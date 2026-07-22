@@ -291,13 +291,22 @@ def build_rollout_context(
         use_videos=cfg.dataset.video if cfg.dataset else True,
     )
     # Observation-side aggregation is needed because of build_dataset_frame
-    observation_dataset_features = aggregate_pipeline_dataset_features(
-        pipeline=robot_observation_processor,
-        initial_features=create_initial_features(observation=observation_features_hw),
-        use_videos=cfg.dataset.video if cfg.dataset else True,
-    )
+    explicit_observation_features = getattr(robot, "observation_dataset_features", None)
+    if callable(explicit_observation_features):
+        observation_dataset_features = explicit_observation_features(
+            use_videos=cfg.dataset.video if cfg.dataset else True
+        )
+    else:
+        observation_dataset_features = aggregate_pipeline_dataset_features(
+            pipeline=robot_observation_processor,
+            initial_features=create_initial_features(observation=observation_features_hw),
+            use_videos=cfg.dataset.video if cfg.dataset else True,
+        )
     dataset_features = combine_feature_dicts(action_dataset_features, observation_dataset_features)
-    hw_features = hw_to_dataset_features(observation_features_hw, "observation")
+    if callable(explicit_observation_features):
+        hw_features = explicit_observation_features(use_videos=False)
+    else:
+        hw_features = hw_to_dataset_features(observation_features_hw, "observation")
     raw_action_keys = list(action_features_hw.keys())
     policy_action_names = getattr(policy_config, "action_feature_names", None)
     ordered_action_keys = _resolve_action_key_order(
@@ -311,9 +320,12 @@ def build_rollout_context(
         expected_visuals = {
             k for k, v in policy_config.input_features.items() if v.type == FeatureType.VISUAL
         }
-        provided_visuals = {
-            f"observation.images.{k}" for k, v in robot.observation_features.items() if isinstance(v, tuple)
-        }
+        visual_feature_keys = getattr(robot, "visual_feature_keys", None)
+        if visual_feature_keys is None:
+            visual_feature_keys = tuple(
+                k for k, v in robot.observation_features.items() if isinstance(v, tuple)
+            )
+        provided_visuals = {f"observation.images.{k}" for k in visual_feature_keys}
         policy_subset = expected_visuals.issubset(provided_visuals)
         hw_subset = provided_visuals.issubset(expected_visuals)
         if not (policy_subset or hw_subset):
