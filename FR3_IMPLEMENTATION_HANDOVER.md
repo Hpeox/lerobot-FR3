@@ -6,15 +6,13 @@
 | --- | --- |
 | Report date | 2026-07-22 |
 | Repository branch | `wip/FR3` |
-| Base/current HEAD | `30da8e68` |
 | LeRobot version | `0.6.0` |
 | Supported Python | `>=3.12` |
-| Implementation status | Implemented in the local working tree; not committed |
 | Hardware acceptance | Not completed |
 
-This report describes the FR3 implementation currently present in the working tree. It is intended
-for the engineer who will integrate the external processes, perform hardware acceptance, and own
-subsequent maintenance. The byte-level protocol reference is the
+This report describes the current FR3 implementation. It is intended for the engineer who will
+integrate the external processes, perform hardware acceptance, and own subsequent maintenance. The
+byte-level protocol reference is the
 [FR3 integration guide](docs/source/fr3.mdx).
 
 ## Executive Summary
@@ -400,8 +398,6 @@ No statement in this report should be interpreted as completed real-hardware acc
 - The default endpoints and SHM names are deployment-specific and must be reviewed before using a
   different network or host layout.
 - Shared-memory ABIs assume Linux x86-64, little-endian operation and fixed array dimensions.
-- The implementation is currently uncommitted, so its branch and working-tree state must be
-  preserved until review and commit are complete.
 
 ## Recommended Next Steps
 
@@ -416,8 +412,8 @@ No statement in this report should be interpreted as completed real-hardware acc
    processes on fatal failure.
 5. Add deployment-specific launch configuration and an operator acceptance checklist once the
    production process topology is fixed.
-6. Review the complete working-tree diff, rerun the relevant broader LeRobot tests, and commit the
-   implementation and this report as an intentional change set.
+6. Run broader LeRobot tests, then review any follow-up code changes against the relevant protocol
+    and operations documentation so the implementation stays aligned with the documented interfaces.
 
 ## Handover Checklist
 
@@ -430,5 +426,5 @@ No statement in this report should be interpreted as completed real-hardware acc
 - [ ] Supervised action acceptance has passed on the physical FR3 and gripper.
 - [ ] Record and rollout workflows have passed with production policy preprocessing.
 - [ ] Soak-test results and any tuned timeout values have been recorded.
-- [ ] The uncommitted working tree has been reviewed and committed without unrelated changes.
+- [ ] The implementation, protocol definitions, and operations documentation remain consistent.
 
