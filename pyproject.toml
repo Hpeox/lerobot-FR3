@@ -205,6 +205,7 @@ intelrealsense = [
 phone = ["hebi-py>=2.8.0,<2.12.0", "teleop>=0.1.0,<0.2.0", "fastapi<1.0", "lerobot[scipy-dep]"]
 
 # Policies
+acmt-dp = ["lerobot[diffusers-dep]"]
 diffusion = ["lerobot[diffusers-dep]"]
 wallx = [
     "lerobot[transformers-dep]",
@@ -360,6 +361,7 @@ lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
 lerobot-annotate="lerobot.scripts.lerobot_annotate:main"
 lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
 lerobot-fr3-sensorhub="lerobot.robots.fr3.sensorhub.__main__:main"
+lerobot-convert-acmt-dp-checkpoint="lerobot.scripts.convert_acmt_dp_checkpoint:main"
 
 # ---------------- Tool Configurations ----------------
 

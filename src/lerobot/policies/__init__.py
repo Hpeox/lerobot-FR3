@@ -14,6 +14,7 @@
 
 from lerobot.utils.action_interpolator import ActionInterpolator as ActionInterpolator
 
+from .acmt_dp.configuration_acmt_dp import ACMTDPConfig as ACMTDPConfig
 from .act.configuration_act import ACTConfig as ACTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
 from .eo1.configuration_eo1 import EO1Config as EO1Config
@@ -42,6 +43,7 @@ from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
 
 __all__ = [
     # Configuration classes
+    "ACMTDPConfig",
     "ACTConfig",
     "DiffusionConfig",
     "EO1Config",

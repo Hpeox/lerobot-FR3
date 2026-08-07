@@ -176,6 +176,15 @@ def build_rollout_context(
     # --- 1. Policy (heavy I/O, but no hardware yet) -------------------
     logger.info("Loading policy from '%s'...", cfg.policy.pretrained_path)
     policy_config = cfg.policy
+    if (
+        is_rtc
+        and policy_config.type == "acmt_dp"
+        and getattr(policy_config, "tactile_source", None) == "generated"
+    ):
+        raise NotImplementedError(
+            "ACMT-DP generated tactile inference is causal and only supports "
+            "--inference.type=sync"
+        )
     policy_class = get_policy_class(policy_config.type)
 
     if hasattr(policy_config, "compile_model"):
