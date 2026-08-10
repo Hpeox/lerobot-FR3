@@ -8,7 +8,7 @@ import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 
 from .aligned_shm import AlignedObservationWriter
 from .cache import CausalAligner, SampleCache
@@ -17,6 +17,10 @@ from .samples import CameraSample, FTSample, GripperSample, RobotSample, XenseSa
 from .uds import UDSControlServer
 
 logger = logging.getLogger(__name__)
+
+
+class _ParentExited(RuntimeError):
+    """Internal non-fatal signal that the owning FR3 process disappeared."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,9 +35,6 @@ class SensorHubConfig:
     cache_horizon_s: float = 0.5
     camera_max_skew_ms: int = 50
     required_sample_max_age_ms: int = 100
-    camera_xense_stall_timeout_ms: int = 200
-    ft_robot_gripper_stall_timeout_ms: int = 100
-    alignment_failure_timeout_ms: int = 500
 
     @classmethod
     def from_dict(cls, values: dict[str, object]) -> SensorHubConfig:
@@ -53,7 +54,7 @@ class SensorHubRuntime:
         self.stop_event = Event()
         self.fatal_event = Event()
         self.first_publish_event = Event()
-        self._fatal_lock = Event()
+        self._fatal_lock = Lock()
         self._fatal_message = ""
         self._threads: list[Thread] = []
         self._readers: list[object] = []
@@ -94,6 +95,8 @@ class SensorHubRuntime:
             self.control.publish("READY", message="first aligned snapshot published")
             self._supervise()
             return 1 if self.fatal_event.is_set() else 0
+        except _ParentExited:
+            return 0
         except Exception as exc:
             self._fatal(f"SensorHub startup/runtime failure: {exc}")
             return 1
@@ -114,6 +117,9 @@ class SensorHubRuntime:
         deadline = time.monotonic() + self.config.startup_timeout_s
         last_error: Exception | None = None
         while time.monotonic() < deadline and not self.stop_event.is_set():
+            if not self._parent_is_alive():
+                self.stop_event.set()
+                raise _ParentExited("parent process exited while SensorHub was attaching readers")
             attached: list[object] = []
             try:
                 camera_list = []
@@ -133,6 +139,9 @@ class SensorHubRuntime:
                 for reader in reversed(attached):
                     reader.close()  # type: ignore[attr-defined]
                 time.sleep(0.05)
+        if not self._parent_is_alive():
+            self.stop_event.set()
+            raise _ParentExited("parent process exited while SensorHub was attaching readers")
         raise TimeoutError(f"required upstream writers were not ready: {last_error}")
 
     def _start_thread(self, name: str, target: Callable[[], None]) -> None:
@@ -160,6 +169,7 @@ class SensorHubRuntime:
                     sample = reader.read(timeout_s=0.02)
                     if isinstance(sample, RobotSample):
                         self.robot_cache.append(sample)
+                        self.control.set_robot_resetting(reader.robot_resetting)
                     else:
                         self.gripper_cache.append(sample)
                 except (TimeoutError, LookupError):
@@ -171,31 +181,18 @@ class SensorHubRuntime:
         self._start_thread("FR3TelemetryReader", loop)
 
     def _alignment_loop(self) -> None:
-        last_success_ns = time.monotonic_ns()
         while not self.stop_event.is_set():
-            now_ns = time.monotonic_ns()
-            sample = self.aligner.select(time.time_ns(), now_ns)
-            if sample is not None:
-                assert self.writer is not None
-                self.writer.publish(sample)
-                self.first_publish_event.set()
-                last_success_ns = now_ns
-            elif self._all_sources_have_samples() and (
-                now_ns - last_success_ns > self.config.alignment_failure_timeout_ms * 1_000_000
-            ):
-                self._fatal("causal alignment failed continuously past timeout")
+            try:
+                now_ns = time.monotonic_ns()
+                sample = self.aligner.select(time.time_ns(), now_ns)
+                if sample is not None:
+                    assert self.writer is not None
+                    self.writer.publish(sample)
+                    self.first_publish_event.set()
+            except Exception as exc:
+                self._fatal(f"AlignmentPublisher failed: {exc}")
                 return
             time.sleep(0.001)
-
-    def _all_sources_have_samples(self) -> bool:
-        caches = (
-            *self.camera_caches,
-            self.xense_cache,
-            self.ft_cache,
-            self.robot_cache,
-            self.gripper_cache,
-        )
-        return all(cache.latest() is not None for cache in caches)
 
     def _all_sources_advanced(self) -> bool:
         caches = (
@@ -213,7 +210,8 @@ class SensorHubRuntime:
             if self.fatal_event.is_set():
                 raise RuntimeError(self._fatal_message)
             if not self._parent_is_alive():
-                raise RuntimeError("parent process exited during SensorHub startup")
+                self.stop_event.set()
+                raise _ParentExited("parent process exited during SensorHub startup")
             if self._all_sources_advanced() and self.first_publish_event.is_set():
                 return
             time.sleep(0.005)
@@ -224,36 +222,25 @@ class SensorHubRuntime:
             if not self._parent_is_alive():
                 self.stop_event.set()
                 return
-            now_ns = time.monotonic_ns()
-            camera_xense = (*self.camera_caches, self.xense_cache)
-            fast = (self.ft_cache, self.robot_cache, self.gripper_cache)
-            if any(
-                (sample := cache.latest()) is None
-                or now_ns - sample.ingest_monotonic_ns > self.config.camera_xense_stall_timeout_ms * 1_000_000
-                for cache in camera_xense
-            ):
-                self._fatal("camera/Xense required source stalled")
-                return
-            if any(
-                (sample := cache.latest()) is None
-                or now_ns - sample.ingest_monotonic_ns
-                > self.config.ft_robot_gripper_stall_timeout_ms * 1_000_000
-                for cache in fast
-            ):
-                self._fatal("FT/robot/gripper required source stalled")
-                return
             time.sleep(0.01)
 
     def _parent_is_alive(self) -> bool:
         return self.parent_pid == os.getppid() and os.path.exists(f"/proc/{self.parent_pid}")
 
     def _fatal(self, message: str) -> None:
-        if self._fatal_lock.is_set():
-            return
-        self._fatal_lock.set()
-        self._fatal_message = message
-        self.fatal_event.set()
-        if self.writer is not None:
-            self.writer.set_fatal(message)
-        self.control.publish("FATAL", status_code=1, message=message)
-        self.stop_event.set()
+        with self._fatal_lock:
+            if self.fatal_event.is_set():
+                return
+            self._fatal_message = message
+            self.fatal_event.set()
+            try:
+                if self.writer is not None:
+                    self.writer.set_fatal(message)
+            except Exception:
+                logger.exception("failed to record SensorHub fatal state in aligned SHM")
+            try:
+                self.control.publish("FATAL", status_code=1, message=message)
+            except Exception:
+                logger.exception("failed to publish SensorHub fatal state over UDS")
+            finally:
+                self.stop_event.set()

@@ -258,12 +258,18 @@ class TelemetryReader:
         self._socket.setsockopt(zmq.RCVHWM, 100)
         self._socket.setsockopt(zmq.LINGER, 0)
         self._socket.connect(endpoint)
+        self._robot_resetting: bool | None = None
+
+    @property
+    def robot_resetting(self) -> bool | None:
+        return self._robot_resetting
 
     def read(self, timeout_s: float = 0.02) -> RobotSample | GripperSample:
         if not self._socket.poll(max(1, int(timeout_s * 1000)), self._zmq.POLLIN):
             raise TimeoutError("no FGT1 telemetry frame")
         decoded = parse_telemetry(self._socket.recv())
         if isinstance(decoded, RobotTelemetry):
+            self._robot_resetting = decoded.resetting
             return RobotSample(
                 decoded.sequence,
                 decoded.timestamp_ns,

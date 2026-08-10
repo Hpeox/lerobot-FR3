@@ -39,6 +39,7 @@ and processor tests. It has not yet been accepted against the complete physical 
 - The SensorHub UDS control connection and aligned-observation shared-memory client.
 - The local ZMQ command `PUB` socket connected to `tcp://192.168.1.37:6001`.
 - Action validation, gripper clipping/conversion, command ABI packing, and publication.
+- The FR3-specific internal joint-reset handshake and its SensorHub UDS status queries.
 - Observation feature declarations, dataset schemas, and deterministic policy layout conversion.
 
 ### External and not implemented here
@@ -104,6 +105,11 @@ invalid, static, or cannot participate in an aligned snapshot.
 PUB/SUB provides no delivery acknowledgement. The remote subscriber must be running before the
 Robot begins publishing, and the remote real-time controller must enforce its own watchdog.
 
+At a rollout `INITIALIZE` boundary, internal `FR3._reset_joints(q_reset)` uses the FRCMD1
+`RESET_JOINT` flag. It retransmits one byte-identical logical command until FGT1 reports
+`RESETTING=1`, then waits without retransmitting until `RESETTING=0`. The generic `Robot` interface
+is unchanged. Reset frames carry `gripper_gPO=0`, which the remote reset implementation must ignore.
+
 ## Implemented Components
 
 ### FR3 Robot and configuration
@@ -128,8 +134,11 @@ Robot begins publishing, and the remote real-time controller must enforce its ow
   duplicate aligned output.
 - The aligned writer owns one fixed two-slot seqlock mapping and records fatal state in its global
   header.
-- Runtime supervision detects parent death, source stalls, sustained alignment failure, and reader
-  errors. A fatal condition stops publication, records the failure, sends `FATAL`, and exits.
+- After strict startup, the alignment loop continuously retries data absence and alignment misses.
+  Publication stalls without becoming fatal and resumes in the same SHM when a valid causal sample
+  is available. `required_sample_max_age_ms` rejects stale cache entries naturally.
+- Unexpected reader/parser, ABI, publisher, internal IPC, and invariant failures remain fatal.
+  Parent disappearance terminates SensorHub through the normal non-fatal ownership path.
 - There is intentionally no reader reconnection, SHM remapping, local recovery, or automatic
   SensorHub restart in this version.
 
@@ -176,9 +185,9 @@ Robot begins publishing, and the remote real-time controller must enforce its ow
 | `cache_horizon_s` | `0.5` |
 | `camera_max_skew_ms` | `50` |
 | `required_sample_max_age_ms` | `100` |
-| `camera_xense_stall_timeout_ms` | `200` |
-| `ft_robot_gripper_stall_timeout_ms` | `100` |
-| `alignment_failure_timeout_ms` | `500` |
+| `reset_ack_timeout_s` | `2.0` |
+| `reset_completion_timeout_s` | `30.0` |
+| `reset_retry_interval_s` | `0.1` |
 
 Every timeout and cache duration must be positive, and exactly four RealSense SHM names are required.
 
@@ -221,6 +230,9 @@ remain independent dataset features.
 | `send_action()` | Validates, clips/converts, publishes one command, and returns the submitted action |
 | `disconnect()` | Stops only Robot-owned resources and is safe to call repeatedly |
 
+`FR3._reset_joints(q_reset)` is an internal FR3 integration operation rather than a generic Robot
+lifecycle method. Successful return means the remote reset request was acknowledged and completed.
+
 ## Protocol Summary
 
 ### Command ABI v1
@@ -229,8 +241,9 @@ remain independent dataset features.
 - Publisher: connects to `tcp://192.168.1.37:6001` with `SNDHWM=1`, `CONFLATE=1`, and `LINGER=0`.
 - Subscriber: must bind to `tcp://*:6001`, subscribe to `b""`, and use equivalent latest-only
   behavior.
-- Header: magic `FRCMD1\0\0`, ABI version `1`, header size `48`, total size `112`, flags `0`, sequence,
-  realtime nanoseconds, and monotonic nanoseconds.
+- Header: magic `FRCMD1\0\0`, ABI version `1`, header size `48`, total size `112`, flags, sequence,
+  realtime nanoseconds, and monotonic nanoseconds. Normal actions use flags `0`; bit 0 is
+  `RESET_JOINT`.
 - Payload: seven `float64` joint targets, one `uint8 gPO`, and seven zero padding bytes.
 
 ### FGT1 telemetry ABI
@@ -238,6 +251,8 @@ remain independent dataset features.
 - SensorHub accepts only 504-byte `FGT1` version 1 frames.
 - Robot source `2` requires valid-mask bit `2` and maps `q=floats[8:15]`,
   `dq=floats[15:22]`, and `tau_J=floats[22:29]`.
+- Robot telemetry flags bit 0 is `RESETTING`. It remains control-only state and is not included in
+  `RobotSample`, aligned SHM, or observations.
 - Gripper source `3` requires valid-mask bit `4` and supplies `gPO` and `gCU`.
 - Robot and gripper sequences/caches are independent. GELLO source `1` is ignored.
 - The multiplexed telemetry subscriber intentionally does not use `CONFLATE`, because conflation
@@ -255,10 +270,15 @@ remain independent dataset features.
 
 ### SensorHub UDS protocol
 
+- Protocol version: `2`.
 - Transport: `AF_UNIX/SOCK_SEQPACKET`; packet size is at most 512 bytes.
 - Every JSON packet contains exactly `protocol_version`, `type`, `sequence`, `timestamp_ns`,
   `status_code`, and `message`.
-- Supported types: `READY`, `HEALTH`, `FATAL`, `PING`, `PONG`, and `SHUTDOWN`.
+- Supported types: `READY`, `HEALTH`, `FATAL`, `PING`, `PONG`, `SHUTDOWN`,
+  `GET_ROBOT_RESETTING`, and `ROBOT_RESETTING`.
+- `ROBOT_RESETTING.status_code` is `0` for idle, `1` for resetting, and `2` for unknown.
+- FR3-to-SensorHub requests use an independent `_uds_sequence`; SensorHub-to-FR3 packets use the
+  server's own ordered sequence. Neither counter is tied to FRCMD1 command identity.
 - Diagnostic messages are truncated to at most 256 UTF-8 bytes before encoding so a long exception
   cannot prevent delivery of a fatal packet.
 
@@ -337,10 +357,10 @@ managed SensorHub process group. Shut down external writers and controllers sepa
 | SensorHub UDS timeout | SensorHub failed before control socket creation, invalid socket directory, or process launch failure |
 | `required upstream writers were not ready` | Missing SHM object, incorrect mapping size/layout, or inaccessible source |
 | `readers did not produce advancing coherent samples` | Static sequence, missing telemetry source, or no valid alignment |
-| `camera/Xense required source stalled` | Camera or Xense publication stopped for more than the configured stall timeout |
-| `FT/robot/gripper required source stalled` | FT or FGT1 robot/gripper publication stopped |
-| `causal alignment failed continuously past timeout` | Sources are individually live but timestamps/skew cannot form a valid snapshot |
-| stale aligned snapshot | SensorHub is no longer publishing quickly enough or has entered a fatal state |
+| aligned sequence stops advancing | A required source is absent/stale or current samples cannot satisfy causal alignment; inspect the source-level monitors |
+| stale aligned snapshot | No valid aligned sample has been published recently, or SensorHub reported an internal fatal failure |
+| reset acknowledgement timeout | The remote controller did not expose `RESETTING=1`; check FRCMD1 delivery, idempotence, and FGT1 flags |
+| reset completion timeout | The remote reset remained at `RESETTING=1`; inspect the NUC reset trajectory and telemetry relay |
 | no remote motion | Check subscriber startup order, subscription filter, ABI, watchdog state, and ZMQ endpoint |
 | clipped gripper warning | Policy produced `gripper.pos` outside `[0, 1]`; the submitted value was clipped |
 
@@ -350,22 +370,23 @@ managed SensorHub process group. Shut down external writers and controllers sepa
 
 | Check | Result |
 | --- | --- |
-| Ruff over FR3 and touched integration modules | Passed |
 | `git diff --check` | Passed |
-| Python compile validation | Passed during implementation |
-| Dependency lock validation | `uv lock --check` passed during implementation |
-| FR3 tests in the restricted environment | `32 passed, 1 skipped in 0.29s` |
-| FR3 tests in an unrestricted environment | `33 passed in 0.34s` |
-
-The restricted environment skips the ZMQ IPC case because IPC socket creation is unavailable there.
-The same case passed in the unrestricted run.
+| Python compile validation | Passed for FR3 source and focused tests |
+| Isolated FRCMD1/FGT1 and UDS v2 smoke | Passed |
+| Isolated synchronous reset-handshake smoke | Passed |
+| Isolated SensorHub outage/recovery and fatal-policy smoke | Passed |
+| Focused FR3 pytest suite in `lerobot-fr3` | `54 passed in 0.40s` |
 
 Focused tests cover:
 
-- Command and telemetry golden ABIs, gripper conversion/clipping, invalid inputs, and masks.
-- UDS schema validation, size bounds, and independent multiplexed telemetry sources.
+- Command and telemetry golden ABIs, reset flags, gripper conversion/clipping, invalid inputs, and
+  masks.
+- UDS v2 schema validation, reset-state ordering, size bounds, and independent multiplexed telemetry
+  sources.
 - Causal alignment, duplicate suppression, shared-memory sizing, seqlock round trips, owned snapshots,
   stale reads, and fatal state.
+- Telemetry outage stalling and recovery in the same SensorHub runtime and aligned SHM, including
+  lower post-restart source sequences.
 - Strict RealSense layout checks and fixed Xense/FT offsets.
 - Robot action schema, feature declarations, managed lifecycle, and idempotent disconnect.
 - Online/offline layout conversion, RGB normalization, Z16 preservation, and numeric Array3D dataset
@@ -377,6 +398,7 @@ Focused tests cover:
 - Verification that every external producer uses the exact ABI, timestamps, and sequence semantics
   assumed by the readers.
 - Safe command delivery to the real remote subscriber and FR3 controller.
+- NUC-side duplicate-sequence reset idempotence and `RESETTING` transition behavior.
 - Joint/gripper direction, unit, range, latency, and watchdog verification on hardware.
 - Observation timestamp/skew characterization under sustained load.
 - Long-duration process, shared-memory, CPU, and memory stability testing.
@@ -388,11 +410,13 @@ No statement in this report should be interpreted as completed real-hardware acc
 
 - There is no run-level external controller. Operators must manually establish and verify startup
   order until one is implemented.
-- SensorHub does not reconnect readers, remap replaced SHM objects, recover locally, or restart
-  itself after a fatal condition.
+- SensorHub does not reconstruct readers, remap replaced SHM objects, or restart itself. Its
+  long-lived telemetry SUB remains connected across temporary NUC-side publisher outages.
 - Every modality is required; there is no degraded mode for a missing camera or tactile sensor.
-- ZMQ PUB/SUB can drop commands and has a slow-subscriber startup window. There is no application
-  acknowledgement in command ABI v1.
+- ZMQ PUB/SUB can drop commands and has a slow-subscriber startup window. Joint reset adds an
+  FGT1-state handshake, but ordinary actions remain unacknowledged.
+- The NUC receiver must deduplicate repeated `RESET_JOINT` frames by FRCMD1 command sequence and
+  must not restart the trajectory for duplicate copies.
 - The Robot does not impose FR3 joint limits or velocity/acceleration limits. Safety remains with
   the remote real-time controller.
 - The default endpoints and SHM names are deployment-specific and must be reviewed before using a
@@ -407,9 +431,8 @@ No statement in this report should be interpreted as completed real-hardware acc
    command capture second, and supervised low-risk motion only after watchdog and limits are proven.
 3. Measure source rate, timestamp quality, alignment success, observation age, command latency, and
    resource use during an extended soak test.
-4. Implement the external controller contract described in the FR3 integration guide: start and
-   verify external components, start LeRobot, supervise the complete run, and terminate all owned
-   processes on fatal failure.
+4. Implement the external controller contract described in the FR3 integration guide: supervise
+   owned components and source-level liveness, and use aligned SHM progress for final-data health.
 5. Add deployment-specific launch configuration and an operator acceptance checklist once the
    production process topology is fixed.
 6. Run broader LeRobot tests, then review any follow-up code changes against the relevant protocol
@@ -427,4 +450,3 @@ No statement in this report should be interpreted as completed real-hardware acc
 - [ ] Record and rollout workflows have passed with production policy preprocessing.
 - [ ] Soak-test results and any tuned timeout values have been recorded.
 - [ ] The implementation, protocol definitions, and operations documentation remain consistent.
-

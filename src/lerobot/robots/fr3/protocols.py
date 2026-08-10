@@ -18,6 +18,8 @@ COMMAND_ABI_VERSION: Final = 1
 COMMAND_HEADER_SIZE: Final = 48
 COMMAND_TOTAL_SIZE: Final = 112
 COMMAND_STRUCT = struct.Struct("<8sIIIIQqq7dB7x")
+COMMAND_FLAG_RESET_JOINT: Final = 1 << 0
+COMMAND_KNOWN_FLAGS: Final = COMMAND_FLAG_RESET_JOINT
 
 TELEMETRY_MAGIC: Final = b"FGT1"
 TELEMETRY_VERSION: Final = 1
@@ -27,6 +29,7 @@ ROBOT_SOURCE: Final = 2
 GRIPPER_SOURCE: Final = 3
 ROBOT_VALID_MASK: Final = 2
 GRIPPER_VALID_MASK: Final = 4
+ROBOT_TELEMETRY_FLAG_RESETTING: Final = 1 << 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +39,7 @@ class RobotTelemetry:
     q: np.ndarray
     dq: np.ndarray
     tau_j: np.ndarray
+    resetting: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +69,7 @@ def pack_command(
     *,
     realtime_ns: int | None = None,
     monotonic_ns: int | None = None,
+    flags: int = 0,
 ) -> bytes:
     """Encode one command using the fixed 112-byte FR3 command ABI."""
 
@@ -75,6 +80,10 @@ def pack_command(
         raise ValueError("joint targets must be finite")
     if isinstance(gripper_gpo, bool) or not 0 <= gripper_gpo <= 255:
         raise ValueError("gripper_gpo must be an integer in [0, 255]")
+    if isinstance(flags, bool) or not isinstance(flags, int):
+        raise TypeError("command flags must be an integer, not bool")
+    if flags < 0 or flags & ~COMMAND_KNOWN_FLAGS:
+        raise ValueError(f"unsupported command flags: 0x{flags:x}")
     realtime_ns = time.time_ns() if realtime_ns is None else realtime_ns
     monotonic_ns = time.monotonic_ns() if monotonic_ns is None else monotonic_ns
     frame = COMMAND_STRUCT.pack(
@@ -82,7 +91,7 @@ def pack_command(
         COMMAND_ABI_VERSION,
         COMMAND_HEADER_SIZE,
         COMMAND_TOTAL_SIZE,
-        0,
+        flags,
         sequence,
         realtime_ns,
         monotonic_ns,
@@ -100,7 +109,7 @@ def parse_telemetry(frame: bytes) -> RobotTelemetry | GripperTelemetry | None:
     if len(frame) != TELEMETRY_TOTAL_SIZE:
         raise ValueError(f"FGT1 frame must be {TELEMETRY_TOTAL_SIZE} bytes, got {len(frame)}")
     unpacked = TELEMETRY_STRUCT.unpack(frame)
-    magic, version, source, _flags, sequence, stamp, valid_mask = unpacked[:7]
+    magic, version, source, flags, sequence, stamp, valid_mask = unpacked[:7]
     floats = unpacked[7:65]
     gpo, gcu = unpacked[65:67]
     if magic != TELEMETRY_MAGIC or version != TELEMETRY_VERSION:
@@ -116,7 +125,14 @@ def parse_telemetry(frame: bytes) -> RobotTelemetry | GripperTelemetry | None:
         tau_j = np.array(floats[22:29], dtype=np.float32)
         if not (np.isfinite(q).all() and np.isfinite(dq).all() and np.isfinite(tau_j).all()):
             raise ValueError("robot telemetry contains non-finite q/dq/tau_J")
-        return RobotTelemetry(sequence, timestamp_ns, q, dq, tau_j)
+        return RobotTelemetry(
+            sequence,
+            timestamp_ns,
+            q,
+            dq,
+            tau_j,
+            bool(flags & ROBOT_TELEMETRY_FLAG_RESETTING),
+        )
     if source == GRIPPER_SOURCE:
         if not valid_mask & GRIPPER_VALID_MASK:
             raise ValueError("gripper telemetry does not set valid_mask bit 4")

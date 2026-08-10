@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 
@@ -44,9 +45,9 @@ class FR3Config(RobotConfig):
     cache_horizon_s: float = 0.5
     camera_max_skew_ms: int = 50
     required_sample_max_age_ms: int = 100
-    camera_xense_stall_timeout_ms: int = 200
-    ft_robot_gripper_stall_timeout_ms: int = 100
-    alignment_failure_timeout_ms: int = 500
+    reset_ack_timeout_s: float = 2.0
+    reset_completion_timeout_s: float = 30.0
+    reset_retry_interval_s: float = 0.1
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -60,11 +61,11 @@ class FR3Config(RobotConfig):
             "cache_horizon_s": self.cache_horizon_s,
             "camera_max_skew_ms": self.camera_max_skew_ms,
             "required_sample_max_age_ms": self.required_sample_max_age_ms,
-            "camera_xense_stall_timeout_ms": self.camera_xense_stall_timeout_ms,
-            "ft_robot_gripper_stall_timeout_ms": self.ft_robot_gripper_stall_timeout_ms,
-            "alignment_failure_timeout_ms": self.alignment_failure_timeout_ms,
+            "reset_ack_timeout_s": self.reset_ack_timeout_s,
+            "reset_completion_timeout_s": self.reset_completion_timeout_s,
+            "reset_retry_interval_s": self.reset_retry_interval_s,
         }
-        invalid = [name for name, value in positive.items() if value <= 0]
+        invalid = [name for name, value in positive.items() if not math.isfinite(value) or value <= 0]
         if invalid:
             raise ValueError(f"FR3 timeout/cache values must be positive: {invalid}")
 
@@ -82,7 +83,4 @@ class FR3Config(RobotConfig):
             "cache_horizon_s": self.cache_horizon_s,
             "camera_max_skew_ms": self.camera_max_skew_ms,
             "required_sample_max_age_ms": self.required_sample_max_age_ms,
-            "camera_xense_stall_timeout_ms": self.camera_xense_stall_timeout_ms,
-            "ft_robot_gripper_stall_timeout_ms": self.ft_robot_gripper_stall_timeout_ms,
-            "alignment_failure_timeout_ms": self.alignment_failure_timeout_ms,
         }

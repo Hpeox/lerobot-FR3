@@ -58,7 +58,7 @@ offset  size  field
 8       4     abi_version = 1
 12      4     header_size = 48
 16      4     total_size = 112
-20      4     flags = 0
+20      4     flags (bit 0 = RESET_JOINT)
 24      8     sequence:uint64
 32      8     realtime_ns:int64
 40      8     monotonic_ns:int64
@@ -71,12 +71,22 @@ PUB/SUB has no delivery acknowledgement. The remote subscriber must be ready fir
 real-time controller must implement the watchdog/timeout hold behavior; that remote implementation
 is outside this repository.
 
+Normal `send_action()` frames use flags `0`. The FR3-specific internal `_reset_joints(q_reset)`
+operation sends bit 0 (`RESET_JOINT`) with seven concrete reset targets and `gripper_gPO=0`. It
+allocates one command sequence and retransmits the identical frame until robot telemetry reports
+`RESETTING=1`; repeated frames with that sequence must be idempotent on the remote controller. It
+then stops retransmitting and returns only after telemetry reports `RESETTING=0`. The acknowledgement
+and completion waits have finite configurable timeouts. This operation is not part of the generic
+LeRobot `Robot` interface and is intended only for a rollout `INITIALIZE` phase boundary. The remote
+reset implementation must ignore the gripper byte in a `RESET_JOINT` frame.
+
 ## FGT1 telemetry ABI
 
 SensorHub accepts only 504-byte `FGT1` version 1 frames. Robot source 2 requires valid-mask bit 2
 and maps `q=floats[8:15]`, `dq=floats[15:22]`, and `tau_J=floats[22:29]`. Gripper source 3 requires
 valid-mask bit 4 and supplies `gPO/gCU`. Their sequences and caches remain independent. GELLO source
-1 is ignored.
+1 is ignored. Robot telemetry flags bit 0 is `RESETTING`; SensorHub carries it only as runtime
+control state. It is not part of `RobotSample`, aligned SHM, or the observation dictionary.
 
 ## AlignedObservation SHM ABI v1
 
@@ -103,16 +113,29 @@ copy, so a later SensorHub publication cannot overwrite data already handed to a
 
 The control socket uses `AF_UNIX/SOCK_SEQPACKET`. Each JSON packet is at most 512 bytes and contains
 exactly `protocol_version`, `type`, `sequence`, `timestamp_ns`, `status_code`, and `message`. Types are
-`READY`, `HEALTH`, `FATAL`, `PING`, `PONG`, and `SHUTDOWN`.
+`READY`, `HEALTH`, `FATAL`, `PING`, `PONG`, `SHUTDOWN`, `GET_ROBOT_RESETTING`, and
+`ROBOT_RESETTING`. Protocol version 2 uses `ROBOT_RESETTING.status_code` values 0, 1, and 2 for idle,
+resetting, and unknown. FR3 request sequences and SensorHub response/status sequences are independent
+directional counters; neither is related to the FRCMD1 command sequence.
 
 All modalities are required. There is no reader reconnect, SHM remap, local recovery, or automatic
-SensorHub restart. A stale source or sustained alignment failure marks the aligned SHM fatal, sends
-`FATAL`, stops publication, and exits SensorHub. `FR3.disconnect()` requests `SHUTDOWN`, then escalates
-to process-group `SIGTERM` and `SIGKILL` if necessary. It does not signal external writers, the relay,
-or the remote controller.
+SensorHub restart. After strict startup, temporary data absence and alignment misses cause
+`CausalAligner.select()` to return `None`; SensorHub retries without publishing or declaring fatal.
+The same bounded caches, process, and aligned SHM remain in place, and publication resumes when a
+complete causal sample is available. `required_sample_max_age_ms` rejects stale cached telemetry, so
+NUC recovery does not require cache clearing. Unexpected reader/parser, ABI, publisher, internal IPC,
+or invariant failures remain fatal. Parent disappearance terminates SensorHub without sending
+`FATAL`. `FR3.disconnect()` requests `SHUTDOWN`, then escalates to process-group `SIGTERM` and
+`SIGKILL` if necessary. It does not signal external writers, the relay, or the remote controller.
+
+The aligned SHM is a session-level stream. Its `latest_sequence` remains monotonic across rollout
+boundaries and source outages; it stops advancing while no valid aligned sample exists and resumes
+in the same mapping afterward.
 
 ## Future external controller contract
 
-The future controller should start writers, relay, and remote subscriber; verify their ABIs and
-advancing sequences; start LeRobot; monitor every required component; and terminate the whole run on
-any fatal error. This is an interface contract only—no external controller is implemented here.
+The future controller should start and monitor its owned writers, relay, and remote subscriber;
+verify source-level liveness; start LeRobot; and use aligned SHM progress as the coarse final-data
+health signal. It should decide rollout/session policy without supervising SensorHub or interpreting
+the private FR3/SensorHub reset protocol. This is an interface contract only—no external controller
+is implemented here.

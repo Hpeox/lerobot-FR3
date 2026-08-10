@@ -1,11 +1,14 @@
 import logging
+from collections import deque
 
 import numpy as np
 import pytest
 
 from lerobot.robots.fr3 import FR3, FR3Config
 from lerobot.robots.fr3.feature_adapter import ACTION_KEYS
-from lerobot.robots.fr3.protocols import COMMAND_STRUCT
+from lerobot.robots.fr3.protocols import COMMAND_FLAG_RESET_JOINT, COMMAND_STRUCT
+from lerobot.robots.fr3.sensorhub.uds import make_packet, parse_packet
+from lerobot.robots.robot import Robot
 
 
 class FakeProcess:
@@ -27,10 +30,18 @@ class FakeSocket:
     def send(self, frame, flags=0):
         self.frames.append(frame)
 
+    def close(self, linger=0):
+        pass
+
 
 class FakeUDS:
-    def __init__(self):
+    def __init__(self, query_results=()):
         self.closed = False
+        self.sent = []
+        self.responses = deque()
+        self.query_results = deque(query_results)
+        self.default_query_result = None
+        self.process = None
 
     def settimeout(self, timeout):
         pass
@@ -39,11 +50,24 @@ class FakeUDS:
         pass
 
     def recv(self, size):
-        from lerobot.robots.fr3.sensorhub.uds import make_packet
-
-        return make_packet("READY", 1)
+        if not self.responses:
+            raise BlockingIOError
+        return self.responses.popleft()
 
     def send(self, packet):
+        self.sent.append(packet)
+        decoded = parse_packet(packet)
+        if decoded["type"] == "GET_ROBOT_RESETTING":
+            result = self.query_results.popleft() if self.query_results else self.default_query_result
+            if result == "FATAL":
+                self.responses.append(make_packet("FATAL", 100, message="reset path failed"))
+            elif result == "EOF":
+                self.responses.append(b"")
+            elif result == "EXIT":
+                assert self.process is not None
+                self.process.returncode = 9
+            elif result is not None:
+                self.responses.append(make_packet("ROBOT_RESETTING", 100, status_code=result))
         return len(packet)
 
     def close(self):
@@ -52,7 +76,15 @@ class FakeUDS:
 
 @pytest.fixture
 def robot(tmp_path):
-    instance = FR3(FR3Config(id="test", calibration_dir=tmp_path))
+    instance = FR3(
+        FR3Config(
+            id="test",
+            calibration_dir=tmp_path,
+            reset_ack_timeout_s=0.03,
+            reset_completion_timeout_s=0.03,
+            reset_retry_interval_s=0.001,
+        )
+    )
     instance._connected = True
     instance._sensorhub = FakeProcess()
     instance._command_socket = FakeSocket()
@@ -63,6 +95,21 @@ def robot(tmp_path):
 
 def action(gripper=0.5):
     return {**{f"fr3_joint{i}.pos": float(i) for i in range(1, 8)}, "gripper.pos": gripper}
+
+
+def test_fr3_config_keeps_reset_timeouts_out_of_sensorhub_config(tmp_path):
+    config = FR3Config(id="config", calibration_dir=tmp_path)
+    sensorhub = config.sensorhub_dict()
+    assert "required_sample_max_age_ms" in sensorhub
+    assert "reset_ack_timeout_s" not in sensorhub
+    assert "reset_completion_timeout_s" not in sensorhub
+    assert "reset_retry_interval_s" not in sensorhub
+    assert "alignment_failure_timeout_ms" not in sensorhub
+    assert "camera_xense_stall_timeout_ms" not in sensorhub
+    assert "ft_robot_gripper_stall_timeout_ms" not in sensorhub
+
+    with pytest.raises(ValueError, match="reset_ack_timeout_s"):
+        FR3Config(id="invalid", calibration_dir=tmp_path, reset_ack_timeout_s=np.nan)
 
 
 def test_send_action_clips_gripper_and_returns_actual_action(robot, caplog):
@@ -111,6 +158,7 @@ def test_fr3_feature_schema_distinguishes_xense_from_images(robot):
 def test_connect_and_idempotent_disconnect_manage_only_sensorhub(monkeypatch, tmp_path):
     process = FakeProcess()
     uds = FakeUDS()
+    uds.responses.append(make_packet("READY", 1))
 
     monkeypatch.setattr("lerobot.robots.fr3.fr3.subprocess.Popen", lambda *args, **kwargs: process)
     monkeypatch.setattr("lerobot.robots.fr3.fr3.connect_uds", lambda *args, **kwargs: uds)
@@ -127,4 +175,89 @@ def test_connect_and_idempotent_disconnect_manage_only_sensorhub(monkeypatch, tm
     assert not instance.is_connected
     assert process.returncode == 0
     assert uds.closed
+    assert parse_packet(uds.sent[-1])["type"] == "SHUTDOWN"
+    assert parse_packet(uds.sent[-1])["sequence"] == 1
+    assert instance._command_sequence == 0
     instance.disconnect()
+
+
+def _attach_reset_uds(robot, query_results, *, default=None):
+    uds = FakeUDS(query_results)
+    uds.default_query_result = default
+    uds.process = robot._sensorhub
+    robot._uds = uds
+    return uds
+
+
+def test_reset_joints_retransmits_one_logical_command_and_waits_for_completion(robot):
+    uds = _attach_reset_uds(robot, [0, 0, 1, 0])
+
+    robot._reset_joints(np.arange(7, dtype=np.float64))
+
+    assert len(robot._command_socket.frames) == 2
+    assert robot._command_socket.frames[0] == robot._command_socket.frames[1]
+    decoded = COMMAND_STRUCT.unpack(robot._command_socket.frames[0])
+    assert decoded[4] == COMMAND_FLAG_RESET_JOINT
+    assert decoded[5] == 1
+    assert decoded[15] == 0
+    requests = [parse_packet(packet) for packet in uds.sent]
+    assert {packet["type"] for packet in requests} == {"GET_ROBOT_RESETTING"}
+    assert [packet["sequence"] for packet in requests] == list(range(1, len(requests) + 1))
+    assert robot._command_sequence == 1
+
+
+def test_reset_and_action_share_command_sequence_but_not_uds_sequence(robot):
+    uds = _attach_reset_uds(robot, [0, 1, 0])
+    robot.send_action(action())
+    robot._reset_joints(np.arange(7))
+    command_socket = robot._command_socket
+    robot.disconnect()
+
+    commands = [COMMAND_STRUCT.unpack(frame)[5] for frame in command_socket.frames]
+    assert commands == [1, 2]
+    requests = [parse_packet(packet) for packet in uds.sent]
+    assert [packet["sequence"] for packet in requests] == list(range(1, len(requests) + 1))
+    assert requests[-1]["type"] == "SHUTDOWN"
+
+
+@pytest.mark.parametrize("bad", [[0.0] * 6, [0.0] * 6 + [True], [0.0] * 6 + [np.nan]])
+def test_reset_joints_validates_exact_finite_non_bool_targets(robot, bad):
+    with pytest.raises((TypeError, ValueError)):
+        robot._reset_joints(bad)
+    assert not robot._command_socket.frames
+
+
+def test_reset_joints_rejects_already_resetting_robot(robot):
+    _attach_reset_uds(robot, [1])
+    with pytest.raises(RuntimeError, match="already reports RESETTING=1"):
+        robot._reset_joints(np.arange(7))
+    assert not robot._command_socket.frames
+
+
+def test_reset_joints_acknowledgement_timeout(robot):
+    _attach_reset_uds(robot, [0], default=0)
+    with pytest.raises(TimeoutError, match="acknowledge"):
+        robot._reset_joints(np.arange(7))
+    assert len(robot._command_socket.frames) > 1
+    assert len(set(robot._command_socket.frames)) == 1
+
+
+def test_reset_joints_completion_timeout_stops_retransmission(robot):
+    _attach_reset_uds(robot, [0, 1], default=1)
+    with pytest.raises(TimeoutError, match="complete"):
+        robot._reset_joints(np.arange(7))
+    assert len(robot._command_socket.frames) == 1
+
+
+@pytest.mark.parametrize(
+    ("failure", "match"),
+    [("FATAL", "SensorHub fatal"), ("EOF", "UDS disconnected"), ("EXIT", "not running")],
+)
+def test_reset_joints_propagates_sensorhub_health_failures(robot, failure, match):
+    _attach_reset_uds(robot, [0, failure])
+    with pytest.raises(RuntimeError, match=match):
+        robot._reset_joints(np.arange(7))
+
+
+def test_reset_joints_is_not_part_of_generic_robot_interface():
+    assert "_reset_joints" not in Robot.__dict__

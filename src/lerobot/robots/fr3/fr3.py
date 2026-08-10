@@ -14,7 +14,10 @@ import socket
 import subprocess
 import sys
 import time
+from collections import deque
+from collections.abc import Sequence
 from contextlib import suppress
+from threading import Lock
 from typing import Any
 
 import numpy as np
@@ -34,7 +37,7 @@ from .feature_adapter import (
     fr3_action_dataset_features,
     fr3_observation_dataset_features,
 )
-from .protocols import pack_command, policy_gripper_to_gpo
+from .protocols import COMMAND_FLAG_RESET_JOINT, pack_command, policy_gripper_to_gpo
 from .sensorhub.aligned_shm import AlignedObservationClient
 from .sensorhub.uds import MAX_PACKET_SIZE, connect_uds, make_packet, parse_packet
 
@@ -57,6 +60,10 @@ class FR3(Robot):
         self._zmq_context = None
         self._command_socket = None
         self._command_sequence = 0
+        self._uds_sequence = 0
+        self._uds_send_lock = Lock()
+        self._command_lock = Lock()
+        self._resetting_events: deque[bool | None] = deque()
         self._fatal_message: str | None = None
 
     @property
@@ -143,8 +150,7 @@ class FR3(Robot):
             if packet["type"] == "READY":
                 self._uds.setblocking(False)
                 return
-            if packet["type"] == "FATAL":
-                raise RuntimeError(f"SensorHub failed to start: {packet['message']}")
+            self._dispatch_uds_packet(packet, startup=True)
         raise TimeoutError("SensorHub did not report READY before startup timeout")
 
     def _open_command_socket(self) -> None:
@@ -175,11 +181,38 @@ class FR3(Robot):
                     self._fatal_message = f"SensorHub UDS failed: {exc}"
                     raise RuntimeError(self._fatal_message) from exc
                 if not raw:
-                    break
-                packet = parse_packet(raw)
-                if packet["type"] == "FATAL":
-                    self._fatal_message = f"SensorHub fatal: {packet['message']}"
+                    self._fatal_message = "SensorHub UDS disconnected"
                     raise RuntimeError(self._fatal_message)
+                try:
+                    packet = parse_packet(raw)
+                except (ValueError, UnicodeDecodeError) as exc:
+                    self._fatal_message = f"SensorHub UDS protocol failure: {exc}"
+                    raise RuntimeError(self._fatal_message) from exc
+                self._dispatch_uds_packet(packet)
+
+    def _dispatch_uds_packet(self, packet: dict[str, object], *, startup: bool = False) -> None:
+        message_type = packet["type"]
+        if message_type == "FATAL":
+            prefix = "SensorHub failed to start" if startup else "SensorHub fatal"
+            self._fatal_message = f"{prefix}: {packet['message']}"
+            raise RuntimeError(self._fatal_message)
+        if message_type == "ROBOT_RESETTING":
+            status_code = packet["status_code"]
+            if status_code not in {0, 1, 2}:
+                raise RuntimeError(f"invalid ROBOT_RESETTING status_code: {status_code}")
+            self._resetting_events.append(None if status_code == 2 else bool(status_code))
+
+    def _send_uds_request(self, message_type: str, *, message: str = "") -> None:
+        if self._uds is None:
+            raise RuntimeError("SensorHub UDS is not connected")
+        with self._uds_send_lock:
+            self._uds_sequence += 1
+            packet = make_packet(message_type, self._uds_sequence, message=message)
+            try:
+                self._uds.send(packet)
+            except OSError as exc:
+                self._fatal_message = f"SensorHub UDS failed: {exc}"
+                raise RuntimeError(self._fatal_message) from exc
 
     @check_if_not_connected
     def get_observation(self) -> RobotObservation:
@@ -193,7 +226,6 @@ class FR3(Robot):
 
     @check_if_not_connected
     def send_action(self, action: RobotAction) -> RobotAction:
-        self._check_health()
         expected = set(ACTION_KEYS)
         received = set(action)
         if received != expected:
@@ -216,12 +248,21 @@ class FR3(Robot):
             logger.warning(
                 "gripper.pos was clipped from %.6g to %.6g", validated["gripper.pos"], clipped_gripper
             )
-        self._command_sequence += 1
-        frame = pack_command(
-            self._command_sequence,
-            [validated[key] for key in JOINT_POSITION_KEYS],
-            gpo,
-        )
+        with self._command_lock:
+            self._check_health()
+            self._command_sequence += 1
+            frame = pack_command(
+                self._command_sequence,
+                [validated[key] for key in JOINT_POSITION_KEYS],
+                gpo,
+            )
+            self._send_command_frame(frame)
+        return {
+            **{key: validated[key] for key in JOINT_POSITION_KEYS},
+            "gripper.pos": clipped_gripper,
+        }
+
+    def _send_command_frame(self, frame: bytes) -> None:
         assert self._command_socket is not None
         try:
             import zmq
@@ -229,20 +270,100 @@ class FR3(Robot):
             self._command_socket.send(frame, flags=zmq.NOBLOCK)
         except zmq.Again as exc:
             raise RuntimeError("FR3 local command PUB queue is unavailable") from exc
-        return {
-            **{key: validated[key] for key in JOINT_POSITION_KEYS},
-            "gripper.pos": clipped_gripper,
-        }
+
+    @check_if_not_connected
+    def _reset_joints(self, q_reset: Sequence[float]) -> None:
+        """Request and synchronously wait for one FR3 joint reset trajectory."""
+
+        try:
+            joints = tuple(q_reset)
+        except TypeError as exc:
+            raise TypeError("q_reset must be a sequence of 7 real numbers") from exc
+        if len(joints) != 7:
+            raise ValueError(f"expected 7 reset joint targets, got {len(joints)}")
+        validated: list[float] = []
+        for value in joints:
+            if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
+                raise TypeError("q_reset values must be real numbers, not bool")
+            numeric = float(value)
+            if not math.isfinite(numeric):
+                raise ValueError("q_reset values must be finite")
+            validated.append(numeric)
+
+        with self._command_lock:
+            self._check_health()
+            self._resetting_events.clear()
+            current = self._wait_for_reset_state(
+                timeout_s=self.config.reset_ack_timeout_s,
+                query_interval_s=self.config.reset_retry_interval_s,
+            )
+            if current:
+                raise RuntimeError("cannot start reset while robot telemetry already reports RESETTING=1")
+
+            self._command_sequence += 1
+            frame = pack_command(
+                self._command_sequence,
+                validated,
+                0,
+                flags=COMMAND_FLAG_RESET_JOINT,
+            )
+            ack_deadline = time.monotonic() + self.config.reset_ack_timeout_s
+            next_retry = 0.0
+            while True:
+                now = time.monotonic()
+                if now >= ack_deadline:
+                    raise TimeoutError("robot did not acknowledge RESET_JOINT with RESETTING=1")
+                if now >= next_retry:
+                    self._send_command_frame(frame)
+                    self._send_uds_request("GET_ROBOT_RESETTING")
+                    next_retry = now + self.config.reset_retry_interval_s
+                state = self._next_reset_state(ack_deadline, next_retry)
+                if state is True:
+                    break
+
+            completion_deadline = time.monotonic() + self.config.reset_completion_timeout_s
+            next_query = 0.0
+            while True:
+                now = time.monotonic()
+                if now >= completion_deadline:
+                    raise TimeoutError("robot did not complete RESET_JOINT with RESETTING=0")
+                if now >= next_query:
+                    self._send_uds_request("GET_ROBOT_RESETTING")
+                    next_query = now + self.config.reset_retry_interval_s
+                state = self._next_reset_state(completion_deadline, next_query)
+                if state is False:
+                    return
+
+    def _wait_for_reset_state(self, *, timeout_s: float, query_interval_s: float) -> bool:
+        deadline = time.monotonic() + timeout_s
+        next_query = 0.0
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                raise TimeoutError("robot RESETTING state was not available")
+            if now >= next_query:
+                self._send_uds_request("GET_ROBOT_RESETTING")
+                next_query = now + query_interval_s
+            state = self._next_reset_state(deadline, next_query)
+            if state is not None:
+                return state
+
+    def _next_reset_state(self, deadline: float, next_request: float) -> bool | None:
+        self._check_health()
+        if self._resetting_events:
+            return self._resetting_events.popleft()
+        wait_s = min(deadline, next_request) - time.monotonic()
+        if wait_s > 0:
+            time.sleep(min(0.005, wait_s))
+        return None
 
     def disconnect(self) -> None:
         if not self._connected and self._sensorhub is None:
             return
         self._connected = False
         if self._uds is not None:
-            with suppress(OSError):
-                self._uds.send(
-                    make_packet("SHUTDOWN", self._command_sequence + 1, message="robot disconnect")
-                )
+            with suppress(OSError, RuntimeError):
+                self._send_uds_request("SHUTDOWN", message="robot disconnect")
         self._cleanup_resources(force_process=False)
         logger.info("%s disconnected", self)
 
