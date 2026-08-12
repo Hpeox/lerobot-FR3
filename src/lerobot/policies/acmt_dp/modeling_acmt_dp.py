@@ -186,7 +186,7 @@ class ACMTDPPolicy(PreTrainedPolicy):
             prediction_type="epsilon",
         )
         self.tactile_generator: TactiGenForceFieldModel | None = None
-        if config.tactile_source == "generated":
+        if config.tactile_source == "tactigen":
             generator_config = dict(config.generator_model_config or {})
             self.tactile_generator = TactiGenForceFieldModel(**generator_config)
             for parameter in self.tactile_generator.parameters():
@@ -242,7 +242,7 @@ class ACMTDPPolicy(PreTrainedPolicy):
             required.extend((rgb_key(camera), depth_key(camera)))
         if self.config.tactile_source == "real":
             required.extend((XENSE0, XENSE1))
-        if self.config.tactile_source == "generated":
+        if self.config.tactile_source == "tactigen":
             required.append(O_T_EE)
         missing = [key for key in required if key not in batch]
         if missing:
@@ -274,7 +274,7 @@ class ACMTDPPolicy(PreTrainedPolicy):
                 [self._force_side(XENSE0, batch[XENSE0]), self._force_side(XENSE1, batch[XENSE1])],
                 dim=1,
             )
-        if self.config.tactile_source == "generated":
+        if self.config.tactile_source == "tactigen":
             current["pose"] = self._require_shape(O_T_EE, batch[O_T_EE], (4, 4)).float()
         return current
 
@@ -284,7 +284,7 @@ class ACMTDPPolicy(PreTrainedPolicy):
                 self._history[key].extend(current[key] for _ in range(4))
             else:
                 self._history[key].append(current[key])
-        if self.config.tactile_source == "generated":
+        if self.config.tactile_source == "tactigen":
             pose = current["pose"]
             if not self._history["pose"]:
                 self._history["pose"].extend(pose for _ in range(4))
@@ -295,7 +295,7 @@ class ACMTDPPolicy(PreTrainedPolicy):
     @torch.no_grad()
     def _generate_tactile(self, previous: dict[str, Tensor], action_chunk: Tensor) -> Tensor:
         if self.tactile_generator is None:
-            raise RuntimeError("generated mode has no embedded ACMT generator")
+            raise RuntimeError("tactigen mode has no embedded TactiGen generator")
         first = action_chunk[:, :1]
         generator_batch = {
             "realsense.cam1_color": previous["rgb"][:, :, 0],
@@ -353,14 +353,18 @@ class ACMTDPPolicy(PreTrainedPolicy):
             )
         elif self.config.tactile_source == "real":
             window["tactile"] = current["tactile"]
-        elif self._previous_window is None or self._previous_action_chunk is None:
+        elif self.config.tactile_source == "tactigen" and (
+            self._previous_window is None or self._previous_action_chunk is None
+        ):
             window["tactile"] = torch.zeros(
                 window["lowdim"].shape[0], 2, 35, 20, 3, device=window["lowdim"].device
             )
-        else:
+        elif self.config.tactile_source == "tactigen":
             window["tactile"] = self._generate_tactile(self._previous_window, self._previous_action_chunk)
+        else:
+            raise RuntimeError(f"Unsupported tactile_source={self.config.tactile_source!r}")
         action = self._plan(window, noise=noise)
-        if self.config.tactile_source == "generated":
+        if self.config.tactile_source == "tactigen":
             self._previous_window = {
                 key: value.detach().clone() for key, value in window.items() if key != "tactile"
             }

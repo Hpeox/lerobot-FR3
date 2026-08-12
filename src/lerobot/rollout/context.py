@@ -179,11 +179,10 @@ def build_rollout_context(
     if (
         is_rtc
         and policy_config.type == "acmt_dp"
-        and getattr(policy_config, "tactile_source", None) == "generated"
+        and getattr(policy_config, "tactile_source", None) == "tactigen"
     ):
         raise NotImplementedError(
-            "ACMT-DP generated tactile inference is causal and only supports "
-            "--inference.type=sync"
+            "ACMT-DP TactiGen tactile inference is causal and only supports --inference.type=sync"
         )
     policy_class = get_policy_class(policy_config.type)
 

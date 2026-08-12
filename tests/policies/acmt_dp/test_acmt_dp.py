@@ -44,13 +44,14 @@ def _generator_config() -> dict:
 
 
 def _config(mode: str = "none") -> ACMTDPConfig:
+    checkpoint_source = "real" if mode == "tactigen" else mode
     return ACMTDPConfig(
         tactile_source=mode,
-        checkpoint_tactile_source=mode,
+        checkpoint_tactile_source=checkpoint_source,
         visual_encoder_name="tiny",
         unet_dims=(32, 64),
         diffusion_inference_steps=2,
-        generator_model_config=_generator_config() if mode == "generated" else None,
+        generator_model_config=_generator_config() if mode == "tactigen" else None,
         device="cpu",
     )
 
@@ -69,7 +70,7 @@ def _batch(mode: str = "none", batch_size: int = 1) -> dict[str, torch.Tensor]:
     if mode == "real":
         batch[XENSE0] = torch.zeros(batch_size, 35, 20, 3)
         batch[XENSE1] = torch.zeros(batch_size, 3, 35, 20)
-    if mode == "generated":
+    if mode == "tactigen":
         batch[O_T_EE] = torch.eye(4).repeat(batch_size, 1, 1)
     return batch
 
@@ -85,6 +86,12 @@ def test_registration_and_config_serialization(tmp_path) -> None:
     assert restored.wrist_camera_keys == ("camera.cam1", "camera.cam2")
     assert restored.wrist_roi == (176, 304, 256, 384)
 
+    tactigen = _config("tactigen")
+    tactigen.save_pretrained(tmp_path / "tactigen")
+    restored_tactigen = PreTrainedConfig.from_pretrained(tmp_path / "tactigen")
+    assert restored_tactigen.tactile_source == "tactigen"
+    assert restored_tactigen.checkpoint_tactile_source == "real"
+
 
 def test_mode_specific_config_validation() -> None:
     with pytest.raises(ValueError, match="mode-specific"):
@@ -92,6 +99,8 @@ def test_mode_specific_config_validation() -> None:
     with pytest.raises(ValueError, match="task-specific"):
         ACMTDPConfig(task_variant="gear", checkpoint_task_variant="peg", device="cpu")
     with pytest.raises(ValueError, match="generator_model_config"):
+        ACMTDPConfig(tactile_source="tactigen", device="cpu")
+    with pytest.raises(ValueError, match="deprecated"):
         ACMTDPConfig(tactile_source="generated", device="cpu")
     config = ACMTDPConfig(device="cpu")
     config.task_variant = "gear"
@@ -149,10 +158,10 @@ def test_lowdim_order_and_real_tactile_layout() -> None:
     assert torch.all(current["tactile"][0, 1, ..., 1] == 2)
 
 
-def test_generated_causal_state_replans_and_reset() -> None:
-    policy = ACMTDPPolicy(_config("generated"))
+def test_tactigen_causal_state_replans_and_reset() -> None:
+    policy = ACMTDPPolicy(_config("tactigen"))
     tactile_seen: list[torch.Tensor] = []
-    generated_from: list[torch.Tensor] = []
+    generator_inputs: list[torch.Tensor] = []
     plan_count = 0
 
     def fake_plan(self, observation, noise=None):
@@ -164,12 +173,12 @@ def test_generated_causal_state_replans_and_reset() -> None:
 
     def fake_generate(self, previous, action_chunk):
         assert previous["lowdim"].shape == (1, 4, 28)
-        generated_from.append(action_chunk[:, 0].clone())
+        generator_inputs.append(action_chunk[:, 0].clone())
         return torch.full((1, 2, 35, 20, 3), 7.0)
 
     policy._plan = MethodType(fake_plan, policy)
     policy._generate_tactile = MethodType(fake_generate, policy)
-    batch = _batch("generated")
+    batch = _batch("tactigen")
 
     first = policy.predict_action_chunk(batch)
     policy.predict_action_chunk(batch)
@@ -177,7 +186,7 @@ def test_generated_causal_state_replans_and_reset() -> None:
     assert first.shape == (1, 16, 8)
     assert torch.count_nonzero(tactile_seen[0]) == 0
     assert torch.all(tactile_seen[1] == 7)
-    torch.testing.assert_close(generated_from[0], first[:, 0])
+    torch.testing.assert_close(generator_inputs[0], first[:, 0])
     torch.testing.assert_close(policy.select_action(batch), torch.full((1, 8), 3.0))
     assert plan_count == 3
 
@@ -197,14 +206,14 @@ def test_mode_specific_missing_and_shape_errors() -> None:
     with pytest.raises(ValueError, match="four dimensions"):
         real._extract_current(invalid_real)
 
-    generated = ACMTDPPolicy(_config("generated"))
+    tactigen = ACMTDPPolicy(_config("tactigen"))
     missing_pose = _batch("none")
     with pytest.raises(KeyError, match="O_T_EE"):
-        generated._extract_current(missing_pose)
-    invalid_pose = _batch("generated")
+        tactigen._extract_current(missing_pose)
+    invalid_pose = _batch("tactigen")
     invalid_pose[O_T_EE] = torch.zeros(1, 16)
     with pytest.raises(ValueError, match=r"\[B,4,4\]"):
-        generated._extract_current(invalid_pose)
+        tactigen._extract_current(invalid_pose)
 
 
 def test_training_interfaces_are_disabled() -> None:

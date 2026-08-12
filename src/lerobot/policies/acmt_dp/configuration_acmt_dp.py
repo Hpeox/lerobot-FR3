@@ -96,14 +96,27 @@ class ACMTDPConfig(PreTrainedConfig):
         self.input_features = _coerce_features(self.input_features)
         self.output_features = _coerce_features(self.output_features)
 
-        if self.tactile_source not in {"none", "real", "generated"}:
-            raise ValueError("tactile_source must be one of: none, real, generated")
+        if self.tactile_source == "generated":
+            raise ValueError(
+                "tactile_source='generated' is deprecated: use 'tactigen' with a real "
+                "policy checkpoint and an embedded TactiGen generator"
+            )
+        if self.tactile_source not in {"none", "real", "tactigen"}:
+            raise ValueError("tactile_source must be one of: none, real, tactigen")
         if self.checkpoint_tactile_source is None:
-            self.checkpoint_tactile_source = self.tactile_source
-        if self.checkpoint_tactile_source != self.tactile_source:
+            self.checkpoint_tactile_source = (
+                "real" if self.tactile_source == "tactigen" else self.tactile_source
+            )
+        if self.checkpoint_tactile_source == "generated":
+            raise ValueError("checkpoint_tactile_source='generated' is deprecated: use 'real'")
+        if self.checkpoint_tactile_source not in {"none", "real"}:
+            raise ValueError("checkpoint_tactile_source must be 'none' or 'real'")
+        expected_checkpoint_source = "real" if self.tactile_source == "tactigen" else self.tactile_source
+        if self.checkpoint_tactile_source != expected_checkpoint_source:
             raise ValueError(
                 "ACMT-DP checkpoints are mode-specific: "
-                f"checkpoint={self.checkpoint_tactile_source!r}, requested={self.tactile_source!r}"
+                f"checkpoint={self.checkpoint_tactile_source!r}, requested={self.tactile_source!r}; "
+                f"expected checkpoint source={expected_checkpoint_source!r}"
             )
         if self.task_variant not in {"peg", "gear"}:
             raise ValueError("task_variant must be 'peg' or 'gear'")
@@ -145,8 +158,8 @@ class ACMTDPConfig(PreTrainedConfig):
         for name, (value, expected) in expected_lengths.items():
             if len(value) != expected:
                 raise ValueError(f"{name} must contain {expected} values")
-        if self.tactile_source == "generated" and self.generator_model_config is None:
-            raise ValueError("generated checkpoints require generator_model_config")
+        if self.tactile_source == "tactigen" and self.generator_model_config is None:
+            raise ValueError("tactigen checkpoints require generator_model_config")
 
         if self.input_features is None:
             self.input_features = self._default_input_features()
@@ -168,15 +181,17 @@ class ACMTDPConfig(PreTrainedConfig):
         if self.tactile_source == "real":
             features[XENSE0] = PolicyFeature(type=FeatureType.STATE, shape=(3, 35, 20))
             features[XENSE1] = PolicyFeature(type=FeatureType.STATE, shape=(3, 35, 20))
-        if self.tactile_source == "generated":
+        if self.tactile_source == "tactigen":
             features[O_T_EE] = PolicyFeature(type=FeatureType.STATE, shape=(4, 4))
         return features
 
     def validate_features(self) -> None:
-        if self.checkpoint_tactile_source != self.tactile_source:
+        expected_checkpoint_source = "real" if self.tactile_source == "tactigen" else self.tactile_source
+        if self.checkpoint_tactile_source != expected_checkpoint_source:
             raise ValueError(
                 "ACMT-DP checkpoint/runtime tactile mode mismatch: "
-                f"checkpoint={self.checkpoint_tactile_source!r}, requested={self.tactile_source!r}"
+                f"checkpoint={self.checkpoint_tactile_source!r}, requested={self.tactile_source!r}; "
+                f"expected checkpoint source={expected_checkpoint_source!r}"
             )
         if self.checkpoint_task_variant != self.task_variant:
             raise ValueError(

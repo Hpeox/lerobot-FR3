@@ -1,4 +1,4 @@
-"""Inference-compatible ACMT force-field generator for generated mode."""
+"""Inference-compatible TactiGen force-field generator for tactigen mode."""
 
 from __future__ import annotations
 

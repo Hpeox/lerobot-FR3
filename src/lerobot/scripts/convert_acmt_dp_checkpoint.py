@@ -17,6 +17,7 @@ import hashlib
 import json
 import shutil
 import tempfile
+import uuid
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -39,7 +40,7 @@ DEFAULT_GENERATOR_CHECKPOINTS = {
         "/cym/TactiGen/ACMTv4/checkpoints/action_cmt_drifting_fz_xy_v2_gear_big2small_seed42_e20/best.pt"
     ),
 }
-MODES = ("none", "real", "generated")
+MODES = ("none", "real", "tactigen")
 TASKS = ("peg", "gear")
 
 
@@ -105,8 +106,17 @@ def _make_config(
     if not isinstance(legacy_config, Mapping) or not isinstance(statistics, Mapping):
         raise KeyError("Legacy policy checkpoint requires config and statistics")
     source_mode = legacy_config.get("tactile_source")
-    if source_mode != mode:
-        raise ValueError(f"Checkpoint tactile_source={source_mode!r}, requested mode={mode!r}")
+    expected_source_mode = "real" if mode == "tactigen" else mode
+    if source_mode == "generated":
+        raise ValueError(
+            "Legacy generated policy checkpoints are deprecated; use the real "
+            "policy checkpoint as the tactigen policy base"
+        )
+    if source_mode != expected_source_mode:
+        raise ValueError(
+            f"Checkpoint tactile_source={source_mode!r}, requested mode={mode!r}; "
+            f"expected policy source={expected_source_mode!r}"
+        )
     if int(legacy_config.get("obs_horizon", -1)) != 4:
         raise ValueError("Legacy checkpoint obs_horizon is not 4")
     if int(legacy_config.get("pred_horizon", -1)) != 16:
@@ -115,7 +125,7 @@ def _make_config(
         raise ValueError("Legacy checkpoint action_dim is not 8")
     return ACMTDPConfig(
         tactile_source=mode,
-        checkpoint_tactile_source=mode,
+        checkpoint_tactile_source=expected_source_mode,
         task_variant=task,
         checkpoint_task_variant=task,
         diffusion_train_steps=int(legacy_config["diffusion_train_steps"]),
@@ -176,9 +186,9 @@ def convert_one(
     generator = None
     generator_state = None
     generator_config = None
-    if mode == "generated":
+    if mode == "tactigen":
         if generator_checkpoint is None:
-            raise ValueError("generated conversion requires a generator checkpoint")
+            raise ValueError("tactigen conversion requires a TactiGen checkpoint")
         generator_checkpoint = generator_checkpoint.resolve()
         generator = _load_checkpoint(generator_checkpoint)
         generator_config = _generator_config(generator)
@@ -191,22 +201,24 @@ def convert_one(
     target_state = _strict_target_state(policy, policy_state, generator_state)
 
     output_dir = output_dir.resolve()
-    if output_dir.exists():
-        raise FileExistsError(f"Refusing to overwrite existing output: {output_dir}")
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}-", dir=output_dir.parent))
+    backup: Path | None = None
     try:
         policy.save_pretrained(temporary, state_dict=target_state)
         preprocessor, postprocessor = make_acmt_dp_pre_post_processors(config)
         preprocessor.save_pretrained(temporary, config_filename=f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json")
         postprocessor.save_pretrained(temporary, config_filename=f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json")
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "policy_type": "acmt_dp",
             "task_variant": task,
             "tactile_source": mode,
+            "policy_checkpoint_tactile_source": "real" if mode == "tactigen" else mode,
+            "protocol": "single_frozen_inference" if mode == "tactigen" else "direct_policy",
             "seed": 42,
             "source_checkpoint": str(source_checkpoint),
+            "source_policy_tactile_source": source.get("config", {}).get("tactile_source"),
             "source_checkpoint_sha256": _sha256(source_checkpoint),
             "source_global_step": int(source.get("global_step", -1)),
             "source_best_val_loss": float(source.get("best_val_loss", float("nan"))),
@@ -222,9 +234,16 @@ def convert_one(
         (temporary / "conversion_manifest.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
+        if output_dir.exists():
+            backup = output_dir.parent / f".{output_dir.name}.backup-{uuid.uuid4().hex}"
+            output_dir.rename(backup)
         temporary.rename(output_dir)
+        if backup is not None:
+            shutil.rmtree(backup)
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
+        if backup is not None and backup.exists() and not output_dir.exists():
+            backup.rename(output_dir)
         raise
     return output_dir
 
@@ -262,7 +281,8 @@ def main() -> None:
         policy_root = args.policy_source_root or DEFAULT_POLICY_CHECKPOINTS[task]
         generator_checkpoint = args.generator_checkpoint or DEFAULT_GENERATOR_CHECKPOINTS[task]
         for mode in modes:
-            source = policy_root / mode / "seed42" / "best.pt"
+            source_mode = "real" if mode == "tactigen" else mode
+            source = policy_root / source_mode / "seed42" / "best.pt"
             output = args.output_root / task / mode / "seed42" / "pretrained_model"
             print(f"Converting {task}/{mode}: {source} -> {output}", flush=True)
             converted = convert_one(
@@ -270,7 +290,7 @@ def main() -> None:
                 mode=mode,
                 source_checkpoint=source,
                 output_dir=output,
-                generator_checkpoint=generator_checkpoint if mode == "generated" else None,
+                generator_checkpoint=generator_checkpoint if mode == "tactigen" else None,
             )
             print(f"Saved {converted}", flush=True)
             gc.collect()
