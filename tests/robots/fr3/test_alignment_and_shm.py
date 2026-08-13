@@ -10,12 +10,14 @@ import numpy as np
 import pytest
 
 from lerobot.robots.fr3.sensorhub.aligned_shm import (
+    ABI_VERSION,
+    GLOBAL_HEADER,
     GLOBAL_HEADER_SIZE,
-    SLOT_HEADER_SIZE,
-    SLOT_STRIDE,
-    TOTAL_SIZE,
+    MAGIC,
+    SLOT_COUNT,
     AlignedObservationClient,
     AlignedObservationWriter,
+    aligned_observation_layout,
 )
 from lerobot.robots.fr3.sensorhub.cache import CausalAligner, SampleCache
 from lerobot.robots.fr3.sensorhub.readers import (
@@ -54,18 +56,35 @@ def camera(sequence, ingest_ns, value=0):
     )
 
 
-def test_abi_golden_sizes():
+def transform():
+    return np.array(
+        [
+            [0.0, -1.0, 0.0, 0.12],
+            [1.0, 0.0, 0.0, -0.34],
+            [0.0, 0.0, 1.0, 0.56],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+
+@pytest.mark.parametrize("camera_count", [1, 2, 4, 5])
+def test_abi_golden_sizes(camera_count):
+    layout = aligned_observation_layout(camera_count)
     assert GLOBAL_HEADER_SIZE == 320
-    assert SLOT_HEADER_SIZE == 160
-    assert SLOT_STRIDE == 6_161_080
-    assert TOTAL_SIZE == 12_322_480
+    assert MAGIC == b"FR3OBS2\0"
+    assert ABI_VERSION == 2
+    assert layout.slot_header_size == 96 + 16 * camera_count
+    assert layout.payload_size == camera_count * (921_600 + 614_400) + 16_984
+    assert layout.slot_stride == layout.slot_header_size + layout.payload_size
+    assert layout.total_size == GLOBAL_HEADER_SIZE + SLOT_COUNT * layout.slot_stride
+    if camera_count == 4:
+        assert layout.slot_header_size == 160
+        assert layout.slot_stride == 6_161_144
+        assert layout.total_size == 12_322_608
 
 
-def test_causal_alignment_and_duplicate_suppression():
-    camera_caches = tuple(SampleCache[CameraSample](0.5) for _ in range(4))
-    for index, cache in enumerate(camera_caches):
-        cache.append(camera(index + 1, 90_000_000))
-        cache.append(camera(index + 11, (100 + index * 5) * 1_000_000))
+def _required_caches():
     xense_cache = SampleCache[XenseSample](0.5)
     ft_cache = SampleCache[FTSample](0.5)
     robot_cache = SampleCache[RobotSample](0.5)
@@ -73,8 +92,36 @@ def test_causal_alignment_and_duplicate_suppression():
     field = np.zeros((35, 20, 3), dtype=np.float32)
     xense_cache.append(XenseSample(1, 95, 95_000_000, field, field))
     ft_cache.append(FTSample(1, 95, 95_000_000, np.zeros(6, dtype=np.float32)))
-    robot_cache.append(RobotSample(1, 95, 95_000_000, *(np.zeros(7, dtype=np.float32) for _ in range(3))))
+    robot_cache.append(
+        RobotSample(
+            1,
+            95,
+            95_000_000,
+            *(np.zeros(7, dtype=np.float32) for _ in range(3)),
+            np.eye(4, dtype=np.float32),
+        )
+    )
     gripper_cache.append(GripperSample(1, 95, 95_000_000, 1, 2))
+    return xense_cache, ft_cache, robot_cache, gripper_cache
+
+
+def test_causal_aligner_rejects_zero_cameras():
+    with pytest.raises(ValueError, match="at least one"):
+        CausalAligner(
+            (),
+            *_required_caches(),
+            camera_max_skew_ms=50,
+            required_sample_max_age_ms=100,
+        )
+
+
+@pytest.mark.parametrize("camera_count", [1, 2, 5])
+def test_causal_alignment_order_and_duplicate_suppression(camera_count):
+    camera_caches = tuple(SampleCache[CameraSample](0.5) for _ in range(camera_count))
+    for index, cache in enumerate(camera_caches):
+        cache.append(camera(index + 1, 90_000_000))
+        cache.append(camera(index + 11, (100 + index * 5) * 1_000_000))
+    xense_cache, ft_cache, robot_cache, gripper_cache = _required_caches()
     aligner = CausalAligner(
         camera_caches,
         xense_cache,
@@ -86,13 +133,40 @@ def test_causal_alignment_and_duplicate_suppression():
     )
     aligned = aligner.select(1, 120_000_000)
     assert aligned is not None
-    assert [sample.sequence for sample in aligned.cameras] == [11, 2, 3, 4]
+    assert [sample.sequence for sample in aligned.cameras] == [11, *range(2, camera_count + 1)]
+    np.testing.assert_array_equal(aligned.robot.O_T_EE, np.eye(4, dtype=np.float32))
     assert aligner.select(2, 121_000_000) is None
 
 
-def _aligned_sample(sequence=1):
+def test_causal_alignment_preserves_camera_skew_and_required_age_limits():
+    camera_caches = tuple(SampleCache[CameraSample](0.5) for _ in range(2))
+    camera_caches[0].append(camera(1, 100_000_000))
+    camera_caches[1].append(camera(1, 40_000_000))
+    camera_caches[1].append(camera(2, 110_000_000))
+    aligner = CausalAligner(
+        camera_caches,
+        *_required_caches(),
+        camera_max_skew_ms=50,
+        required_sample_max_age_ms=100,
+    )
+    assert aligner.select(1, 120_000_000) is None
+
+    fresh_cameras = tuple(SampleCache[CameraSample](0.5) for _ in range(2))
+    for cache in fresh_cameras:
+        cache.append(camera(1, 200_000_000))
+    stale_required = _required_caches()
+    aligner = CausalAligner(
+        fresh_cameras,
+        *stale_required,
+        camera_max_skew_ms=50,
+        required_sample_max_age_ms=100,
+    )
+    assert aligner.select(1, 210_000_000) is None
+
+
+def _aligned_sample(sequence=1, camera_count=2):
     now = time.monotonic_ns()
-    cameras = tuple(camera(i, now, i) for i in range(1, 5))
+    cameras = tuple(camera(i, now, i) for i in range(1, camera_count + 1))
     field0 = np.full((35, 20, 3), 1.5, dtype=np.float32)
     field1 = np.full((35, 20, 3), 2.5, dtype=np.float32)
     return AlignedSample(
@@ -109,28 +183,60 @@ def _aligned_sample(sequence=1):
             np.arange(7, dtype=np.float32),
             np.arange(10, 17, dtype=np.float32),
             np.arange(20, 27, dtype=np.float32),
+            transform(),
         ),
         GripperSample(8, now, now, 128, 3),
     )
 
 
-def test_aligned_shm_roundtrip_and_owned_buffer():
+@pytest.mark.parametrize("camera_count", [1, 2, 5])
+def test_aligned_shm_roundtrip_and_owned_buffer(camera_count):
     name = f"fr3_test_{uuid.uuid4().hex}"
-    writer = AlignedObservationWriter(name)
+    writer = AlignedObservationWriter(name, camera_count=camera_count)
     client = None
     try:
-        writer.publish(_aligned_sample())
+        sample = _aligned_sample(camera_count=camera_count)
+        writer.publish(sample)
+        global_header = GLOBAL_HEADER.unpack_from(writer._shm.buf, 0)
+        assert global_header[:11] == (
+            MAGIC,
+            ABI_VERSION,
+            1,
+            GLOBAL_HEADER_SIZE,
+            writer.layout.slot_header_size,
+            writer.layout.total_size,
+            SLOT_COUNT,
+            640,
+            480,
+            camera_count,
+            writer.layout.slot_stride,
+        )
         client = AlignedObservationClient(name)
         first, metadata = client.read(max_age_ms=1000)
         assert metadata.sequence == 1
-        assert first["camera.cam4.rgb"][0, 0, 0] == 4
+        assert client.camera_count == camera_count
+        assert first[f"camera.cam{camera_count}.rgb"][0, 0, 0] == camera_count
         assert first["camera.cam1.depth"].dtype == np.uint16
+        camera_keys = {key for key in first if key.startswith("camera.")}
+        assert camera_keys == {
+            *(f"camera.cam{i}.rgb" for i in range(1, camera_count + 1)),
+            *(f"camera.cam{i}.depth" for i in range(1, camera_count + 1)),
+        }
         assert first["xense.sensor0.force_field"].shape == (35, 20, 3)
         assert first["xense.sensor0.force_field"][0, 0, 0] == pytest.approx(1.5)
         assert first["gripper.pos"] == pytest.approx(128 / 255)
+        assert first["fr3.O_T_EE"].dtype == np.float32
+        np.testing.assert_array_equal(first["fr3.O_T_EE"], transform())
 
-        writer.publish(_aligned_sample(sequence=2))
-        assert first["camera.cam4.rgb"][0, 0, 0] == 4
+        header = writer.layout.slot_header.unpack_from(
+            writer._shm.buf,
+            GLOBAL_HEADER_SIZE + writer.layout.slot_stride,
+        )
+        source_sequences = header[4::2]
+        assert source_sequences == (*range(1, camera_count + 1), 5, 6, 7, 8)
+
+        writer.publish(_aligned_sample(sequence=2, camera_count=camera_count))
+        assert first[f"camera.cam{camera_count}.rgb"][0, 0, 0] == camera_count
     finally:
         if client is not None:
             client.close()
@@ -139,7 +245,7 @@ def test_aligned_shm_roundtrip_and_owned_buffer():
 
 def test_aligned_shm_fatal_and_stale_detection():
     name = f"fr3_test_{uuid.uuid4().hex}"
-    writer = AlignedObservationWriter(name)
+    writer = AlignedObservationWriter(name, camera_count=2)
     client = None
     try:
         sample = _aligned_sample()
@@ -160,6 +266,77 @@ def test_aligned_shm_fatal_and_stale_detection():
         writer.set_fatal("required source stalled", status_code=9)
         with pytest.raises(RuntimeError, match="required source stalled"):
             client.read(max_age_ms=1000)
+    finally:
+        if client is not None:
+            client.close()
+        writer.close()
+
+
+@pytest.mark.parametrize(
+    ("offset", "format", "value"),
+    [
+        (20, "<I", 999),
+        (24, "<Q", 999),
+        (44, "<I", 0),
+        (48, "<Q", 999),
+    ],
+)
+def test_aligned_shm_rejects_inconsistent_header_metadata(offset, format, value):
+    name = f"fr3_invalid_{uuid.uuid4().hex}"
+    writer = AlignedObservationWriter(name, camera_count=2)
+    try:
+        writer.publish(_aligned_sample(camera_count=2))
+        struct.pack_into(format, writer._shm.buf, offset, value)
+        with pytest.raises(ValueError):
+            AlignedObservationClient(name)
+    finally:
+        writer.close()
+
+
+def test_aligned_shm_rejects_mapping_smaller_than_declared_layout():
+    name = f"fr3_short_{uuid.uuid4().hex}"
+    raw = SharedMemory(name=name, create=True, size=GLOBAL_HEADER_SIZE)
+    layout = aligned_observation_layout(1)
+    try:
+        GLOBAL_HEADER.pack_into(
+            raw.buf,
+            0,
+            MAGIC,
+            ABI_VERSION,
+            1,
+            GLOBAL_HEADER_SIZE,
+            layout.slot_header_size,
+            layout.total_size,
+            SLOT_COUNT,
+            640,
+            480,
+            1,
+            layout.slot_stride,
+            0,
+            0,
+            0,
+            b"\0" * 248,
+        )
+        with pytest.raises(ValueError, match="metadata mismatch"):
+            AlignedObservationClient(name)
+    finally:
+        raw.close()
+        raw.unlink()
+
+
+def test_aligned_shm_rejects_camera_count_mismatch_and_incoherent_slot():
+    name = f"fr3_mismatch_{uuid.uuid4().hex}"
+    writer = AlignedObservationWriter(name, camera_count=2)
+    client = None
+    try:
+        with pytest.raises(ValueError, match="expected 2"):
+            writer.publish(_aligned_sample(camera_count=1))
+        writer.publish(_aligned_sample(camera_count=2))
+        client = AlignedObservationClient(name)
+        slot_base = GLOBAL_HEADER_SIZE + writer.layout.slot_stride
+        struct.pack_into("<Q", writer._shm.buf, slot_base, 1)
+        with pytest.raises(TimeoutError):
+            client.read(timeout_ms=2, max_age_ms=1000)
     finally:
         if client is not None:
             client.close()

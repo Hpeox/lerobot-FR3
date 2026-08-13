@@ -30,11 +30,10 @@ from ..robot import Robot
 from .config_fr3 import FR3Config
 from .feature_adapter import (
     ACTION_KEYS,
-    DEPTH_KEYS,
     JOINT_POSITION_KEYS,
-    RGB_KEYS,
     XENSE_KEYS,
     fr3_action_dataset_features,
+    fr3_camera_feature_keys,
     fr3_observation_dataset_features,
 )
 from .protocols import COMMAND_FLAG_RESET_JOINT, pack_command, policy_gripper_to_gpo
@@ -68,17 +67,19 @@ class FR3(Robot):
 
     @property
     def observation_features(self) -> dict[str, type | tuple[int, ...] | PolicyFeature]:
+        rgb_keys, depth_keys = fr3_camera_feature_keys(len(self.config.realsense_shm_names))
         features: dict[str, type | tuple[int, ...] | PolicyFeature] = {
             **dict.fromkeys(JOINT_POSITION_KEYS, float),
             "fr3.dq": PolicyFeature(type=FeatureType.STATE, shape=(7,)),
             "fr3.tau_J": PolicyFeature(type=FeatureType.STATE, shape=(7,)),
+            "fr3.O_T_EE": PolicyFeature(type=FeatureType.STATE, shape=(4, 4)),
             "gripper.pos": float,
             "gripper.gPO": np.uint8,
             "gripper.gCU": np.uint8,
             "ft300s.wrench": PolicyFeature(type=FeatureType.STATE, shape=(6,)),
             **dict.fromkeys(XENSE_KEYS, PolicyFeature(type=FeatureType.STATE, shape=(35, 20, 3))),
-            **dict.fromkeys(RGB_KEYS, (480, 640, 3)),
-            **dict.fromkeys(DEPTH_KEYS, (480, 640, 1)),
+            **dict.fromkeys(rgb_keys, (480, 640, 3)),
+            **dict.fromkeys(depth_keys, (480, 640, 1)),
         }
         return features
 
@@ -88,10 +89,13 @@ class FR3(Robot):
 
     @property
     def visual_feature_keys(self) -> tuple[str, ...]:
-        return (*RGB_KEYS, *DEPTH_KEYS)
+        rgb_keys, depth_keys = fr3_camera_feature_keys(len(self.config.realsense_shm_names))
+        return (*rgb_keys, *depth_keys)
 
     def observation_dataset_features(self, *, use_videos: bool = True) -> dict[str, dict[str, Any]]:
-        return fr3_observation_dataset_features(use_videos=use_videos)
+        return fr3_observation_dataset_features(
+            camera_count=len(self.config.realsense_shm_names), use_videos=use_videos
+        )
 
     def action_dataset_features(self) -> dict[str, dict[str, Any]]:
         return fr3_action_dataset_features()

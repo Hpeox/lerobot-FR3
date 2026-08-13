@@ -22,6 +22,29 @@ def _default_sensorhub_socket_path() -> str:
     return f"/run/user/{os.getuid()}/fr3_sensorhub.sock"
 
 
+def normalize_realsense_shm_names(values: object) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, (list, tuple)):
+        raise TypeError("realsense_shm_names must be an ordered tuple or list of SHM names")
+    names = tuple(values)
+    if not names:
+        raise ValueError("at least one RealSense SHM name is required")
+    if any(not isinstance(name, str) for name in names):
+        raise TypeError("RealSense SHM names must be strings")
+    invalid_names = [
+        name
+        for name in names
+        if len(name) <= 1 or not name.startswith("/") or "/" in name[1:] or "\0" in name
+    ]
+    if invalid_names:
+        raise ValueError(
+            "RealSense SHM names must contain one leading slash and a non-empty simple name: "
+            f"{invalid_names}"
+        )
+    if len(set(names)) != len(names):
+        raise ValueError("RealSense SHM names must be unique")
+    return names
+
+
 @RobotConfig.register_subclass("fr3")
 @dataclass(kw_only=True)
 class FR3Config(RobotConfig):
@@ -31,11 +54,9 @@ class FR3Config(RobotConfig):
     telemetry_endpoint: str = "tcp://192.168.1.37:6000"
     observation_shm_name: str = "/fr3_aligned_observation"
     sensorhub_socket_path: str = field(default_factory=_default_sensorhub_socket_path)
-    realsense_shm_names: tuple[str, str, str, str] = (
+    realsense_shm_names: tuple[str, ...] = (
         "/realsense_cam1",
         "/realsense_cam2",
-        "/realsense_cam3",
-        "/realsense_cam4",
     )
     xense_shm_name: str = "xense_sensor_frame"
     ft300s_shm_name: str = "ft300_sensor_frame"
@@ -66,8 +87,7 @@ class FR3Config(RobotConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if len(self.realsense_shm_names) != 4:
-            raise ValueError("FR3 requires exactly four RealSense SHM names")
+        self.realsense_shm_names = normalize_realsense_shm_names(self.realsense_shm_names)
         positive = {
             "sensorhub_start_timeout_s": self.sensorhub_start_timeout_s,
             "sensorhub_stop_timeout_s": self.sensorhub_stop_timeout_s,

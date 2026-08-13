@@ -62,8 +62,8 @@ class CausalAligner:
         camera_max_skew_ms: int,
         required_sample_max_age_ms: int,
     ):
-        if len(cameras) != 4:
-            raise ValueError("CausalAligner requires four camera caches")
+        if not cameras:
+            raise ValueError("CausalAligner requires at least one camera cache")
         self.cameras = cameras
         self.xense = xense
         self.ft = ft

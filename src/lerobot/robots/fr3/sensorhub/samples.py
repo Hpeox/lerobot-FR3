@@ -42,6 +42,7 @@ class RobotSample:
     q: np.ndarray
     dq: np.ndarray
     tau_j: np.ndarray
+    O_T_EE: np.ndarray
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,7 +59,7 @@ class AlignedSample:
     sequence: int
     publish_realtime_ns: int
     publish_monotonic_ns: int
-    cameras: tuple[CameraSample, CameraSample, CameraSample, CameraSample]
+    cameras: tuple[CameraSample, ...]
     xense: XenseSample
     ft: FTSample
     robot: RobotSample

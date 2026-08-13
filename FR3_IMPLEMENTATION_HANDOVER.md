@@ -18,9 +18,10 @@ byte-level protocol reference is the
 ## Executive Summary
 
 The implementation adds a LeRobot `FR3` Robot backed by a managed SensorHub subprocess. SensorHub
-attaches read-only to four RealSense shared-memory writers, one dual-Xense writer, one FT300S
-writer, and an FGT1 ZMQ telemetry stream. It causally aligns these sources and publishes coherent
-observations through a two-slot shared-memory mapping owned by SensorHub.
+attaches read-only to the ordered non-empty RealSense SHM subset selected by the FR3 configuration,
+one dual-Xense writer, one FT300S writer, and an FGT1 ZMQ telemetry stream. It causally aligns these
+sources and publishes coherent observations through a two-slot shared-memory mapping owned by
+SensorHub.
 
 The Robot exposes the aligned data through the normal LeRobot observation interface and publishes
 eight-field actions through a latest-only ZMQ `PUB` socket. Explicit dataset feature definitions
@@ -146,7 +147,9 @@ is unchanged. Reset frames carry `gripper_gPO=0`, which the remote reset impleme
 
 - The dataset adapter explicitly separates state arrays from camera data. Xense is stored as two
   independent numeric `float32` arrays shaped `(35, 20, 3)`; it is not encoded as image or video.
-- Four RGB arrays use shape `(480, 640, 3)` and four depth arrays use shape `(480, 640, 1)`.
+- The configured N RGB arrays use shape `(480, 640, 3)` and the N depth arrays use shape
+  `(480, 640, 1)`; tuple position defines `camera.cam1` through `camera.camN`.
+- `O_T_EE` remains a numeric float32 `(4, 4)` feature through dataset and policy preparation.
 - The FR3 policy processor converts HWC to BCHW, BHWC to BCHW, and BTHWC to BTCHW.
 - RGB is converted to `float32` and normalized to `[0, 1]`.
 - Depth is converted to `float32` without dividing the Z16 values, preserving the depth scale.
@@ -175,7 +178,7 @@ is unchanged. Reset frames carry `gripper_gPO=0`, which the remote reset impleme
 | `telemetry_endpoint` | `tcp://192.168.1.37:6000` |
 | `observation_shm_name` | `/fr3_aligned_observation` |
 | `sensorhub_socket_path` | `/run/user/<uid>/fr3_sensorhub.sock` |
-| `realsense_shm_names` | `/realsense_cam1` through `/realsense_cam4` |
+| `realsense_shm_names` | `("/realsense_cam1", "/realsense_cam2")` |
 | `xense_shm_name` | `xense_sensor_frame` |
 | `ft300s_shm_name` | `ft300_sensor_frame` |
 | `sensorhub_start_timeout_s` | `10.0` |
@@ -189,7 +192,8 @@ is unchanged. Reset frames carry `gripper_gPO=0`, which the remote reset impleme
 | `reset_completion_timeout_s` | `30.0` |
 | `reset_retry_interval_s` | `0.1` |
 
-Every timeout and cache duration must be positive, and exactly four RealSense SHM names are required.
+Every timeout and cache duration must be positive. `realsense_shm_names` must be an ordered,
+non-empty tuple/list of unique simple POSIX SHM names; there is no fixed maximum camera count.
 
 ### Action schema
 
@@ -208,14 +212,15 @@ above.
 | `fr3_joint1.pos` ... `fr3_joint7.pos` | scalar float | Joint position in radians |
 | `fr3.dq` | `float32 (7,)` | Joint velocity |
 | `fr3.tau_J` | `float32 (7,)` | Joint torque |
+| `fr3.O_T_EE` | `float32 (4, 4)` | Conventional homogeneous end-effector transform |
 | `gripper.pos` | scalar float | Normalized `gPO / 255` |
 | `gripper.gPO` | `uint8` | Raw gripper position feedback |
 | `gripper.gCU` | `uint8` | Raw gripper current feedback |
 | `ft300s.wrench` | `float32 (6,)` | FT300S wrench |
 | `xense.sensor0.force_field` | `float32 (35, 20, 3)` | First tactile force field |
 | `xense.sensor1.force_field` | `float32 (35, 20, 3)` | Second tactile force field |
-| `camera.cam1.rgb` ... `camera.cam4.rgb` | `uint8 (480, 640, 3)` | RGB images |
-| `camera.cam1.depth` ... `camera.cam4.depth` | `uint16 (480, 640, 1)` | Z16 depth images |
+| `camera.cam1.rgb` ... `camera.camN.rgb` | `uint8 (480, 640, 3)` | Ordered RGB images |
+| `camera.cam1.depth` ... `camera.camN.depth` | `uint16 (480, 640, 1)` | Ordered Z16 depth images |
 
 The dataset schema groups the seven joint positions and normalized gripper position into
 `observation.state` with shape `(8,)`. Velocity, torque, raw gripper values, wrench, and Xense fields
@@ -250,7 +255,9 @@ lifecycle method. Successful return means the remote reset request was acknowled
 
 - SensorHub accepts only 504-byte `FGT1` version 1 frames.
 - Robot source `2` requires valid-mask bit `2` and maps `q=floats[8:15]`,
-  `dq=floats[15:22]`, and `tau_J=floats[22:29]`.
+  `dq=floats[15:22]`, `tau_J=floats[22:29]`, and `O_T_EE=floats[36:52]`.
+- The column-major libfranka `O_T_EE` wire values are converted once during FGT1 parsing into a
+  conventional float32 `(4, 4)` matrix.
 - Robot telemetry flags bit 0 is `RESETTING`. It remains control-only state and is not included in
   `RobotSample`, aligned SHM, or observations.
 - Gripper source `3` requires valid-mask bit `4` and supplies `gPO` and `gCU`.
@@ -258,15 +265,17 @@ lifecycle method. Successful return means the remote reset request was acknowled
 - The multiplexed telemetry subscriber intentionally does not use `CONFLATE`, because conflation
   across sources could starve either the robot or gripper cache. It uses `RCVHWM=100`.
 
-### AlignedObservation SHM ABI v1
+### AlignedObservation SHM ABI v2
 
 - Linux x86-64, little-endian, 8-byte aligned, two-slot seqlock mapping.
-- Magic `FR3OBS1\0`, global header `320` bytes, slot header `160` bytes.
-- Slot stride `6,161,080` bytes; total mapping size `12,322,480` bytes.
+- Magic `FR3OBS2\0`, ABI version `2`, fixed global header `320` bytes.
+- For `N` configured cameras, slot header size is `96 + 16*N`, payload size is
+  `N*(921,600 + 614,400) + 16,984`, and total size is `320 + 2*slot_stride`.
+- The global header records `camera_count`; camera names are not encoded.
 - Snapshot `L` uses slot `L % 2` and is stable only when its seqlock equals `2 * L` before and after
   the reader's copy.
-- Payload order is four RGB arrays, four depth arrays, two Xense arrays, wrench, `q`, `dq`, `tau_J`,
-  normalized gripper position, `gPO`, `gCU`, and padding.
+- Payload order is N RGB arrays, N depth arrays, two Xense arrays, wrench, `q`, `dq`, `tau_J`,
+  `O_T_EE`, normalized gripper position, `gPO`, `gCU`, and padding.
 
 ### SensorHub UDS protocol
 
@@ -304,8 +313,8 @@ The FR3 extra supplies `pyzmq`. The repository requires Python 3.12 or newer.
 
 Start these components before starting LeRobot:
 
-1. RealSense writers for `/realsense_cam1`, `/realsense_cam2`, `/realsense_cam3`, and
-   `/realsense_cam4`.
+1. RealSense writers for every configured `realsense_shm_names` entry; the default requires
+   `/realsense_cam1` and `/realsense_cam2`. The external runtime may run additional cameras.
 2. Dual-Xense writer for `xense_sensor_frame`.
 3. FT300S writer for `ft300_sensor_frame`.
 4. FGT1 telemetry relay publishing at `tcp://192.168.1.37:6000`.
@@ -316,7 +325,6 @@ The local SHM files can be checked with:
 ```bash
 ls -l \
   /dev/shm/realsense_cam1 /dev/shm/realsense_cam2 \
-  /dev/shm/realsense_cam3 /dev/shm/realsense_cam4 \
   /dev/shm/xense_sensor_frame /dev/shm/ft300_sensor_frame
 ```
 

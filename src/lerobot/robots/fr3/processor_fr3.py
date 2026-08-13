@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,7 +13,14 @@ import torch
 from lerobot.configs import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.processor.pipeline import ObservationProcessorStep, ProcessorStepRegistry
 
-from .feature_adapter import DEPTH_KEYS, RGB_KEYS, XENSE_KEYS
+from .feature_adapter import XENSE_KEYS
+
+CAMERA_FEATURE_PATTERN = re.compile(r"^camera\.cam[1-9][0-9]*\.(rgb|depth)$")
+
+
+def _camera_feature_kind(raw_key: str) -> str | None:
+    match = CAMERA_FEATURE_PATTERN.fullmatch(raw_key)
+    return None if match is None else match.group(1)
 
 
 def _channels_first(value: np.ndarray | torch.Tensor, *, normalize_rgb: bool = False):
@@ -46,9 +54,10 @@ def prepare_fr3_array_for_policy(key: str, value: Any):
     raw_key = key.removeprefix("observation.").removeprefix("images.")
     if raw_key in XENSE_KEYS:
         return _channels_first(value)
-    if raw_key in RGB_KEYS:
+    camera_kind = _camera_feature_kind(raw_key)
+    if camera_kind == "rgb":
         return _channels_first(value, normalize_rgb=True)
-    if raw_key in DEPTH_KEYS:
+    if camera_kind == "depth":
         return _channels_first(value)
     return value
 
@@ -70,8 +79,8 @@ class FR3PolicyObservationProcessorStep(ObservationProcessorStep):
             raw_key = key.removeprefix("observation.").removeprefix("images.")
             if raw_key in XENSE_KEYS:
                 bucket[key] = PolicyFeature(type=FeatureType.STATE, shape=(3, 35, 20))
-            elif raw_key in RGB_KEYS:
+            elif _camera_feature_kind(raw_key) == "rgb":
                 bucket[key] = PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640))
-            elif raw_key in DEPTH_KEYS:
+            elif _camera_feature_kind(raw_key) == "depth":
                 bucket[key] = PolicyFeature(type=FeatureType.VISUAL, shape=(1, 480, 640))
         return transformed

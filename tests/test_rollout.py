@@ -353,3 +353,19 @@ def test_rollout_context_fields():
 
     field_names = {f.name for f in dataclasses.fields(RolloutContext)}
     assert field_names == {"runtime", "hardware", "policy", "processors", "data"}
+
+
+def test_visual_feature_coverage_requires_every_policy_camera_but_allows_robot_superset():
+    from lerobot.rollout.context import _validate_visual_feature_coverage
+
+    cam1 = {
+        "observation.images.camera.cam1.rgb",
+        "observation.images.camera.cam1.depth",
+    }
+    cam2 = {
+        "observation.images.camera.cam2.rgb",
+        "observation.images.camera.cam2.depth",
+    }
+    _validate_visual_feature_coverage(cam1, cam1 | cam2)
+    with pytest.raises(ValueError, match="camera.cam2"):
+        _validate_visual_feature_coverage(cam1 | cam2, cam1)

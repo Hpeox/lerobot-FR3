@@ -71,7 +71,15 @@ def _batch(mode: str = "none", batch_size: int = 1) -> dict[str, torch.Tensor]:
         batch[XENSE0] = torch.zeros(batch_size, 35, 20, 3)
         batch[XENSE1] = torch.zeros(batch_size, 3, 35, 20)
     if mode == "tactigen":
-        batch[O_T_EE] = torch.eye(4).repeat(batch_size, 1, 1)
+        pose = torch.tensor(
+            [
+                [0.0, -1.0, 0.0, 0.12],
+                [1.0, 0.0, 0.0, -0.34],
+                [0.0, 0.0, 1.0, 0.56],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
+        )
+        batch[O_T_EE] = pose.repeat(batch_size, 1, 1)
     return batch
 
 
@@ -106,6 +114,18 @@ def test_mode_specific_config_validation() -> None:
     config.task_variant = "gear"
     with pytest.raises(ValueError, match="checkpoint/runtime task mismatch"):
         config.validate_features()
+
+
+def test_tactigen_config_and_roi_processor_keep_conventional_pose_matrix():
+    config = _config("tactigen")
+    assert config.input_features[O_T_EE].shape == (4, 4)
+    pose = _batch("tactigen")[O_T_EE]
+    step = ACMTDPWristROIProcessorStep(
+        camera_keys=config.wrist_camera_keys,
+        roi=config.wrist_roi,
+    )
+    processed = step.observation({O_T_EE: pose})
+    assert processed[O_T_EE] is pose
 
 
 def test_roi_processor_maps_rgb_and_depth() -> None:
@@ -173,6 +193,7 @@ def test_tactigen_causal_state_replans_and_reset() -> None:
 
     def fake_generate(self, previous, action_chunk):
         assert previous["lowdim"].shape == (1, 4, 28)
+        torch.testing.assert_close(previous["pose"][:, -1], batch[O_T_EE])
         generator_inputs.append(action_chunk[:, 0].clone())
         return torch.full((1, 2, 35, 20, 3), 7.0)
 

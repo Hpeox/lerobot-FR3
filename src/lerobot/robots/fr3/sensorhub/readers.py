@@ -55,8 +55,13 @@ class RealSenseReader:
     """Strict reader for the existing RealSense RGB/depth SHM ABI v1."""
 
     def __init__(self, shm_name: str):
-        if not shm_name.startswith("/") or "/" in shm_name[1:]:
-            raise ValueError("RealSense SHM name must contain one leading slash")
+        if (
+            len(shm_name) <= 1
+            or not shm_name.startswith("/")
+            or "/" in shm_name[1:]
+            or "\0" in shm_name
+        ):
+            raise ValueError("RealSense SHM name must contain one leading slash and a simple name")
         self.shm_name = shm_name
         self._fd = os.open(Path("/dev/shm") / shm_name[1:], os.O_RDONLY)
         size = os.fstat(self._fd).st_size
@@ -277,6 +282,7 @@ class TelemetryReader:
                 decoded.q,
                 decoded.dq,
                 decoded.tau_j,
+                decoded.O_T_EE,
             )
         if isinstance(decoded, GripperTelemetry):
             return GripperSample(

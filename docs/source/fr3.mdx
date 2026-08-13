@@ -1,9 +1,9 @@
 # FR3 Robot and SensorHub
 
-The `fr3` Robot integrates an FR3 arm, Robotiq gripper, four externally managed RealSense writers,
-a dual-Xense writer, and an FT300S writer. The Robot owns only its SensorHub subprocess and its
-local command publisher. It never starts or stops the upstream sensor writers, telemetry relay, or
-remote command subscriber.
+The `fr3` Robot integrates an FR3 arm, Robotiq gripper, an ordered non-empty subset of externally
+managed RealSense writers, a dual-Xense writer, and an FT300S writer. The Robot owns only its
+SensorHub subprocess and its local command publisher. It never starts or stops the upstream sensor
+writers, telemetry relay, or remote command subscriber.
 
 ## Scope and startup
 
@@ -11,7 +11,8 @@ An external run controller does not exist yet and is not part of this implementa
 implemented, an operator or temporary script must start and verify these prerequisites before
 starting LeRobot:
 
-1. Four RealSense SHM writers: `/realsense_cam1` through `/realsense_cam4`.
+1. Every RealSense SHM writer selected by `realsense_shm_names`; the default tuple is
+   `("/realsense_cam1", "/realsense_cam2")`.
 2. The dual-Xense writer: `xense_sensor_frame`.
 3. The FT300S writer: `ft300_sensor_frame`.
 4. The FGT1 telemetry relay at `tcp://192.168.1.37:6000`.
@@ -41,8 +42,10 @@ logged when changed, and converted with `floor(value * 255 + 0.5)`. `send_action
 values actually submitted to the local publisher.
 
 Observations expose joint position, velocity, torque, normalized and raw gripper feedback, FT300S
-wrench, two independent `(35, 20, 3)` float32 Xense force fields, four RGB images, and four Z16 depth
-images. The FR3 feature adapter declares Xense as numeric Array3D data; it is not encoded as video.
+wrench, a conventional float32 `(4, 4)` `O_T_EE`, two independent `(35, 20, 3)` float32 Xense
+force fields, and one RGB/Z16 depth pair per configured RealSense input. Tuple order defines the
+logical `camera.cam1` through `camera.camN` order. The FR3 feature adapter declares Xense as numeric
+Array3D data; it is not encoded as video.
 The FR3 policy processor converts online Xense HWC to BCHW and offline BTHWC to BTCHW. It performs
 no sensor I/O, alignment, feature encoding, safety control, or CNN fusion.
 
@@ -83,27 +86,31 @@ reset implementation must ignore the gripper byte in a `RESET_JOINT` frame.
 ## FGT1 telemetry ABI
 
 SensorHub accepts only 504-byte `FGT1` version 1 frames. Robot source 2 requires valid-mask bit 2
-and maps `q=floats[8:15]`, `dq=floats[15:22]`, and `tau_J=floats[22:29]`. Gripper source 3 requires
-valid-mask bit 4 and supplies `gPO/gCU`. Their sequences and caches remain independent. GELLO source
-1 is ignored. Robot telemetry flags bit 0 is `RESETTING`; SensorHub carries it only as runtime
-control state. It is not part of `RobotSample`, aligned SHM, or the observation dictionary.
+and maps `q=floats[8:15]`, `dq=floats[15:22]`, `tau_J=floats[22:29]`, and
+`O_T_EE=floats[36:52]`. The libfranka matrix is column-major on the wire and is converted exactly
+once at this protocol boundary into a conventional float32 `(4, 4)` matrix. Gripper source 3
+requires valid-mask bit 4 and supplies `gPO/gCU`. Their sequences and caches remain independent.
+GELLO source 1 is ignored. Robot telemetry flags bit 0 is `RESETTING`; SensorHub carries it only as
+runtime control state. It is not part of `RobotSample`, aligned SHM, or the observation dictionary.
 
-## AlignedObservation SHM ABI v1
+## AlignedObservation SHM ABI v2
 
 SensorHub owns `/fr3_aligned_observation`. It is a Linux x86-64 little-endian, 8-byte-aligned,
-two-slot seqlock mapping with magic `FR3OBS1\0`:
+two-slot seqlock mapping with magic `FR3OBS2\0`. For `N = len(realsense_shm_names)`:
 
 ```text
-global header  320 bytes
-slot header    160 bytes
-slot stride    6,161,080 bytes
-total size     12,322,480 bytes
+global header size = 320
+slot header size   = 96 + 16*N
+payload size       = N*(921,600 + 614,400) + 16,984
+slot stride        = slot header size + payload size
+total size         = 320 + 2*slot stride
 ```
 
-The global header stores ABI sizes, dimensions, latest sequence, and fatal status/message. The slot
-header stores the aligned sequence and publish clocks followed by sequence/source-time pairs for
-four cameras, Xense, FT300S, robot, and gripper. Payload order is four RGB arrays, four depth arrays,
-two Xense fields, wrench, q, dq, tau_J, normalized gripper position, gPO, gCU, and six padding bytes.
+The global header stores ABI sizes, dimensions, `camera_count`, latest sequence, and fatal
+status/message. The slot header stores aligned metadata followed by sequence/source-time pairs for
+the N ordered cameras, Xense, FT300S, robot, and gripper. Payload order is N RGB arrays, N depth
+arrays, two Xense fields, wrench, q, dq, tau_J, `O_T_EE`, normalized gripper position, gPO, gCU,
+and six padding bytes. Camera names are not encoded in this mapping.
 
 For snapshot `L`, slot `L % 2` is stable only when its seqlock equals `2 * L`. A reader copies the
 whole slot and checks the seqlock again. The Robot returns arrays backed by that independent local

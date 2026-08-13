@@ -79,17 +79,38 @@ def _telemetry_frame(source: int, mask: int, floats: list[float], gpo=0, gcu=0, 
     return TELEMETRY_STRUCT.pack(b"FGT1", 1, source, flags, 42, 12.5, mask, *floats, gpo, gcu)
 
 
+def _expected_transform():
+    return np.array(
+        [
+            [0.0, -1.0, 0.0, 0.12],
+            [1.0, 0.0, 0.0, -0.34],
+            [0.0, 0.0, 1.0, 0.56],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+
 def test_parse_robot_and_gripper_telemetry():
+    assert TELEMETRY_STRUCT.size == 504
     values = [math.nan] * 58
     values[8:15] = range(7)
     values[15:22] = range(10, 17)
     values[22:29] = range(20, 27)
+    expected_transform = _expected_transform()
+    values[36:52] = expected_transform.flatten(order="F")
     robot = parse_telemetry(_telemetry_frame(2, 2, values))
     assert isinstance(robot, RobotTelemetry)
     assert robot.resetting is False
     np.testing.assert_array_equal(robot.q, np.arange(7, dtype=np.float32))
     np.testing.assert_array_equal(robot.dq, np.arange(10, 17, dtype=np.float32))
     np.testing.assert_array_equal(robot.tau_j, np.arange(20, 27, dtype=np.float32))
+    assert robot.O_T_EE.dtype == np.float32
+    assert robot.O_T_EE.shape == (4, 4)
+    np.testing.assert_array_equal(robot.O_T_EE, expected_transform)
+    np.testing.assert_array_equal(
+        robot.O_T_EE[:3, 3], np.array([0.12, -0.34, 0.56], dtype=np.float32)
+    )
 
     gripper = parse_telemetry(_telemetry_frame(3, 4, [math.nan] * 58, 19, 3))
     assert isinstance(gripper, GripperTelemetry)
@@ -114,6 +135,13 @@ def test_parse_telemetry_rejects_wrong_size_and_mask():
         parse_telemetry(b"short")
     with pytest.raises(ValueError):
         parse_telemetry(_telemetry_frame(2, 0, [0.0] * 58))
+
+
+def test_parse_robot_telemetry_rejects_nonfinite_transform():
+    values = [0.0] * 58
+    values[36] = math.nan
+    with pytest.raises(ValueError, match="O_T_EE"):
+        parse_telemetry(_telemetry_frame(2, 2, values))
 
 
 def test_uds_packet_has_exact_schema_and_bounded_diagnostic():
@@ -244,6 +272,8 @@ def test_telemetry_reader_keeps_robot_and_gripper_sources_independent(tmp_path):
             if isinstance(sample, RobotSample):
                 break
         assert reader.robot_resetting is True
+        assert sample.O_T_EE.dtype == np.float32
+        assert sample.O_T_EE.shape == (4, 4)
     finally:
         reader.close()
         publisher.close(linger=0)

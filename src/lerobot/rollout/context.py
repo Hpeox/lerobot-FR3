@@ -171,6 +171,19 @@ class RolloutContext:
 # ---------------------------------------------------------------------------
 
 
+def _validate_visual_feature_coverage(expected: set[str], provided: set[str]) -> None:
+    missing = expected - provided
+    if missing:
+        raise ValueError(
+            f"Visual feature mismatch between policy and robot hardware.\n"
+            f"Policy expects: {expected}\n"
+            f"Robot provides: {provided}\n"
+            f"Missing from robot: {missing}\n"
+            f"Use --rename_map to map camera names, e.g. "
+            f"""--rename_map='{{"observation.images.top": "observation.images.cam0"}}'"""
+        )
+
+
 def build_rollout_context(
     cfg: RolloutConfig,
     shutdown_event: Event,
@@ -353,16 +366,7 @@ def build_rollout_context(
                 k for k, v in robot.observation_features.items() if isinstance(v, tuple)
             )
         provided_visuals = {f"observation.images.{k}" for k in visual_feature_keys}
-        policy_subset = expected_visuals.issubset(provided_visuals)
-        hw_subset = provided_visuals.issubset(expected_visuals)
-        if not (policy_subset or hw_subset):
-            raise ValueError(
-                f"Visual feature mismatch between policy and robot hardware.\n"
-                f"Policy expects: {expected_visuals}\n"
-                f"Robot provides: {provided_visuals}\n"
-                f"Use --rename_map to map camera names, e.g. "
-                f"""--rename_map='{{"observation.images.top": "observation.images.cam0"}}'"""
-            )
+        _validate_visual_feature_coverage(expected_visuals, provided_visuals)
 
     # --- 5. Dataset -------------
     dataset = None

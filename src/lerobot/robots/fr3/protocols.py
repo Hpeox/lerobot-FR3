@@ -39,6 +39,7 @@ class RobotTelemetry:
     q: np.ndarray
     dq: np.ndarray
     tau_j: np.ndarray
+    O_T_EE: np.ndarray
     resetting: bool
 
 
@@ -123,15 +124,22 @@ def parse_telemetry(frame: bytes) -> RobotTelemetry | GripperTelemetry | None:
         q = np.array(floats[8:15], dtype=np.float32)
         dq = np.array(floats[15:22], dtype=np.float32)
         tau_j = np.array(floats[22:29], dtype=np.float32)
-        if not (np.isfinite(q).all() and np.isfinite(dq).all() and np.isfinite(tau_j).all()):
-            raise ValueError("robot telemetry contains non-finite q/dq/tau_J")
+        O_T_EE = np.asarray(floats[36:52], dtype=np.float32).reshape(4, 4, order="F")
+        if not (
+            np.isfinite(q).all()
+            and np.isfinite(dq).all()
+            and np.isfinite(tau_j).all()
+            and np.isfinite(O_T_EE).all()
+        ):
+            raise ValueError("robot telemetry contains non-finite q/dq/tau_J/O_T_EE")
         return RobotTelemetry(
-            sequence,
-            timestamp_ns,
-            q,
-            dq,
-            tau_j,
-            bool(flags & ROBOT_TELEMETRY_FLAG_RESETTING),
+            sequence=sequence,
+            timestamp_ns=timestamp_ns,
+            q=q,
+            dq=dq,
+            tau_j=tau_j,
+            O_T_EE=O_T_EE,
+            resetting=bool(flags & ROBOT_TELEMETRY_FLAG_RESETTING),
         )
     if source == GRIPPER_SOURCE:
         if not valid_mask & GRIPPER_VALID_MASK:

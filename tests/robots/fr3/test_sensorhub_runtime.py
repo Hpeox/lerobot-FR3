@@ -1,10 +1,12 @@
 import os
 import time
 import uuid
-from threading import Thread
+from threading import Event, Thread
 
 import numpy as np
+import pytest
 
+from lerobot.robots.fr3.sensorhub import runtime as runtime_module
 from lerobot.robots.fr3.sensorhub.aligned_shm import AlignedObservationClient, AlignedObservationWriter
 from lerobot.robots.fr3.sensorhub.runtime import SensorHubConfig, SensorHubRuntime
 from lerobot.robots.fr3.sensorhub.samples import (
@@ -16,12 +18,12 @@ from lerobot.robots.fr3.sensorhub.samples import (
 )
 
 
-def _config(tmp_path, shm_name):
+def _config(tmp_path, shm_name, realsense_shm_names=("/cam1", "/cam2")):
     return SensorHubConfig(
         telemetry_endpoint="inproc://unused",
         observation_shm_name=shm_name,
         sensorhub_socket_path=str(tmp_path / "sensorhub.sock"),
-        realsense_shm_names=("/cam1", "/cam2", "/cam3", "/cam4"),
+        realsense_shm_names=realsense_shm_names,
         xense_shm_name="xense",
         ft300s_shm_name="ft",
         required_sample_max_age_ms=10,
@@ -40,7 +42,7 @@ def _append_round(runtime, sequence, *, robot_sequence=None, gripper_sequence=No
     if robot_sequence is not None:
         joint = np.zeros(7, dtype=np.float32)
         runtime.robot_cache.append(
-            RobotSample(robot_sequence, now_ns, now_ns, joint, joint, joint)
+            RobotSample(robot_sequence, now_ns, now_ns, joint, joint, joint, np.eye(4, dtype=np.float32))
         )
     if gripper_sequence is not None:
         runtime.gripper_cache.append(GripperSample(gripper_sequence, now_ns, now_ns, 0, 0))
@@ -61,7 +63,7 @@ def _wait_for_sequence(client, expected):
 def test_telemetry_outage_stalls_then_resumes_same_runtime_and_shm(tmp_path):
     shm_name = f"fr3_runtime_{uuid.uuid4().hex}"
     runtime = SensorHubRuntime(_config(tmp_path, shm_name), os.getpid())
-    runtime.writer = AlignedObservationWriter(shm_name)
+    runtime.writer = AlignedObservationWriter(shm_name, camera_count=len(runtime.camera_caches))
     client = None
     alignment_thread = Thread(target=runtime._alignment_loop)
     try:
@@ -199,6 +201,7 @@ def test_robot_resetting_updates_only_runtime_control_state(tmp_path):
                 joints,
                 joints,
                 joints,
+                np.eye(4, dtype=np.float32),
             )
 
     try:
@@ -209,3 +212,60 @@ def test_robot_resetting_updates_only_runtime_control_state(tmp_path):
         assert "resetting" not in RobotSample.__dataclass_fields__
     finally:
         runtime.control.close()
+
+
+def test_sensorhub_config_and_cache_count_preserve_dynamic_camera_order(tmp_path):
+    names = ("/cam5", "/cam2", "/cam1", "/cam4", "/cam3")
+    config = _config(tmp_path, f"unused_{uuid.uuid4().hex}", names)
+    runtime = SensorHubRuntime(config, os.getpid())
+    try:
+        assert config.realsense_shm_names == names
+        assert len(runtime.camera_caches) == 5
+    finally:
+        runtime.control.close()
+
+
+def test_sensorhub_config_from_dict_preserves_order_and_validates_names():
+    values = {
+        "telemetry_endpoint": "inproc://unused",
+        "observation_shm_name": "/observation",
+        "sensorhub_socket_path": "/tmp/sensorhub.sock",
+        "realsense_shm_names": ["/cam2", "/cam1", "/cam5"],
+        "xense_shm_name": "xense",
+        "ft300s_shm_name": "ft",
+    }
+    config = SensorHubConfig.from_dict(values)
+    assert config.realsense_shm_names == ("/cam2", "/cam1", "/cam5")
+    for names, error in [([], ValueError), (["/cam1", "/cam1"], ValueError), ([1], TypeError)]:
+        invalid = dict(values, realsense_shm_names=names)
+        with pytest.raises(error):
+            SensorHubConfig.from_dict(invalid)
+
+
+def test_attach_readers_uses_only_configured_names_in_order(monkeypatch, tmp_path):
+    attached_names = []
+
+    class FakeReader:
+        def __init__(self, name):
+            self.name = name
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        runtime_module,
+        "RealSenseReader",
+        lambda name: attached_names.append(name) or FakeReader(name),
+    )
+    monkeypatch.setattr(runtime_module, "XenseReader", FakeReader)
+    monkeypatch.setattr(runtime_module, "FT300SReader", FakeReader)
+    monkeypatch.setattr(runtime_module, "TelemetryReader", FakeReader)
+
+    names = ("/runtime_cam5", "/runtime_cam1")
+    runtime = object.__new__(SensorHubRuntime)
+    runtime.config = _config(tmp_path, "unused", names)
+    runtime.stop_event = Event()
+    runtime._parent_is_alive = lambda: True
+    cameras, _xense, _ft, _telemetry = runtime._attach_readers()
+    assert attached_names == list(names)
+    assert tuple(reader.name for reader in cameras) == names

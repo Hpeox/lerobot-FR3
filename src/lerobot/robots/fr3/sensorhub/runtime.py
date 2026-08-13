@@ -10,6 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from threading import Event, Lock, Thread
 
+from ..config_fr3 import normalize_realsense_shm_names
 from .aligned_shm import AlignedObservationWriter
 from .cache import CausalAligner, SampleCache
 from .readers import FT300SReader, RealSenseReader, TelemetryReader, XenseReader
@@ -28,7 +29,7 @@ class SensorHubConfig:
     telemetry_endpoint: str
     observation_shm_name: str
     sensorhub_socket_path: str
-    realsense_shm_names: tuple[str, str, str, str]
+    realsense_shm_names: tuple[str, ...]
     xense_shm_name: str
     ft300s_shm_name: str
     startup_timeout_s: float = 10.0
@@ -36,12 +37,18 @@ class SensorHubConfig:
     camera_max_skew_ms: int = 50
     required_sample_max_age_ms: int = 100
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "realsense_shm_names",
+            normalize_realsense_shm_names(self.realsense_shm_names),
+        )
+
     @classmethod
     def from_dict(cls, values: dict[str, object]) -> SensorHubConfig:
         values = dict(values)
-        names = tuple(str(value) for value in values.pop("realsense_shm_names"))  # type: ignore[arg-type]
-        if len(names) != 4:
-            raise ValueError("SensorHub requires exactly four RealSense SHM names")
+        raw_names = values.pop("realsense_shm_names")
+        names = normalize_realsense_shm_names(raw_names)
         return cls(realsense_shm_names=names, **values)  # type: ignore[arg-type]
 
 
@@ -61,7 +68,9 @@ class SensorHubRuntime:
         self.writer: AlignedObservationWriter | None = None
         self.control = UDSControlServer(config.sensorhub_socket_path, self.stop_event)
 
-        self.camera_caches = tuple(SampleCache[CameraSample](config.cache_horizon_s) for _ in range(4))
+        self.camera_caches = tuple(
+            SampleCache[CameraSample](config.cache_horizon_s) for _ in config.realsense_shm_names
+        )
         self.xense_cache = SampleCache[XenseSample](config.cache_horizon_s)
         self.ft_cache = SampleCache[FTSample](config.cache_horizon_s)
         self.robot_cache = SampleCache[RobotSample](config.cache_horizon_s)
@@ -81,7 +90,10 @@ class SensorHubRuntime:
         try:
             cameras, xense, ft, telemetry = self._attach_readers()
             self._readers = [*cameras, xense, ft, telemetry]
-            self.writer = AlignedObservationWriter(self.config.observation_shm_name)
+            self.writer = AlignedObservationWriter(
+                self.config.observation_shm_name,
+                camera_count=len(self.config.realsense_shm_names),
+            )
             for index, reader in enumerate(cameras):
                 self._start_reader_thread(
                     f"RealSenseReader-{index + 1}", reader.read, self.camera_caches[index].append

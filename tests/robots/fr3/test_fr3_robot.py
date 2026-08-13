@@ -100,6 +100,7 @@ def action(gripper=0.5):
 
 def test_fr3_config_keeps_reset_timeouts_out_of_sensorhub_config(tmp_path):
     config = FR3Config(id="config", calibration_dir=tmp_path)
+    assert config.realsense_shm_names == ("/realsense_cam1", "/realsense_cam2")
     sensorhub = config.sensorhub_dict()
     assert "required_sample_max_age_ms" in sensorhub
     assert "reset_ack_timeout_s" not in sensorhub
@@ -114,6 +115,39 @@ def test_fr3_config_keeps_reset_timeouts_out_of_sensorhub_config(tmp_path):
 
     with pytest.raises(ValueError, match="reset_ack_timeout_s"):
         FR3Config(id="invalid", calibration_dir=tmp_path, reset_ack_timeout_s=np.nan)
+
+
+@pytest.mark.parametrize(
+    "names",
+    [
+        ("/only",),
+        ("/cam2", "/cam1"),
+        ("/cam5", "/cam4", "/cam3", "/cam2", "/cam1"),
+        ["/cam2", "/cam1"],
+    ],
+)
+def test_fr3_config_accepts_ordered_dynamic_camera_names(tmp_path, names):
+    config = FR3Config(id="dynamic", calibration_dir=tmp_path, realsense_shm_names=names)
+    assert config.realsense_shm_names == tuple(names)
+    assert config.sensorhub_dict()["realsense_shm_names"] == list(names)
+
+
+@pytest.mark.parametrize(
+    ("names", "error"),
+    [
+        ((), ValueError),
+        (("/cam1", "/cam1"), ValueError),
+        (("cam1",), ValueError),
+        (("/",), ValueError),
+        (("/group/cam1",), ValueError),
+        (("/cam\0one",), ValueError),
+        ((1,), TypeError),
+        ("/cam1", TypeError),
+    ],
+)
+def test_fr3_config_rejects_invalid_camera_names(tmp_path, names, error):
+    with pytest.raises(error):
+        FR3Config(id="invalid", calibration_dir=tmp_path, realsense_shm_names=names)
 
 
 def test_fr3_config_has_formal_controlled_rollout_defaults(tmp_path):
@@ -206,6 +240,29 @@ def test_fr3_feature_schema_distinguishes_xense_from_images(robot):
     assert schema["observation.xense.sensor0.force_field"]["dtype"] == "float32"
     assert schema["observation.xense.sensor0.force_field"]["shape"] == (35, 20, 3)
     assert schema["observation.images.camera.cam1.rgb"]["dtype"] == "image"
+    assert schema["observation.fr3.O_T_EE"] == {
+        "dtype": "float32",
+        "shape": (4, 4),
+        "names": None,
+    }
+    assert robot.observation_features["fr3.O_T_EE"].shape == (4, 4)
+
+
+@pytest.mark.parametrize("camera_count", [1, 2, 5])
+def test_fr3_features_expose_exact_configured_camera_count(tmp_path, camera_count):
+    names = tuple(f"/cam{i}" for i in range(camera_count, 0, -1))
+    instance = FR3(FR3Config(id="features", calibration_dir=tmp_path, realsense_shm_names=names))
+    rgb_keys = tuple(f"camera.cam{i}.rgb" for i in range(1, camera_count + 1))
+    depth_keys = tuple(f"camera.cam{i}.depth" for i in range(1, camera_count + 1))
+    assert instance.visual_feature_keys == (*rgb_keys, *depth_keys)
+    camera_features = {key for key in instance.observation_features if key.startswith("camera.")}
+    assert camera_features == {*rgb_keys, *depth_keys}
+    schema = instance.observation_dataset_features(use_videos=False)
+    schema_camera_keys = {key for key in schema if key.startswith("observation.images.camera.")}
+    assert schema_camera_keys == {
+        *(f"observation.images.{key}" for key in rgb_keys),
+        *(f"observation.images.{key}" for key in depth_keys),
+    }
 
 
 def test_connect_and_idempotent_disconnect_manage_only_sensorhub(monkeypatch, tmp_path):
