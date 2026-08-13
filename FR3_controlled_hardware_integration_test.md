@@ -28,9 +28,10 @@ The workstation-local test evidence covers:
   sequence validation, phase-local blocking/polling behavior, blind phase-boundary drain, no deferred
   command execution, STOP/ABORT/completion transitions, SHUTDOWN/FAIL_STOP behavior, stale exception
   propagation, and the RTC previous-episode quiescence boundary.
-- Dataset-disabled behavior and mocked episode save/clear/single-finalize ownership. A real
-  `LeRobotDataset`/video session was not run because the workstation environment lacked the optional
-  `datasets`, `av`, and `pyarrow` packages.
+- Dataset-disabled behavior, mocked episode save/clear/single-finalize ownership, and real local
+  `LeRobotDataset` sessions with the optional `datasets`, `av`, and `pyarrow` dependencies. The
+  Controlled STOP path encoded a standard MP4/Parquet episode and reloaded/decoded it through
+  `LeRobotDataset`; the ABORT path discarded the partial episode and its temporary video frames.
 - FRCMD1 and FGT1 ABI compatibility between both repositories, router fan-out, reset gripper OPEN,
   fake reverse-control `RESETTING 0 -> 1 -> 0`, JUMP_HOLD recovery, failure paths, and gripper dry-run
   components.

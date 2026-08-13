@@ -12,11 +12,13 @@ from threading import Event, Lock, Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
+import torch
 
-# The workstation's lerobot-fr3 environment intentionally lacks the optional
-# dataset/video extras. These narrow stubs let lifecycle tests import rollout
-# code without pretending to exercise real LeRobotDataset or video encoding.
+# Keep the core lifecycle tests runnable in minimal installations. Tests that
+# exercise the real dataset/video path explicitly skip when those optional
+# dependencies are unavailable.
 if importlib.util.find_spec("datasets") is None:
     from lerobot.utils import import_utils
 
@@ -158,6 +160,36 @@ def make_strategy(control):
     strategy._control = control
     strategy._interpolator = ActionInterpolator(multiplier=1)
     return strategy
+
+
+def make_real_dataset_context(dataset, features):
+    frame_index = 0
+
+    def get_observation():
+        nonlocal frame_index
+        value = float(frame_index)
+        image = np.full((64, 96, 3), frame_index * 20, dtype=np.uint8)
+        frame_index += 1
+        return {"joint_0.pos": value, "joint_1.pos": value + 1.0, "cam": image}
+
+    robot = SimpleNamespace(
+        initialize_rollout=MagicMock(),
+        return_to_home=MagicMock(),
+        get_observation=get_observation,
+        send_action=MagicMock(side_effect=lambda action: action),
+        is_connected=False,
+    )
+    ctx, engine, robot = make_context(dataset=dataset, robot=robot)
+    engine.get_action.return_value = torch.tensor([0.5, -0.5], dtype=torch.float32)
+    ctx.runtime.cfg.dataset = SimpleNamespace(single_task="controlled dataset test")
+    ctx.runtime.cfg.fps = 30.0
+    ctx.processors = SimpleNamespace(
+        robot_observation_processor=lambda observation: observation,
+        robot_action_processor=lambda action_and_observation: action_and_observation[0],
+    )
+    ctx.data.dataset_features = features
+    ctx.data.ordered_action_keys = ["joint_0.pos", "joint_1.pos"]
+    return ctx, engine, robot
 
 
 def test_controlled_config_factory_and_generic_api_boundaries():
@@ -501,6 +533,115 @@ def test_dataset_disabled_uses_no_video_manager(monkeypatch):
     strategy = make_strategy(control)
     strategy._engine = engine
     strategy.run(ctx)
+
+
+def test_controlled_real_dataset_stop_encodes_and_reloads_video(tmp_path):
+    pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
+    pytest.importorskip("av", reason="av is required (install lerobot[dataset])")
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    features = {
+        "observation.state": {
+            "dtype": "float32",
+            "shape": (2,),
+            "names": ["joint_0.pos", "joint_1.pos"],
+        },
+        "observation.images.cam": {
+            "dtype": "video",
+            "shape": (64, 96, 3),
+            "names": ["height", "width", "channels"],
+        },
+        "action": {
+            "dtype": "float32",
+            "shape": (2,),
+            "names": ["joint_0.pos", "joint_1.pos"],
+        },
+    }
+    root = tmp_path / "controlled_dataset"
+    dataset = LeRobotDataset.create(
+        repo_id="local/controlled-dataset-test",
+        fps=30,
+        features=features,
+        root=root,
+        use_videos=True,
+        video_backend="pyav",
+    )
+    control = FakeControl(
+        blocking=[command(1, "INITIALIZE"), command(2, "START"), command(4, "SHUTDOWN")],
+        polling=[None, None, None, None, command(3, "STOP")],
+    )
+    ctx, engine, robot = make_real_dataset_context(dataset, features)
+    strategy = make_strategy(control)
+    strategy._engine = engine
+
+    strategy.run(ctx)
+
+    assert dataset.meta.total_episodes == 1
+    assert dataset.meta.total_frames == 4
+    assert dataset._is_finalized is True
+    assert not dataset.has_pending_frames()
+    assert list(root.glob("videos/**/*.mp4"))
+    robot.send_action.assert_called()
+
+    reloaded = LeRobotDataset(
+        repo_id="local/controlled-dataset-test",
+        root=root,
+        video_backend="pyav",
+    )
+    assert len(reloaded) == 4
+    frame = reloaded[0]
+    assert tuple(frame["observation.state"].shape) == (2,)
+    assert tuple(frame["action"].shape) == (2,)
+    assert tuple(frame["observation.images.cam"].shape) == (3, 64, 96)
+
+
+def test_controlled_real_dataset_abort_discards_partial_episode(tmp_path):
+    pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
+    pytest.importorskip("av", reason="av is required (install lerobot[dataset])")
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    features = {
+        "observation.state": {
+            "dtype": "float32",
+            "shape": (2,),
+            "names": ["joint_0.pos", "joint_1.pos"],
+        },
+        "observation.images.cam": {
+            "dtype": "video",
+            "shape": (64, 96, 3),
+            "names": ["height", "width", "channels"],
+        },
+        "action": {
+            "dtype": "float32",
+            "shape": (2,),
+            "names": ["joint_0.pos", "joint_1.pos"],
+        },
+    }
+    root = tmp_path / "controlled_aborted_dataset"
+    dataset = LeRobotDataset.create(
+        repo_id="local/controlled-aborted-dataset-test",
+        fps=30,
+        features=features,
+        root=root,
+        use_videos=True,
+        video_backend="pyav",
+    )
+    control = FakeControl(
+        blocking=[command(1, "INITIALIZE"), command(2, "START"), command(4, "SHUTDOWN")],
+        polling=[None, None, command(3, "ABORT")],
+    )
+    ctx, engine, _robot = make_real_dataset_context(dataset, features)
+    strategy = make_strategy(control)
+    strategy._engine = engine
+
+    strategy.run(ctx)
+
+    assert dataset.meta.total_episodes == 0
+    assert dataset.meta.total_frames == 0
+    assert dataset._is_finalized is True
+    assert not dataset.has_pending_frames()
+    assert not list(root.glob("videos/**/*.mp4"))
+    assert not list(root.glob("images/**/*.png"))
 
 
 def test_duration_completion_returns_to_wait_initialize():
