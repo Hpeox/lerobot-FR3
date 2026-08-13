@@ -58,6 +58,7 @@ def test_strategies_submodule_imports():
 def test_strategy_config_types():
     from lerobot.rollout import (
         BaseStrategyConfig,
+        ControlledStrategyConfig,
         DAggerStrategyConfig,
         EpisodicStrategyConfig,
         HighlightStrategyConfig,
@@ -65,6 +66,7 @@ def test_strategy_config_types():
     )
 
     assert BaseStrategyConfig().type == "base"
+    assert ControlledStrategyConfig().type == "controlled"
     assert SentryStrategyConfig().type == "sentry"
     assert HighlightStrategyConfig().type == "highlight"
     assert DAggerStrategyConfig().type == "dagger"
@@ -203,6 +205,8 @@ def test_create_strategy_dispatches():
     from lerobot.rollout import (
         BaseStrategy,
         BaseStrategyConfig,
+        ControlledStrategy,
+        ControlledStrategyConfig,
         DAggerStrategy,
         DAggerStrategyConfig,
         EpisodicStrategy,
@@ -213,6 +217,7 @@ def test_create_strategy_dispatches():
     )
 
     assert isinstance(create_strategy(BaseStrategyConfig()), BaseStrategy)
+    assert isinstance(create_strategy(ControlledStrategyConfig()), ControlledStrategy)
     assert isinstance(create_strategy(SentryStrategyConfig()), SentryStrategy)
     assert isinstance(create_strategy(DAggerStrategyConfig()), DAggerStrategy)
     assert isinstance(create_strategy(EpisodicStrategyConfig()), EpisodicStrategy)

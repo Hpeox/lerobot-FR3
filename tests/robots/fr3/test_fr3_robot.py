@@ -1,5 +1,6 @@
 import logging
 from collections import deque
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -104,12 +105,64 @@ def test_fr3_config_keeps_reset_timeouts_out_of_sensorhub_config(tmp_path):
     assert "reset_ack_timeout_s" not in sensorhub
     assert "reset_completion_timeout_s" not in sensorhub
     assert "reset_retry_interval_s" not in sensorhub
+    assert "rollout_home_joint_positions" not in sensorhub
+    assert "rollout_init_delta_lower" not in sensorhub
+    assert "rollout_init_delta_upper" not in sensorhub
     assert "alignment_failure_timeout_ms" not in sensorhub
     assert "camera_xense_stall_timeout_ms" not in sensorhub
     assert "ft_robot_gripper_stall_timeout_ms" not in sensorhub
 
     with pytest.raises(ValueError, match="reset_ack_timeout_s"):
         FR3Config(id="invalid", calibration_dir=tmp_path, reset_ack_timeout_s=np.nan)
+
+
+def test_fr3_config_has_formal_controlled_rollout_defaults(tmp_path):
+    config = FR3Config(id="config", calibration_dir=tmp_path)
+    assert config.rollout_home_joint_positions == (
+        0.1416057646,
+        0.3408541381,
+        -0.0186031274,
+        -1.5938080549,
+        0.0486696586,
+        1.8890386820,
+        0.0432172865,
+    )
+    assert config.rollout_init_delta_lower == (-0.01,) * 7
+    assert config.rollout_init_delta_upper == (0.01,) * 7
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("rollout_home_joint_positions", (0.0,) * 6, ValueError),
+        ("rollout_init_delta_lower", (0.0,) * 6 + (True,), TypeError),
+        ("rollout_init_delta_upper", (0.0,) * 6 + (np.nan,), ValueError),
+        ("rollout_init_delta_lower", (0.02,) * 7, ValueError),
+    ],
+)
+def test_fr3_config_validates_controlled_rollout_vectors(tmp_path, field, value, error):
+    kwargs = {field: value}
+    with pytest.raises(error):
+        FR3Config(id="invalid", calibration_dir=tmp_path, **kwargs)
+
+
+def test_initialize_rollout_samples_bounded_target_and_logs(robot, caplog):
+    robot._reset_joints = Mock()
+    with caplog.at_level(logging.INFO):
+        robot.initialize_rollout()
+    target = tuple(robot._reset_joints.call_args.args[0])
+    for actual, home in zip(target, robot.config.rollout_home_joint_positions, strict=True):
+        assert home - 0.01 <= actual <= home + 0.01
+    assert repr(target) in caplog.text
+
+
+def test_return_to_home_uses_exact_target_and_logs(robot, caplog):
+    robot._reset_joints = Mock()
+    with caplog.at_level(logging.INFO):
+        robot.return_to_home()
+    target = tuple(robot._reset_joints.call_args.args[0])
+    assert target == robot.config.rollout_home_joint_positions
+    assert repr(target) in caplog.text
 
 
 def test_send_action_clips_gripper_and_returns_actual_action(robot, caplog):

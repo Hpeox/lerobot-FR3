@@ -15,6 +15,7 @@
 """Rollout strategies — public API re-exports."""
 
 from .base import BaseStrategy
+from .controlled import ControlledStrategy
 from .core import RolloutStrategy, estimate_max_episode_seconds, safe_push_to_hub, send_next_action
 from .dagger import DAggerEvents, DAggerPhase, DAggerStrategy
 from .episodic import EpisodicStrategy
@@ -24,6 +25,7 @@ from .sentry import SentryStrategy
 
 __all__ = [
     "BaseStrategy",
+    "ControlledStrategy",
     "DAggerEvents",
     "DAggerPhase",
     "DAggerStrategy",

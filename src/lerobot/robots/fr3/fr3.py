@@ -271,6 +271,33 @@ class FR3(Robot):
         except zmq.Again as exc:
             raise RuntimeError("FR3 local command PUB queue is unavailable") from exc
 
+    def initialize_rollout(self) -> None:
+        """Randomize around the configured home pose and synchronously reset the FR3.
+
+        ``RESET_JOINT`` also commands the gripper to OPEN by protocol design.
+        """
+
+        delta = np.random.uniform(
+            self.config.rollout_init_delta_lower,
+            self.config.rollout_init_delta_upper,
+        )
+        target = tuple(
+            float(home + sampled)
+            for home, sampled in zip(self.config.rollout_home_joint_positions, delta, strict=True)
+        )
+        logger.info("FR3 rollout initialization target q_reset=%s", target)
+        self._reset_joints(target)
+
+    def return_to_home(self) -> None:
+        """Synchronously reset to the deterministic configured home pose.
+
+        ``RESET_JOINT`` also commands the gripper to OPEN by protocol design.
+        """
+
+        target = tuple(self.config.rollout_home_joint_positions)
+        logger.info("FR3 graceful shutdown target q_home=%s", target)
+        self._reset_joints(target)
+
     @check_if_not_connected
     def _reset_joints(self, q_reset: Sequence[float]) -> None:
         """Request and synchronously wait for one FR3 joint reset trajectory."""
@@ -304,7 +331,7 @@ class FR3(Robot):
             frame = pack_command(
                 self._command_sequence,
                 validated,
-                0,
+                0,  # RESET_JOINT formally commands the gripper OPEN.
                 flags=COMMAND_FLAG_RESET_JOINT,
             )
             ack_deadline = time.monotonic() + self.config.reset_ack_timeout_s

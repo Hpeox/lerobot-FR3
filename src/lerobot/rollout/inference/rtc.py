@@ -122,6 +122,7 @@ class RTCInferenceEngine(InferenceEngine):
         self._action_queue: ActionQueue | None = None
         self._obs_holder: dict[str, Any] = {}
         self._obs_lock = Lock()
+        self._inference_lock = Lock()
         self._policy_active = Event()
         self._compile_warmup_done = Event()
         self._shutdown_event = Event()
@@ -225,6 +226,21 @@ class RTCInferenceEngine(InferenceEngine):
         if self._action_queue is not None:
             self._action_queue.clear()
 
+    def reset_for_controlled_rollout(self) -> None:
+        """Quiesce an old RTC episode before resetting Controlled rollout state.
+
+        This deliberately remains RTC-local instead of extending the generic
+        inference ABC. Base and Episodic retain their existing ``reset`` and
+        ``pause`` semantics.
+        """
+
+        logger.info("Quiescing previous RTC episode for Controlled rollout reset")
+        self._policy_active.clear()
+        with self._inference_lock:
+            self.reset()
+            with self._obs_lock:
+                self._obs_holder["obs"] = None
+
     # ------------------------------------------------------------------
     # Action production (called from main thread)
     # ------------------------------------------------------------------
@@ -261,67 +277,76 @@ class RTCInferenceEngine(InferenceEngine):
                     continue
 
                 queue = self._action_queue
-                with self._obs_lock:
-                    obs = self._obs_holder.get("obs")
-                if queue is None or obs is None:
+                if queue is None:
                     time.sleep(_RTC_IDLE_SLEEP_S)
                     continue
 
                 if queue.qsize() <= self._rtc_queue_threshold:
                     try:
-                        current_time = time.perf_counter()
-                        idx_before = queue.get_action_index()
-                        prev_actions = queue.get_left_over()
+                        with self._inference_lock:
+                            # A Controlled START may have paused while this worker was
+                            # waiting for the lock. Never run a stale observation after
+                            # that episode boundary has been reset.
+                            if not self._policy_active.is_set():
+                                continue
+                            with self._obs_lock:
+                                obs = self._obs_holder.get("obs")
+                            if obs is None:
+                                continue
 
-                        latency = latency_tracker.max()
-                        delay = math.ceil(latency / time_per_chunk) if latency else 0
+                            current_time = time.perf_counter()
+                            idx_before = queue.get_action_index()
+                            prev_actions = queue.get_left_over()
 
-                        obs_batch = build_dataset_frame(self._hw_features, obs, prefix="observation")
-                        obs_batch = prepare_observation_for_inference(
-                            obs_batch, policy_device, self._task, self._robot.robot_type
-                        )
-                        obs_batch["task"] = [self._task]
+                            latency = latency_tracker.max()
+                            delay = math.ceil(latency / time_per_chunk) if latency else 0
 
-                        preprocessed = self._preprocessor(obs_batch)
+                            obs_batch = build_dataset_frame(self._hw_features, obs, prefix="observation")
+                            obs_batch = prepare_observation_for_inference(
+                                obs_batch, policy_device, self._task, self._robot.robot_type
+                            )
+                            obs_batch["task"] = [self._task]
 
-                        if prev_actions is not None and self._relative_step is not None:
-                            # Rebase against the raw cached state so the leftover tail stays in
-                            # the training-time coordinate frame.
-                            raw_state = self._relative_step.get_cached_state()
-                            if raw_state is not None:
-                                prev_abs = queue.get_processed_left_over()
-                                if prev_abs is not None and prev_abs.numel() > 0:
-                                    prev_actions = reanchor_relative_rtc_prefix(
-                                        prev_actions_absolute=prev_abs,
-                                        current_state=raw_state,
-                                        relative_step=self._relative_step,
-                                        normalizer_step=self._normalizer_step,
-                                        policy_device=policy_device,
-                                    )
+                            preprocessed = self._preprocessor(obs_batch)
 
-                        if prev_actions is not None:
-                            prev_actions = _normalize_prev_actions_length(
-                                prev_actions, target_steps=self._rtc_config.execution_horizon
+                            if prev_actions is not None and self._relative_step is not None:
+                                # Rebase against the raw cached state so the leftover tail stays in
+                                # the training-time coordinate frame.
+                                raw_state = self._relative_step.get_cached_state()
+                                if raw_state is not None:
+                                    prev_abs = queue.get_processed_left_over()
+                                    if prev_abs is not None and prev_abs.numel() > 0:
+                                        prev_actions = reanchor_relative_rtc_prefix(
+                                            prev_actions_absolute=prev_abs,
+                                            current_state=raw_state,
+                                            relative_step=self._relative_step,
+                                            normalizer_step=self._normalizer_step,
+                                            policy_device=policy_device,
+                                        )
+
+                            if prev_actions is not None:
+                                prev_actions = _normalize_prev_actions_length(
+                                    prev_actions, target_steps=self._rtc_config.execution_horizon
+                                )
+
+                            actions = self._policy.predict_action_chunk(
+                                preprocessed, inference_delay=delay, prev_chunk_left_over=prev_actions
                             )
 
-                        actions = self._policy.predict_action_chunk(
-                            preprocessed, inference_delay=delay, prev_chunk_left_over=prev_actions
-                        )
+                            original = actions.squeeze(0).clone()
+                            processed = self._postprocessor(actions).squeeze(0)
+                            new_latency = time.perf_counter() - current_time
+                            new_delay = math.ceil(new_latency / time_per_chunk)
 
-                        original = actions.squeeze(0).clone()
-                        processed = self._postprocessor(actions).squeeze(0)
-                        new_latency = time.perf_counter() - current_time
-                        new_delay = math.ceil(new_latency / time_per_chunk)
+                            inference_count += 1
+                            consecutive_errors = 0
+                            is_warmup = self._use_torch_compile and inference_count <= warmup_required
+                            if is_warmup:
+                                latency_tracker.reset()
+                            else:
+                                latency_tracker.add(new_latency)
 
-                        inference_count += 1
-                        consecutive_errors = 0
-                        is_warmup = self._use_torch_compile and inference_count <= warmup_required
-                        if is_warmup:
-                            latency_tracker.reset()
-                        else:
-                            latency_tracker.add(new_latency)
-
-                        queue.merge(original, processed, new_delay, idx_before)
+                            queue.merge(original, processed, new_delay, idx_before)
 
                         if (
                             is_warmup

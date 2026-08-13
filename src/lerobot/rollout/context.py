@@ -48,7 +48,7 @@ from lerobot.robots import make_robot_from_config
 from lerobot.teleoperators import Teleoperator, make_teleoperator_from_config
 from lerobot.utils.feature_utils import combine_feature_dicts, hw_to_dataset_features
 
-from .configs import BaseStrategyConfig, DAggerStrategyConfig, RolloutConfig
+from .configs import BaseStrategyConfig, ControlledStrategyConfig, DAggerStrategyConfig, RolloutConfig
 from .inference import (
     InferenceEngine,
     RTCInferenceConfig,
@@ -58,6 +58,18 @@ from .inference import (
 from .robot_wrapper import ThreadSafeRobot
 
 logger = logging.getLogger(__name__)
+
+
+def _require_controlled_capabilities(robot) -> None:
+    """Fail before connect when a robot lacks the FR3-style Controlled hooks."""
+
+    required_capabilities = ("initialize_rollout", "return_to_home")
+    missing = [name for name in required_capabilities if not callable(getattr(robot, name, None))]
+    if missing:
+        raise NotImplementedError(
+            f"Controlled rollout requires robot capabilities {required_capabilities}; "
+            f"{type(robot).__name__} is missing {missing}"
+        )
 
 
 def _resolve_action_key_order(
@@ -243,13 +255,20 @@ def build_rollout_context(
     # --- 3. Hardware (heaviest side-effect, deferred) -----------------
     logger.info("Connecting robot (%s)...", cfg.robot.type if cfg.robot else "?")
     robot = make_robot_from_config(cfg.robot)
+    is_controlled = isinstance(cfg.strategy, ControlledStrategyConfig)
+    if is_controlled:
+        _require_controlled_capabilities(robot)
     robot.connect()
     logger.info("Robot connected: %s", robot.name)
 
     # Store the initial joint positions so we can return to a safe pose on shutdown.
-    initial_obs = robot.get_observation()
-    initial_position = {k: v for k, v in initial_obs.items() if k.endswith(".pos")}
-    logger.info("Captured initial robot position (%d keys)", len(initial_position))
+    if is_controlled:
+        initial_position = None
+        logger.info("Controlled rollout skips startup-pose observation")
+    else:
+        initial_obs = robot.get_observation()
+        initial_position = {k: v for k, v in initial_obs.items() if k.endswith(".pos")}
+        logger.info("Captured initial robot position (%d keys)", len(initial_position))
 
     robot_wrapper = ThreadSafeRobot(robot)
 
