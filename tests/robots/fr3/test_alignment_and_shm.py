@@ -133,9 +133,11 @@ def test_causal_alignment_order_and_duplicate_suppression(camera_count):
     )
     aligned = aligner.select(1, 120_000_000)
     assert aligned is not None
+    assert aligner.last_rejection_reason is None
     assert [sample.sequence for sample in aligned.cameras] == [11, *range(2, camera_count + 1)]
     np.testing.assert_array_equal(aligned.robot.O_T_EE, np.eye(4, dtype=np.float32))
     assert aligner.select(2, 121_000_000) is None
+    assert "camera sequences unchanged" in aligner.last_rejection_reason
 
 
 def test_causal_alignment_preserves_camera_skew_and_required_age_limits():
@@ -150,6 +152,7 @@ def test_causal_alignment_preserves_camera_skew_and_required_age_limits():
         required_sample_max_age_ms=100,
     )
     assert aligner.select(1, 120_000_000) is None
+    assert "camera skew exceeded" in aligner.last_rejection_reason
 
     fresh_cameras = tuple(SampleCache[CameraSample](0.5) for _ in range(2))
     for cache in fresh_cameras:
@@ -162,6 +165,41 @@ def test_causal_alignment_preserves_camera_skew_and_required_age_limits():
         required_sample_max_age_ms=100,
     )
     assert aligner.select(1, 210_000_000) is None
+    assert "required samples stale" in aligner.last_rejection_reason
+
+
+def test_causal_alignment_reports_missing_camera_and_required_sources():
+    camera_caches = tuple(SampleCache[CameraSample](0.5) for _ in range(2))
+    aligner = CausalAligner(
+        camera_caches,
+        *_required_caches(),
+        camera_max_skew_ms=50,
+        required_sample_max_age_ms=100,
+    )
+    assert aligner.select(1, 1) is None
+    assert aligner.last_rejection_reason == "missing latest samples: camera_1,camera_2"
+
+    camera_caches[0].append(camera(1, 100_000_000))
+    camera_caches[1].append(camera(1, 110_000_000))
+    assert aligner.select(2, 120_000_000) is None
+    assert aligner.last_rejection_reason == "missing causal samples at camera reference: camera_2"
+
+    camera_caches = tuple(SampleCache[CameraSample](0.5) for _ in range(2))
+    for cache in camera_caches:
+        cache.append(camera(1, 100_000_000))
+    empty_xense = SampleCache[XenseSample](0.5)
+    _xense, ft, robot, gripper = _required_caches()
+    aligner = CausalAligner(
+        camera_caches,
+        empty_xense,
+        ft,
+        robot,
+        gripper,
+        camera_max_skew_ms=50,
+        required_sample_max_age_ms=100,
+    )
+    assert aligner.select(3, 120_000_000) is None
+    assert aligner.last_rejection_reason == "missing required samples: xense"
 
 
 def _aligned_sample(sequence=1, camera_count=2):

@@ -73,22 +73,49 @@ class CausalAligner:
         self.required_sample_max_age_ns = required_sample_max_age_ms * 1_000_000
         self._last_camera_sequences: tuple[int, ...] | None = None
         self._publish_sequence = 0
+        self._last_rejection_reason: str | None = None
+
+    @property
+    def last_rejection_reason(self) -> str | None:
+        """Return why the most recent alignment attempt produced no sample."""
+        return self._last_rejection_reason
+
+    def _reject(self, reason: str) -> None:
+        self._last_rejection_reason = reason
+        return None
 
     def select(self, realtime_ns: int, monotonic_ns: int) -> AlignedSample | None:
         camera_latest = [cache.latest() for cache in self.cameras]
         if any(sample is None for sample in camera_latest):
-            return None
+            missing = [
+                f"camera_{index + 1}"
+                for index, sample in enumerate(camera_latest)
+                if sample is None
+            ]
+            return self._reject(f"missing latest samples: {','.join(missing)}")
         reference_ns = min(sample.ingest_monotonic_ns for sample in camera_latest if sample is not None)
         cameras = tuple(cache.latest_at_or_before(reference_ns) for cache in self.cameras)
         if any(sample is None for sample in cameras):
-            return None
+            missing = [
+                f"camera_{index + 1}"
+                for index, sample in enumerate(cameras)
+                if sample is None
+            ]
+            return self._reject(
+                f"missing causal samples at camera reference: {','.join(missing)}"
+            )
         typed_cameras = tuple(cameras)  # type: ignore[arg-type]
         camera_times = [sample.ingest_monotonic_ns for sample in typed_cameras]
-        if max(camera_times) - min(camera_times) > self.camera_max_skew_ns:
-            return None
+        camera_skew_ns = max(camera_times) - min(camera_times)
+        if camera_skew_ns > self.camera_max_skew_ns:
+            return self._reject(
+                "camera skew exceeded: "
+                f"observed_ms={camera_skew_ns / 1_000_000:.3f} "
+                f"limit_ms={self.camera_max_skew_ns / 1_000_000:.3f}"
+            )
         camera_sequences = tuple(sample.sequence for sample in typed_cameras)
         if camera_sequences == self._last_camera_sequences:
-            return None
+            return self._reject(f"camera sequences unchanged: {camera_sequences}")
 
         selected = (
             self.xense.latest_at_or_before(reference_ns),
@@ -97,14 +124,24 @@ class CausalAligner:
             self.gripper.latest_at_or_before(reference_ns),
         )
         if any(sample is None for sample in selected):
-            return None
-        if any(
-            reference_ns - sample.ingest_monotonic_ns > self.required_sample_max_age_ns for sample in selected
-        ):
-            return None
+            names = ("xense", "ft", "robot", "gripper")
+            missing = [name for name, sample in zip(names, selected, strict=True) if sample is None]
+            return self._reject(f"missing required samples: {','.join(missing)}")
+        names = ("xense", "ft", "robot", "gripper")
+        stale = [
+            f"{name}(age_ms={(reference_ns - sample.ingest_monotonic_ns) / 1_000_000:.3f})"
+            for name, sample in zip(names, selected, strict=True)
+            if reference_ns - sample.ingest_monotonic_ns > self.required_sample_max_age_ns
+        ]
+        if stale:
+            return self._reject(
+                "required samples stale: "
+                f"{','.join(stale)} limit_ms={self.required_sample_max_age_ns / 1_000_000:.3f}"
+            )
         xense, ft, robot, gripper = selected
         self._publish_sequence += 1
         self._last_camera_sequences = camera_sequences
+        self._last_rejection_reason = None
         return AlignedSample(
             sequence=self._publish_sequence,
             publish_realtime_ns=realtime_ns,

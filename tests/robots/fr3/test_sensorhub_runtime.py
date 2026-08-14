@@ -1,13 +1,16 @@
+import logging
 import os
 import time
 import uuid
 from threading import Event, Thread
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from lerobot.robots.fr3.sensorhub import runtime as runtime_module
 from lerobot.robots.fr3.sensorhub.aligned_shm import AlignedObservationClient, AlignedObservationWriter
+from lerobot.robots.fr3.sensorhub.cache import SampleCache
 from lerobot.robots.fr3.sensorhub.runtime import SensorHubConfig, SensorHubRuntime
 from lerobot.robots.fr3.sensorhub.samples import (
     CameraSample,
@@ -160,21 +163,114 @@ def test_reader_timeouts_retry_and_unexpected_errors_remain_fatal(tmp_path):
         runtime.control.close()
 
 
-def test_fatal_is_published_once_across_concurrent_failures(tmp_path):
+def test_fatal_is_published_and_logged_once_across_concurrent_failures(tmp_path, caplog):
     runtime = SensorHubRuntime(_config(tmp_path, f"unused_{uuid.uuid4().hex}"), os.getpid())
     published = []
     runtime.control.publish = lambda *args, **kwargs: published.append((args, kwargs))
     threads = [Thread(target=runtime._fatal, args=(f"failure {index}",)) for index in range(4)]
     try:
+        caplog.set_level(logging.ERROR, logger=runtime_module.__name__)
         for thread in threads:
             thread.start()
         for thread in threads:
             thread.join()
         assert len(published) == 1
+        assert sum("SensorHub fatal: failure" in record.message for record in caplog.records) == 1
         assert runtime.fatal_event.is_set()
         assert runtime.stop_event.is_set()
     finally:
         runtime.control.close()
+
+
+def test_alignment_pending_log_is_reason_change_or_one_second_throttled(caplog):
+    runtime = object.__new__(SensorHubRuntime)
+    runtime.aligner = SimpleNamespace(last_rejection_reason="missing required samples: robot")
+    runtime._alignment_pending_reason = None
+    runtime._alignment_pending_log_monotonic = 0.0
+    caplog.set_level(logging.WARNING, logger=runtime_module.__name__)
+
+    runtime._log_alignment_pending()
+    runtime._log_alignment_pending()
+    runtime.aligner.last_rejection_reason = "missing required samples: gripper"
+    runtime._log_alignment_pending()
+    runtime._alignment_pending_log_monotonic -= 1.0
+    runtime._log_alignment_pending()
+
+    messages = [
+        record.message
+        for record in caplog.records
+        if "SensorHub alignment pending before READY" in record.message
+    ]
+    assert messages == [
+        "SensorHub alignment pending before READY: missing required samples: robot",
+        "SensorHub alignment pending before READY: missing required samples: gripper",
+        "SensorHub alignment pending before READY: missing required samples: gripper",
+    ]
+
+
+def test_alignment_pending_logs_stop_after_first_publish(caplog):
+    runtime = object.__new__(SensorHubRuntime)
+    runtime.stop_event = Event()
+    runtime.first_publish_event = Event()
+    runtime._alignment_pending_reason = None
+    runtime._alignment_pending_log_monotonic = 0.0
+    published = []
+    runtime.writer = SimpleNamespace(publish=published.append)
+    runtime._fatal = lambda message: pytest.fail(message)
+
+    class Aligner:
+        last_rejection_reason = "missing required samples: robot"
+        calls = 0
+
+        def select(self, realtime_ns, monotonic_ns):
+            self.calls += 1
+            if self.calls == 1:
+                return "first aligned sample"
+            runtime.stop_event.set()
+            return None
+
+    runtime.aligner = Aligner()
+    caplog.set_level(logging.WARNING, logger=runtime_module.__name__)
+
+    runtime._alignment_loop()
+
+    assert published == ["first aligned sample"]
+    assert runtime.first_publish_event.is_set()
+    assert not any("alignment pending before READY" in record.message for record in caplog.records)
+
+
+def test_ready_timeout_reports_each_source_progress():
+    runtime = object.__new__(SensorHubRuntime)
+    runtime.config = SimpleNamespace(startup_timeout_s=0.001)
+    runtime.fatal_event = Event()
+    runtime.first_publish_event = Event()
+    runtime.stop_event = Event()
+    runtime._parent_is_alive = lambda: True
+    runtime.camera_caches = tuple(SampleCache[CameraSample](0.5) for _ in range(2))
+    runtime.xense_cache = SampleCache[XenseSample](0.5)
+    runtime.ft_cache = SampleCache[FTSample](0.5)
+    runtime.robot_cache = SampleCache[RobotSample](0.5)
+    runtime.gripper_cache = SampleCache[GripperSample](0.5)
+    runtime.camera_caches[0].append(camera_sample := CameraSample(
+        1,
+        1,
+        1,
+        np.zeros((480, 640, 3), dtype=np.uint8),
+        np.zeros((480, 640, 1), dtype=np.uint16),
+    ))
+    runtime.camera_caches[0].append(
+        CameraSample(2, 2, 2, camera_sample.rgb, camera_sample.depth)
+    )
+
+    with pytest.raises(TimeoutError) as exc_info:
+        runtime._wait_until_ready()
+
+    message = str(exc_info.value)
+    assert "first_publish=False" in message
+    assert "'camera_1': 2" in message
+    assert "'camera_2': 0" in message
+    assert "'robot': 0" in message
+    assert "insufficient_sources=['camera_2', 'xense', 'ft', 'robot', 'gripper']" in message
 
 
 def test_robot_resetting_updates_only_runtime_control_state(tmp_path):

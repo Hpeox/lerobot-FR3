@@ -63,6 +63,8 @@ class SensorHubRuntime:
         self.first_publish_event = Event()
         self._fatal_lock = Lock()
         self._fatal_message = ""
+        self._alignment_pending_reason: str | None = None
+        self._alignment_pending_log_monotonic = 0.0
         self._threads: list[Thread] = []
         self._readers: list[object] = []
         self.writer: AlignedObservationWriter | None = None
@@ -197,14 +199,30 @@ class SensorHubRuntime:
             try:
                 now_ns = time.monotonic_ns()
                 sample = self.aligner.select(time.time_ns(), now_ns)
-                if sample is not None:
-                    assert self.writer is not None
-                    self.writer.publish(sample)
-                    self.first_publish_event.set()
+                if sample is None:
+                    if not self.first_publish_event.is_set():
+                        self._log_alignment_pending()
+                    time.sleep(0.001)
+                    continue
+                assert self.writer is not None
+                self.writer.publish(sample)
+                self.first_publish_event.set()
             except Exception as exc:
                 self._fatal(f"AlignmentPublisher failed: {exc}")
                 return
             time.sleep(0.001)
+
+    def _log_alignment_pending(self) -> None:
+        """Log the startup alignment rejection on change or once per second."""
+        reason = self.aligner.last_rejection_reason or "unknown alignment rejection"
+        now = time.monotonic()
+        if (
+            reason != self._alignment_pending_reason
+            or now - self._alignment_pending_log_monotonic >= 1.0
+        ):
+            logger.warning("SensorHub alignment pending before READY: %s", reason)
+            self._alignment_pending_reason = reason
+            self._alignment_pending_log_monotonic = now
 
     def _all_sources_advanced(self) -> bool:
         caches = (
@@ -227,7 +245,27 @@ class SensorHubRuntime:
             if self._all_sources_advanced() and self.first_publish_event.is_set():
                 return
             time.sleep(0.005)
-        raise TimeoutError("readers did not produce advancing coherent samples and an aligned snapshot")
+        counts = self._source_sequence_counts()
+        insufficient = [name for name, count in counts.items() if count < 2]
+        raise TimeoutError(
+            "readers did not produce advancing coherent samples and an aligned snapshot: "
+            f"first_publish={self.first_publish_event.is_set()} "
+            f"insufficient_sources={insufficient} sequence_counts={counts}"
+        )
+
+    def _source_sequence_counts(self) -> dict[str, int]:
+        """Return startup progress for every source required by READY."""
+        counts = {
+            f"camera_{index + 1}": cache.sequence_count()
+            for index, cache in enumerate(self.camera_caches)
+        }
+        counts.update(
+            xense=self.xense_cache.sequence_count(),
+            ft=self.ft_cache.sequence_count(),
+            robot=self.robot_cache.sequence_count(),
+            gripper=self.gripper_cache.sequence_count(),
+        )
+        return counts
 
     def _supervise(self) -> None:
         while not self.stop_event.is_set():
@@ -245,6 +283,7 @@ class SensorHubRuntime:
                 return
             self._fatal_message = message
             self.fatal_event.set()
+            logger.error("SensorHub fatal: %s", message)
             try:
                 if self.writer is not None:
                     self.writer.set_fatal(message)
