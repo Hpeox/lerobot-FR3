@@ -15,7 +15,7 @@ starting LeRobot:
    `("/realsense_cam1", "/realsense_cam2")`.
 2. The dual-Xense writer: `xense_sensor_frame`.
 3. The FT300S writer: `ft300_sensor_frame`.
-4. The FGT1 telemetry relay at `tcp://192.168.1.37:6000`.
+4. The FGT1 telemetry relay at `tcp://192.168.10.37:6000`.
 5. The remote command `SUB` bound to `tcp://*:6001`.
 
 `FR3.connect()` starts SensorHub, which defensively attaches and validates those already-running
@@ -51,7 +51,7 @@ no sensor I/O, alignment, feature encoding, safety control, or CNN fusion.
 
 ## Command ABI v1
 
-The Robot uses a latest-only ZMQ `PUB` that connects to `tcp://192.168.1.37:6001`. The remote
+The Robot uses a latest-only ZMQ `PUB` that connects to `tcp://192.168.10.37:6001`. The remote
 controller uses `SUB`, binds `tcp://*:6001`, subscribes to `b""`, and both sides use `CONFLATE=1`,
 HWM 1, and `LINGER=0`. Messages are single-part, little-endian, and exactly 112 bytes:
 

@@ -50,8 +50,8 @@ def normalize_realsense_shm_names(values: object) -> tuple[str, ...]:
 class FR3Config(RobotConfig):
     """Configuration for the FR3 Robot and its managed SensorHub process."""
 
-    command_endpoint: str = "tcp://192.168.1.37:6001"
-    telemetry_endpoint: str = "tcp://192.168.1.37:6000"
+    command_endpoint: str = "tcp://192.168.10.37:6001"
+    telemetry_endpoint: str = "tcp://192.168.10.37:6000"
     observation_shm_name: str = "/fr3_aligned_observation"
     sensorhub_socket_path: str = field(default_factory=_default_sensorhub_socket_path)
     realsense_shm_names: tuple[str, ...] = (

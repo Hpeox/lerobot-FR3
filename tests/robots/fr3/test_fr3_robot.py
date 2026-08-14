@@ -101,6 +101,8 @@ def action(gripper=0.5):
 
 def test_fr3_config_keeps_reset_timeouts_out_of_sensorhub_config(tmp_path):
     config = FR3Config(id="config", calibration_dir=tmp_path)
+    assert config.command_endpoint == "tcp://192.168.10.37:6001"
+    assert config.telemetry_endpoint == "tcp://192.168.10.37:6000"
     assert config.realsense_shm_names == ("/realsense_cam1", "/realsense_cam2")
     sensorhub = config.sensorhub_dict()
     assert "required_sample_max_age_ms" in sensorhub

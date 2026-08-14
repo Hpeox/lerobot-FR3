@@ -38,7 +38,7 @@ and processor tests. It has not yet been accepted against the complete physical 
 - LeRobot Robot configuration, factory registration, and public Robot interface.
 - Creation, supervision, and termination of one SensorHub subprocess per connected Robot instance.
 - The SensorHub UDS control connection and aligned-observation shared-memory client.
-- The local ZMQ command `PUB` socket connected to `tcp://192.168.1.37:6001`.
+- The local ZMQ command `PUB` socket connected to `tcp://192.168.10.37:6001`.
 - Action validation, gripper clipping/conversion, command ABI packing, and publication.
 - The FR3-specific internal joint-reset handshake and its SensorHub UDS status queries.
 - Observation feature declarations, dataset schemas, and deterministic policy layout conversion.
@@ -48,7 +48,7 @@ and processor tests. It has not yet been accepted against the complete physical 
 - The run-level external controller. It does not exist yet and is future work.
 - Four RealSense shared-memory writer processes.
 - The dual-Xense and FT300S shared-memory writer processes.
-- The FGT1 telemetry relay at `tcp://192.168.1.37:6000`.
+- The FGT1 telemetry relay at `tcp://192.168.10.37:6000`.
 - The remote command `SUB` process bound to `tcp://*:6001`.
 - Remote robot safety checks, joint limits, command watchdog behavior, and timeout hold behavior.
 - Starting, monitoring, restarting, or terminating any of the external processes above.
@@ -181,8 +181,8 @@ is unchanged. Reset frames carry `gripper_gPO=0`, which the remote reset impleme
 
 | Field | Default |
 | --- | --- |
-| `command_endpoint` | `tcp://192.168.1.37:6001` |
-| `telemetry_endpoint` | `tcp://192.168.1.37:6000` |
+| `command_endpoint` | `tcp://192.168.10.37:6001` |
+| `telemetry_endpoint` | `tcp://192.168.10.37:6000` |
 | `observation_shm_name` | `/fr3_aligned_observation` |
 | `sensorhub_socket_path` | `/run/user/<uid>/fr3_sensorhub.sock` |
 | `realsense_shm_names` | `("/realsense_cam1", "/realsense_cam2")` |
@@ -250,7 +250,7 @@ lifecycle method. Successful return means the remote reset request was acknowled
 ### Command ABI v1
 
 - Transport: single-part ZMQ `PUB/SUB`, little-endian, exactly 112 bytes.
-- Publisher: connects to `tcp://192.168.1.37:6001` with `SNDHWM=1`, `CONFLATE=1`, and `LINGER=0`.
+- Publisher: connects to `tcp://192.168.10.37:6001` with `SNDHWM=1`, `CONFLATE=1`, and `LINGER=0`.
 - Subscriber: must bind to `tcp://*:6001`, subscribe to `b""`, and use equivalent latest-only
   behavior.
 - Header: magic `FRCMD1\0\0`, ABI version `1`, header size `48`, total size `112`, flags, sequence,
@@ -324,7 +324,7 @@ Start these components before starting LeRobot:
    `/realsense_cam1` and `/realsense_cam2`. The external runtime may run additional cameras.
 2. Dual-Xense writer for `xense_sensor_frame`.
 3. FT300S writer for `ft300_sensor_frame`.
-4. FGT1 telemetry relay publishing at `tcp://192.168.1.37:6000`.
+4. FGT1 telemetry relay publishing at `tcp://192.168.10.37:6000`.
 5. Remote command subscriber bound to `tcp://*:6001`, with its watchdog active.
 
 The local SHM files can be checked with:
