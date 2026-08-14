@@ -22,7 +22,7 @@ from lerobot.policies.acmt_dp.configuration_acmt_dp import (
     rgb_key,
 )
 from lerobot.policies.acmt_dp.modeling_acmt_dp import ACMTDPPolicy
-from lerobot.policies.acmt_dp.processor_acmt_dp import ACMTDPWristROIProcessorStep
+from lerobot.policies.acmt_dp.processor_acmt_dp import ACMTDPCenter480ProcessorStep
 from lerobot.policies.factory import get_policy_class, make_policy_config
 from lerobot.utils.constants import OBS_STATE
 
@@ -92,7 +92,10 @@ def test_registration_and_config_serialization(tmp_path) -> None:
     restored = PreTrainedConfig.from_pretrained(tmp_path)
     assert isinstance(restored, ACMTDPConfig)
     assert restored.wrist_camera_keys == ("camera.cam1", "camera.cam2")
-    assert restored.wrist_roi == (176, 304, 256, 384)
+    assert restored.wrist_roi is None
+    assert restored.visual_preprocess == "center480"
+    assert restored.tactile_history == 4
+    assert restored.action_execution_horizon == 8
 
     tactigen = _config("tactigen")
     tactigen.save_pretrained(tmp_path / "tactigen")
@@ -116,20 +119,19 @@ def test_mode_specific_config_validation() -> None:
         config.validate_features()
 
 
-def test_tactigen_config_and_roi_processor_keep_conventional_pose_matrix():
+def test_tactigen_config_and_processor_keep_conventional_pose_matrix():
     config = _config("tactigen")
     assert config.input_features[O_T_EE].shape == (4, 4)
     pose = _batch("tactigen")[O_T_EE]
-    step = ACMTDPWristROIProcessorStep(
+    step = ACMTDPCenter480ProcessorStep(
         camera_keys=config.wrist_camera_keys,
-        roi=config.wrist_roi,
     )
     processed = step.observation({O_T_EE: pose})
     assert processed[O_T_EE] is pose
 
 
-def test_roi_processor_maps_rgb_and_depth() -> None:
-    step = ACMTDPWristROIProcessorStep(camera_keys=("camera.cam1", "camera.cam2"), roi=(176, 304, 256, 384))
+def test_center480_processor_maps_rgb_and_depth() -> None:
+    step = ACMTDPCenter480ProcessorStep(camera_keys=("camera.cam1", "camera.cam2"))
     rows = torch.arange(480, dtype=torch.uint8)[None, :, None, None]
     rgb = rows.expand(1, 480, 640, 3).clone()
     depth = torch.arange(480, dtype=torch.float32)[None, :, None, None].expand(1, 480, 640, 1)
@@ -143,11 +145,11 @@ def test_roi_processor_maps_rgb_and_depth() -> None:
         assert processed[rgb_key(camera)].shape == (1, 3, 128, 128)
         assert processed[depth_key(camera)].shape == (1, 1, 128, 128)
         assert processed[rgb_key(camera)].dtype == torch.float32
-        assert processed[depth_key(camera)][0, 0, 0, 0] == 176
-        assert processed[rgb_key(camera)][0, 0, 0, 0] == pytest.approx(176 / 255)
+        assert processed[depth_key(camera)][0, 0, 0, 0] == 0
+        assert processed[rgb_key(camera)][0, 0, 0, 0] > 0
     assert step.get_config() == {
         "camera_keys": ["camera.cam1", "camera.cam2"],
-        "roi": [176, 304, 256, 384],
+        "visual_preprocess": "center480",
     }
 
 
@@ -191,10 +193,10 @@ def test_tactigen_causal_state_replans_and_reset() -> None:
         tactile_seen.append(observation["tactile"].clone())
         return torch.full((1, 16, 8), float(plan_count))
 
-    def fake_generate(self, previous, action_chunk):
+    def fake_generate(self, previous, action):
         assert previous["lowdim"].shape == (1, 4, 28)
         torch.testing.assert_close(previous["pose"][:, -1], batch[O_T_EE])
-        generator_inputs.append(action_chunk[:, 0].clone())
+        generator_inputs.append(action.clone())
         return torch.full((1, 2, 35, 20, 3), 7.0)
 
     policy._plan = MethodType(fake_plan, policy)
@@ -202,19 +204,24 @@ def test_tactigen_causal_state_replans_and_reset() -> None:
     batch = _batch("tactigen")
 
     first = policy.predict_action_chunk(batch)
-    policy.predict_action_chunk(batch)
-    assert plan_count == 2
+    assert plan_count == 1
     assert first.shape == (1, 16, 8)
     assert torch.count_nonzero(tactile_seen[0]) == 0
-    assert torch.all(tactile_seen[1] == 7)
+    policy.notify_action_executed(first[:, 0])
+    policy.predict_action_chunk(batch)
+    assert plan_count == 2
+    assert torch.count_nonzero(tactile_seen[1][:, :3]) == 0
+    assert torch.count_nonzero(tactile_seen[1][:, 3]) == 2 * 35 * 20 * 3
     torch.testing.assert_close(generator_inputs[0], first[:, 0])
-    torch.testing.assert_close(policy.select_action(batch), torch.full((1, 8), 3.0))
-    assert plan_count == 3
 
     policy.reset()
     policy.predict_action_chunk(batch)
     assert torch.count_nonzero(tactile_seen[-1]) == 0
-    assert policy.causal_state_dict() == {"history_length": 4, "has_previous_plan": True}
+    assert policy.causal_state_dict() == {
+        "history_length": 4,
+        "tactile_history_length": 4,
+        "has_previous_plan": True,
+    }
 
 
 def test_mode_specific_missing_and_shape_errors() -> None:

@@ -21,10 +21,74 @@ from .modeling_components import (
     coordinate_grid,
     require_tensor,
 )
+from .visual_preprocess import prepare_for_frozen_encoder
 
 CONTACT_FZ_THRESHOLD = -0.01
 DEFAULT_TEMPERATURES: tuple[float, ...] = ()
 DEFAULT_POOL_SCALES: tuple[tuple[int, int], ...] = ()
+
+
+def matrix_to_pose_xyzw_fast(matrices: torch.Tensor) -> torch.Tensor:
+    """Vectorized transform conversion used by the causal TactiGen path."""
+    if matrices.ndim < 3 or tuple(matrices.shape[-2:]) != (4, 4):
+        raise ValueError(f"expected [...,4,4] transforms, got {tuple(matrices.shape)}")
+    flat = matrices.reshape(-1, 4, 4)
+    rotation = flat[:, :3, :3]
+    diagonal = torch.diagonal(rotation, dim1=-2, dim2=-1)
+    trace = diagonal.sum(-1)
+    eps = torch.finfo(flat.dtype).eps if flat.dtype.is_floating_point else 1e-7
+    positive = trace > 0
+    s = (torch.sqrt((trace + 1.0).clamp_min(eps)) * 2.0).clamp_min(eps)
+    qp = torch.stack(
+        [
+            (rotation[:, 2, 1] - rotation[:, 1, 2]) / s,
+            (rotation[:, 0, 2] - rotation[:, 2, 0]) / s,
+            (rotation[:, 1, 0] - rotation[:, 0, 1]) / s,
+            0.25 * s,
+        ],
+        dim=-1,
+    )
+    s0 = (torch.sqrt((1 + diagonal[:, 0] - diagonal[:, 1] - diagonal[:, 2]).clamp_min(eps)) * 2).clamp_min(
+        eps
+    )
+    q0 = torch.stack(
+        [
+            0.25 * s0,
+            (rotation[:, 0, 1] + rotation[:, 1, 0]) / s0,
+            (rotation[:, 0, 2] + rotation[:, 2, 0]) / s0,
+            (rotation[:, 2, 1] - rotation[:, 1, 2]) / s0,
+        ],
+        dim=-1,
+    )
+    s1 = (torch.sqrt((1 + diagonal[:, 1] - diagonal[:, 0] - diagonal[:, 2]).clamp_min(eps)) * 2).clamp_min(
+        eps
+    )
+    q1 = torch.stack(
+        [
+            (rotation[:, 0, 1] + rotation[:, 1, 0]) / s1,
+            0.25 * s1,
+            (rotation[:, 1, 2] + rotation[:, 2, 1]) / s1,
+            (rotation[:, 0, 2] - rotation[:, 2, 0]) / s1,
+        ],
+        dim=-1,
+    )
+    s2 = (torch.sqrt((1 + diagonal[:, 2] - diagonal[:, 0] - diagonal[:, 1]).clamp_min(eps)) * 2).clamp_min(
+        eps
+    )
+    q2 = torch.stack(
+        [
+            (rotation[:, 0, 2] + rotation[:, 2, 0]) / s2,
+            (rotation[:, 1, 2] + rotation[:, 2, 1]) / s2,
+            0.25 * s2,
+            (rotation[:, 1, 0] - rotation[:, 0, 1]) / s2,
+        ],
+        dim=-1,
+    )
+    axis = diagonal.argmax(-1)
+    fallback = torch.where(axis[:, None] == 0, q0, torch.where(axis[:, None] == 1, q1, q2))
+    quat = torch.where(positive[:, None], qp, fallback)
+    quat = quat / torch.linalg.vector_norm(quat, dim=-1, keepdim=True).clamp_min(eps)
+    return torch.cat([flat[:, :3, 3], quat], dim=-1).reshape(*matrices.shape[:-2], 7)
 
 
 def contact_from_fz(force_z: torch.Tensor) -> torch.Tensor:
@@ -434,6 +498,15 @@ class TactiGenForceFieldModel(nn.Module):
             persistent=True,
         )
 
+    def reset(self) -> None:
+        """Reset deployment causal state.
+
+        The embedded generator is currently functionally stateless—the policy
+        owns the four-frame tactile ring—but an explicit hook prevents future
+        cached CUDA/RNN state from leaking across episodes.
+        """
+        return None
+
     def model_config(self) -> dict[str, Any]:
         return {
             "t_obs": self.t_obs,
@@ -585,6 +658,45 @@ class TactiGenForceFieldModel(nn.Module):
         visual_ablation: str = "dual",
     ) -> dict[str, Any]:
         return self.forward(batch, visual_ablation)
+
+    @torch.no_grad()
+    def predict_next(
+        self,
+        previous_observation: Mapping[str, torch.Tensor],
+        previous_pose_matrix: torch.Tensor,
+        executed_action: torch.Tensor,
+    ) -> torch.Tensor:
+        """Generate one force frame from the last four observations and action."""
+        if executed_action.ndim == 1:
+            executed_action = executed_action.unsqueeze(0)
+        if executed_action.ndim != 2 or tuple(executed_action.shape[1:]) != (8,):
+            raise ValueError(f"executed_action must be [B,8], got {tuple(executed_action.shape)}")
+        rgb = previous_observation["rgb"]
+        depth = previous_observation["depth"]
+        if tuple(rgb.shape[-3:]) == (3, 480, 640):
+            rgb, depth = prepare_for_frozen_encoder(rgb, depth)
+        depth = depth.to(dtype=torch.int32)
+        pose = previous_pose_matrix
+        if pose.ndim == 3:
+            pose = pose.unsqueeze(0)
+        if pose.ndim != 4 or tuple(pose.shape[-2:]) != (4, 4):
+            raise ValueError(f"previous_pose_matrix must be [B,4,4] or [B,4,4,4], got {tuple(pose.shape)}")
+        if tuple(rgb.shape[1:3]) != (4, 2) or tuple(depth.shape[1:3]) != (4, 2):
+            raise ValueError("TactiGen expects RGB-D history [B,4,2,C,H,W]")
+        batch = {
+            "realsense.cam1_color": rgb[:, :, 0],
+            "realsense.cam1_depth": depth[:, :, 0],
+            "realsense.cam2_color": rgb[:, :, 1],
+            "realsense.cam2_depth": depth[:, :, 1],
+            "robot.q": previous_observation["lowdim"][..., :7],
+            "robot.O_T_EE": matrix_to_pose_xyzw_fast(pose),
+            "ft300.wrench": previous_observation["lowdim"][..., 21:27],
+            "gripper.gripper_gPO": previous_observation["lowdim"][..., 27:28],
+            "gello.future_q": executed_action[:, None, :7],
+            "gello.future_gripper_width": executed_action[:, None, 7:8],
+        }
+        output = self.inference(batch)
+        return torch.cat([output["force_xy"], output["force_z"]], dim=-1)[:, 0]
 
 
 def _spatial_smooth(value: torch.Tensor) -> torch.Tensor:
