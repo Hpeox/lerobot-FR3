@@ -114,6 +114,19 @@ def test_merge_multiple_groups_order_and_dedup():
     assert out[ACTION]["shape"] == (4,)
 
 
+@pytest.mark.parametrize("shape", [(7,), (2, 3)])
+def test_standalone_multidimensional_feature_with_no_names_preserves_shape(shape):
+    feature = {
+        "dtype": "float32",
+        "shape": shape,
+        "names": None,
+    }
+
+    out = combine_feature_dicts({"observation.fr3.dq": feature})
+
+    assert out == {"observation.fr3.dq": feature}
+
+
 def test_non_vector_last_wins_for_images():
     # Non-vector (images) with same name should be overwritten by the last image specified
     g1 = {

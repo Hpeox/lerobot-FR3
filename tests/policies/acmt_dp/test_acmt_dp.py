@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from types import MethodType
 
+import numpy as np
 import pytest
 import torch
 
@@ -23,8 +24,19 @@ from lerobot.policies.acmt_dp.configuration_acmt_dp import (
 )
 from lerobot.policies.acmt_dp.modeling_acmt_dp import ACMTDPPolicy
 from lerobot.policies.acmt_dp.processor_acmt_dp import ACMTDPWristROIProcessorStep
-from lerobot.policies.factory import get_policy_class, make_policy_config
+from lerobot.policies.factory import get_policy_class, make_policy_config, make_pre_post_processors
+from lerobot.policies.utils import prepare_observation_for_inference
+from lerobot.robots.fr3.feature_adapter import (
+    ACTION_KEYS,
+    fr3_action_dataset_features,
+    fr3_observation_dataset_features,
+)
 from lerobot.utils.constants import OBS_STATE
+from lerobot.utils.feature_utils import (
+    build_dataset_frame,
+    combine_feature_dicts,
+    dataset_to_policy_features,
+)
 
 
 def _generator_config() -> dict:
@@ -176,6 +188,93 @@ def test_lowdim_order_and_real_tactile_layout() -> None:
     assert current["tactile"].shape == (1, 2, 35, 20, 3)
     assert torch.all(current["tactile"][0, 0, ..., 0] == 1)
     assert torch.all(current["tactile"][0, 1, ..., 1] == 2)
+
+
+def test_fr3_schema_to_legacy_policy_input_flow() -> None:
+    observation_features = fr3_observation_dataset_features(camera_count=2, use_videos=False)
+    dataset_features = combine_feature_dicts(fr3_action_dataset_features(), observation_features)
+    policy_features = dataset_to_policy_features(dataset_features)
+
+    expected_standalone_shapes = {
+        DQ: (7,),
+        TAU_J: (7,),
+        O_T_EE: (4, 4),
+        FT300: (6,),
+        XENSE0: (35, 20, 3),
+        XENSE1: (35, 20, 3),
+    }
+    for key, shape in expected_standalone_shapes.items():
+        assert dataset_features[key]["shape"] == shape
+        assert policy_features[key].shape == shape
+    for key in (DQ, TAU_J, O_T_EE, FT300):
+        assert dataset_features[key]["names"] is None
+    assert dataset_features["action"] == {
+        "dtype": "float32",
+        "shape": (8,),
+        "names": list(ACTION_KEYS),
+    }
+
+    raw_observation = {
+        **{f"fr3_joint{i}.pos": np.float32(i - 1) for i in range(1, 8)},
+        "gripper.pos": np.float32(0.5),
+        "fr3.dq": np.arange(10, 17, dtype=np.float32),
+        "fr3.tau_J": np.arange(20, 27, dtype=np.float32),
+        "fr3.O_T_EE": np.eye(4, dtype=np.float32),
+        "gripper.gPO": np.array([128], dtype=np.uint8),
+        "gripper.gCU": np.array([0], dtype=np.uint8),
+        "ft300s.wrench": np.arange(30, 36, dtype=np.float32),
+        "xense.sensor0.force_field": np.full((35, 20, 3), 1.0, dtype=np.float32),
+        "xense.sensor1.force_field": np.full((35, 20, 3), 2.0, dtype=np.float32),
+    }
+    for camera in ("camera.cam1", "camera.cam2"):
+        raw_observation[f"{camera}.rgb"] = np.zeros((480, 640, 3), dtype=np.uint8)
+        raw_observation[f"{camera}.depth"] = np.zeros((480, 640, 1), dtype=np.uint16)
+
+    frame = build_dataset_frame(dataset_features, raw_observation, prefix="observation")
+    inference_frame = prepare_observation_for_inference(
+        frame,
+        torch.device("cpu"),
+        task="local-flow",
+        robot_type="fr3",
+    )
+    config = _config("real")
+    preprocessor, _ = make_pre_post_processors(config)
+    policy_batch = preprocessor(inference_frame)
+
+    assert policy_batch[DQ].shape == (1, 7)
+    assert policy_batch[TAU_J].shape == (1, 7)
+    assert policy_batch[FT300].shape == (1, 6)
+    assert policy_batch[XENSE0].shape == (1, 3, 35, 20)
+    assert policy_batch[XENSE1].shape == (1, 3, 35, 20)
+
+    policy = ACMTDPPolicy(config)
+    plan_inputs: list[dict[str, torch.Tensor]] = []
+
+    def fake_plan(self, observation, noise=None):
+        del self, noise
+        plan_inputs.append(observation)
+        return torch.zeros(1, 16, 8)
+
+    policy._plan = MethodType(fake_plan, policy)
+    action = policy.select_action(policy_batch)
+
+    assert action.shape == (1, 8)
+    assert len(plan_inputs) == 1
+    legacy_input = plan_inputs[0]
+    assert legacy_input["lowdim"].shape == (1, 4, 28)
+    assert legacy_input["tactile"].shape == (1, 2, 35, 20, 3)
+    expected_lowdim = torch.cat(
+        [
+            torch.arange(7),
+            torch.arange(10, 17),
+            torch.arange(20, 27),
+            torch.arange(30, 36),
+            torch.tensor([128 / 255]),
+        ]
+    )
+    torch.testing.assert_close(legacy_input["lowdim"][0, -1], expected_lowdim)
+    assert torch.all(legacy_input["tactile"][0, 0] == 1)
+    assert torch.all(legacy_input["tactile"][0, 1] == 2)
 
 
 def test_tactigen_causal_state_replans_and_reset() -> None:

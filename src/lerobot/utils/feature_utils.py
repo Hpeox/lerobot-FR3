@@ -205,7 +205,7 @@ def dataset_to_policy_features(features: dict[str, dict]) -> dict[str, PolicyFea
 def combine_feature_dicts(*dicts: dict) -> dict:
     """Merge LeRobot grouped feature dicts.
 
-    - For 1D numeric specs (dtype not image/video/string) with "names": we merge the names and recompute the shape.
+    - For 1D numeric specs (dtype not image/video/string) with non-None "names": we merge the names and recompute the shape.
     - For others (e.g. `observation.images.*`), the last one wins (if they are identical).
 
     Args:
@@ -230,7 +230,7 @@ def combine_feature_dicts(*dicts: dict) -> dict:
                 dtype not in ("image", "video", "string")
                 and isinstance(shape, tuple)
                 and len(shape) == 1
-                and "names" in value
+                and value.get("names") is not None
             )
 
             if is_vector:
