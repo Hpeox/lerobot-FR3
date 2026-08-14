@@ -155,6 +155,17 @@ class FR3(Robot):
                 self._uds.setblocking(False)
                 return
             self._dispatch_uds_packet(packet, startup=True)
+        diagnostic_deadline = time.monotonic() + min(1.0, self.config.sensorhub_stop_timeout_s)
+        while time.monotonic() < diagnostic_deadline:
+            self._uds.settimeout(max(0.01, diagnostic_deadline - time.monotonic()))
+            try:
+                packet = parse_packet(self._uds.recv(MAX_PACKET_SIZE + 1))
+            except TimeoutError:
+                continue
+            if packet["type"] == "FATAL":
+                self._dispatch_uds_packet(packet, startup=True)
+            if self._sensorhub is not None and self._sensorhub.poll() is not None:
+                break
         raise TimeoutError("SensorHub did not report READY before startup timeout")
 
     def _open_command_socket(self) -> None:

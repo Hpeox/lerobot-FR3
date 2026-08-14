@@ -208,6 +208,81 @@ def test_alignment_pending_log_is_reason_change_or_one_second_throttled(caplog):
     ]
 
 
+def test_attach_pending_log_is_reason_change_or_one_second_throttled(caplog):
+    runtime = object.__new__(SensorHubRuntime)
+    runtime._attach_pending_error = None
+    runtime._attach_pending_log_monotonic = 0.0
+    caplog.set_level(logging.WARNING, logger=runtime_module.__name__)
+
+    runtime._log_attach_pending(FileNotFoundError("missing ft SHM"))
+    runtime._log_attach_pending(FileNotFoundError("missing ft SHM"))
+    runtime._log_attach_pending(FileNotFoundError("missing xense SHM"))
+    runtime._attach_pending_log_monotonic -= 1.0
+    runtime._log_attach_pending(FileNotFoundError("missing xense SHM"))
+
+    messages = [
+        record.message
+        for record in caplog.records
+        if "SensorHub attach pending before READY" in record.message
+    ]
+    assert messages == [
+        "SensorHub attach pending before READY: FileNotFoundError: missing ft SHM",
+        "SensorHub attach pending before READY: FileNotFoundError: missing xense SHM",
+        "SensorHub attach pending before READY: FileNotFoundError: missing xense SHM",
+    ]
+
+
+def test_run_uses_one_startup_deadline_for_attach_and_ready(monkeypatch, tmp_path):
+    runtime = object.__new__(SensorHubRuntime)
+    runtime.config = _config(tmp_path, f"unused_{uuid.uuid4().hex}")
+    runtime.stop_event = Event()
+    runtime.fatal_event = Event()
+    runtime._threads = []
+    runtime._readers = []
+    runtime.writer = None
+    runtime.camera_caches = (SimpleNamespace(append=lambda sample: None),) * 2
+    runtime.xense_cache = SimpleNamespace(append=lambda sample: None)
+    runtime.ft_cache = SimpleNamespace(append=lambda sample: None)
+    deadlines = []
+
+    class FakeReader:
+        def read(self, *, timeout_s):
+            raise TimeoutError
+
+        def close(self):
+            pass
+
+    class FakeWriter:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def close(self, *, unlink):
+            pass
+
+    readers = tuple(FakeReader() for _ in range(5))
+    runtime.control = SimpleNamespace(
+        start=lambda: None,
+        publish=lambda *args, **kwargs: None,
+        close=lambda: None,
+    )
+    runtime._attach_readers = lambda deadline: deadlines.append(deadline) or (
+        readers[:2],
+        readers[2],
+        readers[3],
+        readers[4],
+    )
+    runtime._start_reader_thread = lambda *args, **kwargs: None
+    runtime._start_telemetry_thread = lambda *args, **kwargs: None
+    runtime._start_thread = lambda *args, **kwargs: None
+    runtime._wait_until_ready = lambda deadline: deadlines.append(deadline)
+    runtime._supervise = lambda: None
+    monkeypatch.setattr(runtime_module, "AlignedObservationWriter", FakeWriter)
+
+    assert runtime.run() == 0
+    assert len(deadlines) == 2
+    assert deadlines[0] == deadlines[1]
+
+
 def test_alignment_pending_logs_stop_after_first_publish(caplog):
     runtime = object.__new__(SensorHubRuntime)
     runtime.stop_event = Event()

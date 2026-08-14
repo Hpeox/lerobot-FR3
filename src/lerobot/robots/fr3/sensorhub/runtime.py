@@ -63,6 +63,8 @@ class SensorHubRuntime:
         self.first_publish_event = Event()
         self._fatal_lock = Lock()
         self._fatal_message = ""
+        self._attach_pending_error: str | None = None
+        self._attach_pending_log_monotonic = 0.0
         self._alignment_pending_reason: str | None = None
         self._alignment_pending_log_monotonic = 0.0
         self._threads: list[Thread] = []
@@ -90,7 +92,8 @@ class SensorHubRuntime:
     def run(self) -> int:
         self.control.start()
         try:
-            cameras, xense, ft, telemetry = self._attach_readers()
+            startup_deadline = time.monotonic() + self.config.startup_timeout_s
+            cameras, xense, ft, telemetry = self._attach_readers(startup_deadline)
             self._readers = [*cameras, xense, ft, telemetry]
             self.writer = AlignedObservationWriter(
                 self.config.observation_shm_name,
@@ -105,7 +108,7 @@ class SensorHubRuntime:
             self._start_telemetry_thread(telemetry)
             self._start_thread("AlignmentPublisher", self._alignment_loop)
 
-            self._wait_until_ready()
+            self._wait_until_ready(startup_deadline)
             self.control.publish("READY", message="first aligned snapshot published")
             self._supervise()
             return 1 if self.fatal_event.is_set() else 0
@@ -127,8 +130,9 @@ class SensorHubRuntime:
                 self.writer.close(unlink=True)
             self.control.close()
 
-    def _attach_readers(self):
-        deadline = time.monotonic() + self.config.startup_timeout_s
+    def _attach_readers(self, deadline: float | None = None):
+        if deadline is None:
+            deadline = time.monotonic() + self.config.startup_timeout_s
         last_error: Exception | None = None
         while time.monotonic() < deadline and not self.stop_event.is_set():
             if not self._parent_is_alive():
@@ -150,6 +154,7 @@ class SensorHubRuntime:
                 return cameras, xense, ft, telemetry
             except (FileNotFoundError, ValueError, OSError) as exc:
                 last_error = exc
+                self._log_attach_pending(exc)
                 for reader in reversed(attached):
                     reader.close()  # type: ignore[attr-defined]
                 time.sleep(0.05)
@@ -157,6 +162,18 @@ class SensorHubRuntime:
             self.stop_event.set()
             raise _ParentExited("parent process exited while SensorHub was attaching readers")
         raise TimeoutError(f"required upstream writers were not ready: {last_error}")
+
+    def _log_attach_pending(self, exc: Exception) -> None:
+        """Log the current upstream attach failure on change or once per second."""
+        message = f"{type(exc).__name__}: {exc}"
+        now = time.monotonic()
+        if (
+            message != self._attach_pending_error
+            or now - self._attach_pending_log_monotonic >= 1.0
+        ):
+            logger.warning("SensorHub attach pending before READY: %s", message)
+            self._attach_pending_error = message
+            self._attach_pending_log_monotonic = now
 
     def _start_thread(self, name: str, target: Callable[[], None]) -> None:
         thread = Thread(target=target, name=name, daemon=True)
@@ -234,8 +251,9 @@ class SensorHubRuntime:
         )
         return all(cache.sequence_count() >= 2 for cache in caches)
 
-    def _wait_until_ready(self) -> None:
-        deadline = time.monotonic() + self.config.startup_timeout_s
+    def _wait_until_ready(self, deadline: float | None = None) -> None:
+        if deadline is None:
+            deadline = time.monotonic() + self.config.startup_timeout_s
         while time.monotonic() < deadline:
             if self.fatal_event.is_set():
                 raise RuntimeError(self._fatal_message)

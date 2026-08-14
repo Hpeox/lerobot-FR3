@@ -1,4 +1,5 @@
 import logging
+import time
 from collections import deque
 from unittest.mock import Mock
 
@@ -115,6 +116,29 @@ def test_fr3_config_keeps_reset_timeouts_out_of_sensorhub_config(tmp_path):
 
     with pytest.raises(ValueError, match="reset_ack_timeout_s"):
         FR3Config(id="invalid", calibration_dir=tmp_path, reset_ack_timeout_s=np.nan)
+
+
+def test_sensorhub_fatal_is_consumed_during_post_timeout_diagnostic_grace(tmp_path):
+    instance = FR3(
+        FR3Config(
+            id="startup-diagnostic",
+            calibration_dir=tmp_path,
+            sensorhub_stop_timeout_s=0.01,
+        )
+    )
+    instance._sensorhub = FakeProcess()
+    instance._uds = FakeUDS()
+    instance._uds.responses.append(
+        make_packet(
+            "FATAL",
+            1,
+            status_code=1,
+            message="required upstream writers were not ready: missing ft SHM",
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="missing ft SHM"):
+        instance._wait_for_sensorhub_ready(time.monotonic() - 0.001)
 
 
 @pytest.mark.parametrize(
