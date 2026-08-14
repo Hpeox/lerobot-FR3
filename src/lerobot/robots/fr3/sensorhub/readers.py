@@ -7,6 +7,7 @@ import mmap
 import os
 import struct
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
@@ -26,16 +27,55 @@ XENSE_SLOT_HEADER = struct.Struct("<QQqq")
 FT_SLOT_HEADER = struct.Struct("<QQq8x")
 
 XENSE_FORCE_SHAPE: Final = (35, 20, 3)
-XENSE_FORCE_BYTES: Final = 35 * 20 * 3 * 8
 XENSE_REC_BYTES: Final = 700 * 400 * 3
-XENSE_RESULTANT_BYTES: Final = 6 * 8
-XENSE_FORCE0_OFFSET: Final = XENSE_REC_BYTES
-XENSE_FORCE1_OFFSET: Final = (
-    XENSE_REC_BYTES + XENSE_FORCE_BYTES + XENSE_FORCE_BYTES + XENSE_RESULTANT_BYTES + XENSE_REC_BYTES
-)
-XENSE_PAYLOAD_SIZE: Final = 2 * XENSE_REC_BYTES + 4 * XENSE_FORCE_BYTES + 2 * XENSE_RESULTANT_BYTES
-XENSE_SLOT_STRIDE: Final = XENSE_SLOT_HEADER.size + XENSE_PAYLOAD_SIZE
-XENSE_TOTAL_SIZE: Final = LOCAL_GLOBAL_HEADER.size + 2 * XENSE_SLOT_STRIDE
+
+
+@dataclass(frozen=True, slots=True)
+class XenseSourceLayout:
+    """One supported fixed-width scalar variant of the Xense SHM v2 layout."""
+
+    scalar_dtype: str
+    force0_offset: int
+    force1_offset: int
+    payload_size: int
+    slot_stride: int
+    total_size: int
+
+
+def _xense_source_layout(scalar_dtype: str) -> XenseSourceLayout:
+    scalar_size = np.dtype(scalar_dtype).itemsize
+    force_bytes = 35 * 20 * 3 * scalar_size
+    resultant_bytes = 6 * scalar_size
+    force0_offset = XENSE_REC_BYTES
+    force1_offset = (
+        XENSE_REC_BYTES + force_bytes + force_bytes + resultant_bytes + XENSE_REC_BYTES
+    )
+    payload_size = 2 * XENSE_REC_BYTES + 4 * force_bytes + 2 * resultant_bytes
+    slot_stride = XENSE_SLOT_HEADER.size + payload_size
+    total_size = LOCAL_GLOBAL_HEADER.size + 2 * slot_stride
+    return XenseSourceLayout(
+        scalar_dtype=scalar_dtype,
+        force0_offset=force0_offset,
+        force1_offset=force1_offset,
+        payload_size=payload_size,
+        slot_stride=slot_stride,
+        total_size=total_size,
+    )
+
+
+XENSE_FLOAT64_LAYOUT: Final = _xense_source_layout("<f8")
+XENSE_FLOAT32_LAYOUT: Final = _xense_source_layout("<f4")
+XENSE_LAYOUT_BY_TOTAL_SIZE: Final = {
+    XENSE_FLOAT64_LAYOUT.total_size: XENSE_FLOAT64_LAYOUT,
+    XENSE_FLOAT32_LAYOUT.total_size: XENSE_FLOAT32_LAYOUT,
+}
+
+# Backward-compatible names for the original float64 Xense v2 variant.
+XENSE_FORCE0_OFFSET: Final = XENSE_FLOAT64_LAYOUT.force0_offset
+XENSE_FORCE1_OFFSET: Final = XENSE_FLOAT64_LAYOUT.force1_offset
+XENSE_PAYLOAD_SIZE: Final = XENSE_FLOAT64_LAYOUT.payload_size
+XENSE_SLOT_STRIDE: Final = XENSE_FLOAT64_LAYOUT.slot_stride
+XENSE_TOTAL_SIZE: Final = XENSE_FLOAT64_LAYOUT.total_size
 
 FT_WRENCH_SHAPE: Final = (6,)
 FT_PAYLOAD_SIZE: Final = 6 * 8
@@ -168,10 +208,17 @@ class _PythonSharedMemoryReader:
         size = os.fstat(self._fd).st_size
         self._mapping = mmap.mmap(self._fd, size, access=mmap.ACCESS_READ)
         self._last_sequence = 0
-        if size != self.expected_size:
+        try:
+            self._configure_mapping(size)
+        except Exception:
             self.close()
+            raise
+
+    def _configure_mapping(self, size: int) -> None:
+        if size != self.expected_size:
             raise ValueError(
-                f"{shm_name}: mapping size {size} does not match expected ABI size {self.expected_size}"
+                f"{self.shm_name}: mapping size {size} does not match expected ABI size "
+                f"{self.expected_size}"
             )
 
     def _read_header_and_payload(self, timeout_s: float) -> tuple[tuple[int, ...], bytes]:
@@ -205,21 +252,43 @@ class _PythonSharedMemoryReader:
 
 
 class XenseReader(_PythonSharedMemoryReader):
-    """Reader for the fixed dual-Xense writer layout v2."""
+    """Reader for the two fixed scalar-width variants of dual-Xense SHM v2."""
 
     expected_size = XENSE_TOTAL_SIZE
     slot_stride = XENSE_SLOT_STRIDE
     slot_header = XENSE_SLOT_HEADER
 
+    def _configure_mapping(self, size: int) -> None:
+        layout = XENSE_LAYOUT_BY_TOTAL_SIZE.get(size)
+        if layout is None:
+            supported = sorted(XENSE_LAYOUT_BY_TOTAL_SIZE)
+            raise ValueError(
+                f"{self.shm_name}: mapping size {size} does not match supported Xense ABI sizes "
+                f"{supported}"
+            )
+        self._source_layout = layout
+        self.slot_stride = layout.slot_stride
+
     def read(self, timeout_s: float = 0.02) -> XenseSample:
         (_seq, frame_id, timestamp0_ns, timestamp1_ns), payload = self._read_header_and_payload(timeout_s)
+        layout = self._source_layout
         force0 = (
-            np.frombuffer(payload, dtype="<f8", count=35 * 20 * 3, offset=XENSE_FORCE0_OFFSET)
+            np.frombuffer(
+                payload,
+                dtype=layout.scalar_dtype,
+                count=35 * 20 * 3,
+                offset=layout.force0_offset,
+            )
             .reshape(XENSE_FORCE_SHAPE)
             .astype(np.float32)
         )
         force1 = (
-            np.frombuffer(payload, dtype="<f8", count=35 * 20 * 3, offset=XENSE_FORCE1_OFFSET)
+            np.frombuffer(
+                payload,
+                dtype=layout.scalar_dtype,
+                count=35 * 20 * 3,
+                offset=layout.force1_offset,
+            )
             .reshape(XENSE_FORCE_SHAPE)
             .astype(np.float32)
         )

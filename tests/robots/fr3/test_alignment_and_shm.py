@@ -27,11 +27,9 @@ from lerobot.robots.fr3.sensorhub.readers import (
     LOCAL_GLOBAL_HEADER,
     RS_GLOBAL_HEADER_SIZE,
     RS_SLOT_HEADER,
-    XENSE_FORCE0_OFFSET,
-    XENSE_FORCE1_OFFSET,
+    XENSE_FLOAT32_LAYOUT,
+    XENSE_FLOAT64_LAYOUT,
     XENSE_SLOT_HEADER,
-    XENSE_SLOT_STRIDE,
-    XENSE_TOTAL_SIZE,
     FT300SReader,
     RealSenseReader,
     XenseReader,
@@ -417,17 +415,32 @@ def test_realsense_reader_strict_v1_roundtrip():
         path.unlink()
 
 
-def test_xense_and_ft_reader_fixed_offsets():
+@pytest.mark.parametrize(
+    ("layout", "expected_total_size"),
+    [(XENSE_FLOAT64_LAYOUT, 3_494_664), (XENSE_FLOAT32_LAYOUT, 3_427_368)],
+)
+def test_xense_reader_supported_scalar_layouts(layout, expected_total_size):
+    assert layout.total_size == expected_total_size
     xense_name = f"xense_test_{uuid.uuid4().hex}"
-    raw = SharedMemory(name=xense_name, create=True, size=XENSE_TOTAL_SIZE)
+    raw = SharedMemory(name=xense_name, create=True, size=layout.total_size)
     try:
-        raw.buf[:] = b"\0" * XENSE_TOTAL_SIZE
+        raw.buf[:] = b"\0" * layout.total_size
         LOCAL_GLOBAL_HEADER.pack_into(raw.buf, 0, 1)
-        base = LOCAL_GLOBAL_HEADER.size + XENSE_SLOT_STRIDE
+        base = LOCAL_GLOBAL_HEADER.size + layout.slot_stride
         XENSE_SLOT_HEADER.pack_into(raw.buf, base, 2, 9, 100, 101)
         payload = base + XENSE_SLOT_HEADER.size
-        np.ndarray((35, 20, 3), dtype="<f8", buffer=raw.buf, offset=payload + XENSE_FORCE0_OFFSET).fill(1.25)
-        np.ndarray((35, 20, 3), dtype="<f8", buffer=raw.buf, offset=payload + XENSE_FORCE1_OFFSET).fill(2.25)
+        np.ndarray(
+            (35, 20, 3),
+            dtype=layout.scalar_dtype,
+            buffer=raw.buf,
+            offset=payload + layout.force0_offset,
+        ).fill(1.25)
+        np.ndarray(
+            (35, 20, 3),
+            dtype=layout.scalar_dtype,
+            buffer=raw.buf,
+            offset=payload + layout.force1_offset,
+        ).fill(2.25)
         reader = XenseReader(xense_name)
         sample = reader.read()
         assert sample.sequence == 9
@@ -441,6 +454,20 @@ def test_xense_and_ft_reader_fixed_offsets():
         raw.close()
         raw.unlink()
 
+
+def test_xense_reader_rejects_unknown_mapping_size():
+    xense_name = f"xense_bad_size_{uuid.uuid4().hex}"
+    unknown_size = XENSE_FLOAT32_LAYOUT.total_size + 8
+    raw = SharedMemory(name=xense_name, create=True, size=unknown_size)
+    try:
+        with pytest.raises(ValueError, match="does not match supported Xense ABI sizes"):
+            XenseReader(xense_name)
+    finally:
+        raw.close()
+        raw.unlink()
+
+
+def test_ft_reader_fixed_offsets():
     ft_name = f"ft_test_{uuid.uuid4().hex}"
     raw = SharedMemory(name=ft_name, create=True, size=FT_TOTAL_SIZE)
     try:

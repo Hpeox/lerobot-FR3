@@ -127,10 +127,17 @@ is unchanged. Reset frames carry `gripper_gPO=0`, which the remote reset impleme
 
 ### SensorHub
 
-- Strict readers support the RealSense POSIX SHM v1 layouts, dual-Xense v2 layout, FT300S v2 layout,
-  and FGT1 v1 telemetry frames.
+- Strict readers support the RealSense POSIX SHM v1 layouts, the two explicitly supported
+  dual-Xense v2 scalar-width layouts, FT300S v2 layout, and FGT1 v1 telemetry frames.
 - Xense and FT readers open `/dev/shm` mappings read-only instead of using Python ownership APIs,
   preventing accidental unlinking of externally owned shared memory.
+- The Xense v2 global header contains only `latest_index`; its slot header contains only
+  `seq`, `frame_id`, and two timestamps. Neither header declares mapping size, tensor dtype, or
+  schema. SensorHub therefore distinguishes exactly two closed v2 variants by the complete POSIX
+  mapping size: 3,494,664 bytes for little-endian `float64` force/resultant tensors and 3,427,368
+  bytes for little-endian `float32` tensors. Tensor shapes/order and the `uint8` recording arrays
+  remain identical. Any other size is rejected, and both supported source layouts are copied into
+  the same `float32 (35, 20, 3)` SensorHub samples.
 - A bounded cache and causal aligner enforce freshness and camera skew limits while suppressing
   duplicate aligned output.
 - The aligned writer owns one fixed two-slot seqlock mapping and records fatal state in its global
