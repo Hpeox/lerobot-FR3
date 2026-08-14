@@ -294,7 +294,7 @@ class XenseReader(_PythonSharedMemoryReader):
         )
         return XenseSample(
             frame_id,
-            min(timestamp0_ns, timestamp1_ns),
+            max(timestamp0_ns, timestamp1_ns),
             time.monotonic_ns(),
             force0,
             force1,

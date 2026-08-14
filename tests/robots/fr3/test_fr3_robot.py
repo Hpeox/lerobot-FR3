@@ -106,6 +106,9 @@ def test_fr3_config_keeps_reset_timeouts_out_of_sensorhub_config(tmp_path):
     assert config.realsense_shm_names == ("/realsense_cam1", "/realsense_cam2")
     sensorhub = config.sensorhub_dict()
     assert "required_sample_max_age_ms" in sensorhub
+    assert sensorhub["camera_bundle_span_warn_ms"] == 20
+    assert sensorhub["camera_max_skew_ms"] == 50
+    assert sensorhub["camera_bundle_wait_ms"] == 25
     assert "reset_ack_timeout_s" not in sensorhub
     assert "reset_completion_timeout_s" not in sensorhub
     assert "reset_retry_interval_s" not in sensorhub
@@ -118,6 +121,15 @@ def test_fr3_config_keeps_reset_timeouts_out_of_sensorhub_config(tmp_path):
 
     with pytest.raises(ValueError, match="reset_ack_timeout_s"):
         FR3Config(id="invalid", calibration_dir=tmp_path, reset_ack_timeout_s=np.nan)
+    with pytest.raises(ValueError, match="camera_bundle_wait_ms"):
+        FR3Config(id="invalid", calibration_dir=tmp_path, camera_bundle_wait_ms=0)
+    with pytest.raises(ValueError, match="must be <="):
+        FR3Config(
+            id="invalid",
+            calibration_dir=tmp_path,
+            camera_bundle_span_warn_ms=51,
+            camera_max_skew_ms=50,
+        )
 
 
 def test_sensorhub_fatal_is_consumed_during_post_timeout_diagnostic_grace(tmp_path):

@@ -148,6 +148,21 @@ class SnapshotMetadata:
     publish_monotonic_ns: int
 
 
+@dataclass(frozen=True, slots=True)
+class WriterTimingDiagnostics:
+    sequence: int
+    publish_interval_ns: int | None
+    same_slot_rewrite_interval_ns: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotReadDiagnostics:
+    attempts: int
+    retry_counts: dict[str, int]
+    last_sequence: int
+    slot_copy_duration_ns: int | None
+
+
 class AlignedObservationWriter:
     """Owner/writer for the dynamic two-slot AlignedObservation SHM ABI v2."""
 
@@ -164,6 +179,13 @@ class AlignedObservationWriter:
         self._shm = SharedMemory(name=self.shm_name, create=True, size=self.layout.total_size)
         self._shm.buf[:] = b"\0" * self.layout.total_size
         self._write_global(ready=0, latest_sequence=0, fatal=0, status_code=0, message="")
+        self._last_publish_monotonic_ns: int | None = None
+        self._last_slot_publish_monotonic_ns: list[int | None] = [None] * SLOT_COUNT
+        self._timing_diagnostics = WriterTimingDiagnostics(0, None, None)
+
+    @property
+    def timing_diagnostics(self) -> WriterTimingDiagnostics:
+        return self._timing_diagnostics
 
     def _write_global(
         self,
@@ -251,6 +273,24 @@ class AlignedObservationWriter:
         struct.pack_into("<Q", self._shm.buf, 56, sequence)
         if sequence == 1:
             struct.pack_into("<I", self._shm.buf, 12, 1)
+        completed_ns = time.monotonic_ns()
+        slot_index = sequence % SLOT_COUNT
+        publish_interval_ns = (
+            None
+            if self._last_publish_monotonic_ns is None
+            else completed_ns - self._last_publish_monotonic_ns
+        )
+        previous_slot_ns = self._last_slot_publish_monotonic_ns[slot_index]
+        same_slot_rewrite_interval_ns = (
+            None if previous_slot_ns is None else completed_ns - previous_slot_ns
+        )
+        self._last_publish_monotonic_ns = completed_ns
+        self._last_slot_publish_monotonic_ns[slot_index] = completed_ns
+        self._timing_diagnostics = WriterTimingDiagnostics(
+            sequence,
+            publish_interval_ns,
+            same_slot_rewrite_interval_ns,
+        )
 
     @staticmethod
     def _copy_array(
@@ -302,6 +342,11 @@ class AlignedObservationClient:
         except Exception:
             self.close()
             raise
+        self._last_read_diagnostics = SnapshotReadDiagnostics(0, {}, 0, None)
+
+    @property
+    def last_read_diagnostics(self) -> SnapshotReadDiagnostics:
+        return self._last_read_diagnostics
 
     def _validate(self, size: int) -> None:
         if size < GLOBAL_HEADER_SIZE:
@@ -359,21 +404,39 @@ class AlignedObservationClient:
 
     def read(self, timeout_ms: int = 20, max_age_ms: int = 100) -> tuple[dict, SnapshotMetadata]:
         deadline = time.monotonic() + timeout_ms / 1000.0
+        attempts = 0
+        retry_counts: dict[str, int] = {}
+        last_sequence = 0
+        slot_copy_duration_ns: int | None = None
+
+        def retry(reason: str) -> None:
+            retry_counts[reason] = retry_counts.get(reason, 0) + 1
+
         while True:
+            attempts += 1
             fatal = self.fatal_message()
             if fatal:
                 raise RuntimeError(fatal)
             latest = struct.unpack_from("<Q", self._mapping, 56)[0]
+            last_sequence = latest
             if latest:
                 slot_base = GLOBAL_HEADER_SIZE + (latest % SLOT_COUNT) * self.layout.slot_stride
                 seq1 = struct.unpack_from("<Q", self._mapping, slot_base)[0]
                 if seq1 == 2 * latest:
+                    copy_started_ns = time.monotonic_ns()
                     owned = bytearray(
                         self._mapping[slot_base : slot_base + self.layout.slot_stride]
                     )
+                    slot_copy_duration_ns = time.monotonic_ns() - copy_started_ns
                     seq2 = struct.unpack_from("<Q", self._mapping, slot_base)[0]
                     header = self.layout.slot_header.unpack_from(owned, 0)
                     if seq1 == seq2 == header[0] and header[1] == latest:
+                        self._last_read_diagnostics = SnapshotReadDiagnostics(
+                            attempts,
+                            dict(retry_counts),
+                            last_sequence,
+                            slot_copy_duration_ns,
+                        )
                         metadata = SnapshotMetadata(latest, header[2], header[3])
                         age_ns = time.monotonic_ns() - metadata.publish_monotonic_ns
                         if age_ns > max_age_ms * 1_000_000:
@@ -381,8 +444,29 @@ class AlignedObservationClient:
                                 f"AlignedObservation snapshot is stale ({age_ns / 1e6:.1f} ms)"
                             )
                         return self._decode(owned), metadata
+                    if seq1 != seq2:
+                        retry("sequence_changed_during_copy")
+                    else:
+                        retry("slot_header_mismatch")
+                elif seq1 & 1:
+                    retry("slot_writing")
+                else:
+                    retry("slot_sequence_not_latest")
+            else:
+                retry("latest_not_ready")
             if time.monotonic() >= deadline:
-                raise TimeoutError("no coherent AlignedObservation snapshot")
+                self._last_read_diagnostics = SnapshotReadDiagnostics(
+                    attempts,
+                    dict(retry_counts),
+                    last_sequence,
+                    slot_copy_duration_ns,
+                )
+                raise TimeoutError(
+                    "no coherent AlignedObservation snapshot: "
+                    f"last_sequence={last_sequence} attempts={attempts} "
+                    f"retry_counts={retry_counts} "
+                    f"slot_copy_duration_ns={slot_copy_duration_ns}"
+                )
             time.sleep(0.0005)
 
     def _decode(self, slot: bytearray) -> dict:

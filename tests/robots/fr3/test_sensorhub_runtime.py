@@ -10,7 +10,7 @@ import pytest
 
 from lerobot.robots.fr3.sensorhub import runtime as runtime_module
 from lerobot.robots.fr3.sensorhub.aligned_shm import AlignedObservationClient, AlignedObservationWriter
-from lerobot.robots.fr3.sensorhub.cache import SampleCache
+from lerobot.robots.fr3.sensorhub.cache import CausalAligner, SampleCache
 from lerobot.robots.fr3.sensorhub.runtime import SensorHubConfig, SensorHubRuntime
 from lerobot.robots.fr3.sensorhub.samples import (
     CameraSample,
@@ -70,8 +70,10 @@ def test_telemetry_outage_stalls_then_resumes_same_runtime_and_shm(tmp_path):
     client = None
     alignment_thread = Thread(target=runtime._alignment_loop)
     try:
-        alignment_thread.start()
+        _append_round(runtime, 0, robot_sequence=9, gripper_sequence=19)
         _append_round(runtime, 1, robot_sequence=10, gripper_sequence=20)
+        assert runtime.aligner.initialize_cameras() is not None
+        alignment_thread.start()
         assert runtime.first_publish_event.wait(timeout=1)
         client = AlignedObservationClient(shm_name)
         _wait_for_sequence(client, 1)
@@ -274,13 +276,14 @@ def test_run_uses_one_startup_deadline_for_attach_and_ready(monkeypatch, tmp_pat
     runtime._start_reader_thread = lambda *args, **kwargs: None
     runtime._start_telemetry_thread = lambda *args, **kwargs: None
     runtime._start_thread = lambda *args, **kwargs: None
+    runtime._wait_until_camera_bootstrap = lambda deadline: deadlines.append(deadline)
     runtime._wait_until_ready = lambda deadline: deadlines.append(deadline)
     runtime._supervise = lambda: None
     monkeypatch.setattr(runtime_module, "AlignedObservationWriter", FakeWriter)
 
     assert runtime.run() == 0
-    assert len(deadlines) == 2
-    assert deadlines[0] == deadlines[1]
+    assert len(deadlines) == 3
+    assert deadlines[0] == deadlines[1] == deadlines[2]
 
 
 def test_alignment_pending_logs_stop_after_first_publish(caplog):
@@ -346,6 +349,98 @@ def test_ready_timeout_reports_each_source_progress():
     assert "'camera_2': 0" in message
     assert "'robot': 0" in message
     assert "insufficient_sources=['camera_2', 'xense', 'ft', 'robot', 'gripper']" in message
+
+
+def _camera_bootstrap_runtime(camera_caches):
+    runtime = object.__new__(SensorHubRuntime)
+    runtime.camera_caches = camera_caches
+    runtime.xense_cache = SampleCache[XenseSample](0.5)
+    runtime.ft_cache = SampleCache[FTSample](0.5)
+    runtime.robot_cache = SampleCache[RobotSample](0.5)
+    runtime.gripper_cache = SampleCache[GripperSample](0.5)
+    runtime.aligner = CausalAligner(
+        camera_caches,
+        runtime.xense_cache,
+        runtime.ft_cache,
+        runtime.robot_cache,
+        runtime.gripper_cache,
+        camera_bundle_span_warn_ms=20,
+        camera_max_skew_ms=50,
+        camera_bundle_wait_ms=25,
+        required_sample_max_age_ms=100,
+    )
+    runtime.fatal_event = Event()
+    runtime.stop_event = Event()
+    runtime._fatal_message = ""
+    runtime._parent_is_alive = lambda: True
+    runtime._last_logged_camera_commit_count = 0
+    runtime._alignment_pending_reason = None
+    runtime._alignment_pending_log_monotonic = 0.0
+    runtime._log_new_camera_bundle = lambda: None
+    return runtime
+
+
+def test_camera_bootstrap_is_independent_of_non_camera_readiness():
+    camera_caches = tuple(SampleCache[CameraSample](0.5) for _ in range(2))
+    rgb = np.zeros((480, 640, 3), dtype=np.uint8)
+    depth = np.zeros((480, 640, 1), dtype=np.uint16)
+    for index, cache in enumerate(camera_caches):
+        cache.append(CameraSample(1, 100 + index, 1 + index, rgb, depth))
+        cache.append(CameraSample(2, 200 + index, 3 + index, rgb, depth))
+    runtime = _camera_bootstrap_runtime(camera_caches)
+
+    runtime._wait_until_camera_bootstrap(time.monotonic() + 0.1)
+
+    assert runtime.aligner.cameras_initialized
+    assert runtime.aligner.camera_commit_count == 1
+    assert runtime.xense_cache.latest() is None
+
+
+def test_camera_bootstrap_retries_hard_gate_with_same_startup_deadline():
+    camera_caches = tuple(SampleCache[CameraSample](0.5) for _ in range(2))
+    rgb = np.zeros((480, 640, 3), dtype=np.uint8)
+    depth = np.zeros((480, 640, 1), dtype=np.uint16)
+    camera_caches[0].append(CameraSample(1, 0, 1, rgb, depth))
+    camera_caches[0].append(CameraSample(2, 10_000_000, 2, rgb, depth))
+    camera_caches[1].append(CameraSample(1, 70_000_000, 3, rgb, depth))
+    camera_caches[1].append(CameraSample(2, 80_000_000, 4, rgb, depth))
+    runtime = _camera_bootstrap_runtime(camera_caches)
+
+    def append_recovery_samples():
+        time.sleep(0.01)
+        camera_caches[0].append(CameraSample(3, 90_000_000, 5, rgb, depth))
+        camera_caches[1].append(CameraSample(3, 91_000_000, 6, rgb, depth))
+
+    producer = Thread(target=append_recovery_samples)
+    producer.start()
+    runtime._wait_until_camera_bootstrap(time.monotonic() + 0.2)
+    producer.join(timeout=1)
+
+    assert runtime.aligner.cameras_initialized
+    assert [sample.sequence for sample in runtime.aligner.camera_frontiers] == [3, 3]
+
+
+def test_sensorhub_config_validates_camera_bundle_thresholds():
+    values = {
+        "telemetry_endpoint": "inproc://unused",
+        "observation_shm_name": "/observation",
+        "sensorhub_socket_path": "/tmp/sensorhub.sock",
+        "realsense_shm_names": ["/cam1"],
+        "xense_shm_name": "xense",
+        "ft300s_shm_name": "ft",
+    }
+    config = SensorHubConfig.from_dict(values)
+    assert (
+        config.camera_bundle_span_warn_ms,
+        config.camera_max_skew_ms,
+        config.camera_bundle_wait_ms,
+    ) == (20, 50, 25)
+    with pytest.raises(ValueError, match="camera_bundle_wait_ms"):
+        SensorHubConfig.from_dict(dict(values, camera_bundle_wait_ms=0))
+    with pytest.raises(ValueError, match="must be <="):
+        SensorHubConfig.from_dict(
+            dict(values, camera_bundle_span_warn_ms=51, camera_max_skew_ms=50)
+        )
 
 
 def test_robot_resetting_updates_only_runtime_control_state(tmp_path):

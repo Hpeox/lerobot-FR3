@@ -65,7 +65,9 @@ class FR3Config(RobotConfig):
     snapshot_read_timeout_ms: int = 20
     max_snapshot_age_ms: int = 100
     cache_horizon_s: float = 0.5
+    camera_bundle_span_warn_ms: int = 20
     camera_max_skew_ms: int = 50
+    camera_bundle_wait_ms: int = 25
     required_sample_max_age_ms: int = 100
     reset_ack_timeout_s: float = 2.0
     reset_completion_timeout_s: float = 30.0
@@ -94,7 +96,9 @@ class FR3Config(RobotConfig):
             "snapshot_read_timeout_ms": self.snapshot_read_timeout_ms,
             "max_snapshot_age_ms": self.max_snapshot_age_ms,
             "cache_horizon_s": self.cache_horizon_s,
+            "camera_bundle_span_warn_ms": self.camera_bundle_span_warn_ms,
             "camera_max_skew_ms": self.camera_max_skew_ms,
+            "camera_bundle_wait_ms": self.camera_bundle_wait_ms,
             "required_sample_max_age_ms": self.required_sample_max_age_ms,
             "reset_ack_timeout_s": self.reset_ack_timeout_s,
             "reset_completion_timeout_s": self.reset_completion_timeout_s,
@@ -103,6 +107,10 @@ class FR3Config(RobotConfig):
         invalid = [name for name, value in positive.items() if not math.isfinite(value) or value <= 0]
         if invalid:
             raise ValueError(f"FR3 timeout/cache values must be positive: {invalid}")
+        if self.camera_bundle_span_warn_ms > self.camera_max_skew_ms:
+            raise ValueError(
+                "camera_bundle_span_warn_ms must be <= camera_max_skew_ms"
+            )
         vectors = {
             "rollout_home_joint_positions": self.rollout_home_joint_positions,
             "rollout_init_delta_lower": self.rollout_init_delta_lower,
@@ -134,6 +142,8 @@ class FR3Config(RobotConfig):
             "ft300s_shm_name": self.ft300s_shm_name,
             "startup_timeout_s": self.sensorhub_start_timeout_s,
             "cache_horizon_s": self.cache_horizon_s,
+            "camera_bundle_span_warn_ms": self.camera_bundle_span_warn_ms,
             "camera_max_skew_ms": self.camera_max_skew_ms,
+            "camera_bundle_wait_ms": self.camera_bundle_wait_ms,
             "required_sample_max_age_ms": self.required_sample_max_age_ms,
         }

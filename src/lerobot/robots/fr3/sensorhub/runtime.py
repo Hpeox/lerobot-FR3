@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from collections.abc import Callable
@@ -34,7 +35,9 @@ class SensorHubConfig:
     ft300s_shm_name: str
     startup_timeout_s: float = 10.0
     cache_horizon_s: float = 0.5
+    camera_bundle_span_warn_ms: int = 20
     camera_max_skew_ms: int = 50
+    camera_bundle_wait_ms: int = 25
     required_sample_max_age_ms: int = 100
 
     def __post_init__(self) -> None:
@@ -43,6 +46,21 @@ class SensorHubConfig:
             "realsense_shm_names",
             normalize_realsense_shm_names(self.realsense_shm_names),
         )
+        positive = {
+            "startup_timeout_s": self.startup_timeout_s,
+            "cache_horizon_s": self.cache_horizon_s,
+            "camera_bundle_span_warn_ms": self.camera_bundle_span_warn_ms,
+            "camera_max_skew_ms": self.camera_max_skew_ms,
+            "camera_bundle_wait_ms": self.camera_bundle_wait_ms,
+            "required_sample_max_age_ms": self.required_sample_max_age_ms,
+        }
+        invalid = [name for name, value in positive.items() if not math.isfinite(value) or value <= 0]
+        if invalid:
+            raise ValueError(f"SensorHub timeout/cache values must be positive: {invalid}")
+        if self.camera_bundle_span_warn_ms > self.camera_max_skew_ms:
+            raise ValueError(
+                "camera_bundle_span_warn_ms must be <= camera_max_skew_ms"
+            )
 
     @classmethod
     def from_dict(cls, values: dict[str, object]) -> SensorHubConfig:
@@ -67,6 +85,7 @@ class SensorHubRuntime:
         self._attach_pending_log_monotonic = 0.0
         self._alignment_pending_reason: str | None = None
         self._alignment_pending_log_monotonic = 0.0
+        self._last_logged_camera_commit_count = 0
         self._threads: list[Thread] = []
         self._readers: list[object] = []
         self.writer: AlignedObservationWriter | None = None
@@ -85,7 +104,9 @@ class SensorHubRuntime:
             self.ft_cache,
             self.robot_cache,
             self.gripper_cache,
+            camera_bundle_span_warn_ms=config.camera_bundle_span_warn_ms,
             camera_max_skew_ms=config.camera_max_skew_ms,
+            camera_bundle_wait_ms=config.camera_bundle_wait_ms,
             required_sample_max_age_ms=config.required_sample_max_age_ms,
         )
 
@@ -106,6 +127,7 @@ class SensorHubRuntime:
             self._start_reader_thread("XenseReader", xense.read, self.xense_cache.append)
             self._start_reader_thread("FT300SReader", ft.read, self.ft_cache.append)
             self._start_telemetry_thread(telemetry)
+            self._wait_until_camera_bootstrap(startup_deadline)
             self._start_thread("AlignmentPublisher", self._alignment_loop)
 
             self._wait_until_ready(startup_deadline)
@@ -216,6 +238,7 @@ class SensorHubRuntime:
             try:
                 now_ns = time.monotonic_ns()
                 sample = self.aligner.select(time.time_ns(), now_ns)
+                self._log_new_camera_bundle()
                 if sample is None:
                     if not self.first_publish_event.is_set():
                         self._log_alignment_pending()
@@ -228,6 +251,26 @@ class SensorHubRuntime:
                 self._fatal(f"AlignmentPublisher failed: {exc}")
                 return
             time.sleep(0.001)
+
+    def _log_new_camera_bundle(self) -> None:
+        commit_count = getattr(self.aligner, "camera_commit_count", 0)
+        if commit_count == getattr(self, "_last_logged_camera_commit_count", 0):
+            return
+        bundle = getattr(self.aligner, "last_camera_bundle", None)
+        if bundle is None:
+            return
+        logger.debug(
+            "SensorHub camera bundle committed: mode=%s source_span_ms=%.3f "
+            "round_wait_ms=%.3f sequences=%s resynced=%s degraded=%s reused_cameras=%s",
+            bundle.mode,
+            bundle.source_span_ns / 1_000_000,
+            bundle.round_wait_ns / 1_000_000,
+            tuple(sample.sequence for sample in bundle.cameras),
+            bundle.resynced,
+            bundle.degraded,
+            bundle.reused_camera_indices,
+        )
+        self._last_logged_camera_commit_count = commit_count
 
     def _log_alignment_pending(self) -> None:
         """Log the startup alignment rejection on change or once per second."""
@@ -250,6 +293,27 @@ class SensorHubRuntime:
             self.gripper_cache,
         )
         return all(cache.sequence_count() >= 2 for cache in caches)
+
+    def _wait_until_camera_bootstrap(self, deadline: float) -> None:
+        """Acquire and commit camera phase once within the existing startup deadline."""
+        while time.monotonic() < deadline:
+            if self.fatal_event.is_set():
+                raise RuntimeError(self._fatal_message)
+            if not self._parent_is_alive():
+                self.stop_event.set()
+                raise _ParentExited("parent process exited during SensorHub camera bootstrap")
+            if all(cache.sequence_count() >= 2 for cache in self.camera_caches):
+                bundle = self.aligner.initialize_cameras()
+                if bundle is not None:
+                    self._log_new_camera_bundle()
+                    return
+                self._log_alignment_pending()
+            time.sleep(0.005)
+        counts = self._source_sequence_counts()
+        raise TimeoutError(
+            "camera bootstrap did not produce a coherent tuple: "
+            f"reason={self.aligner.last_rejection_reason} sequence_counts={counts}"
+        )
 
     def _wait_until_ready(self, deadline: float | None = None) -> None:
         if deadline is None:
