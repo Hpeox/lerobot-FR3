@@ -15,15 +15,24 @@ lerobot-rollout \
   --inference.type=sync
 ```
 
-`tactigen` is causal and synchronous: the first call uses zero tactile input;
-subsequent calls generate tactile input from the previous four-frame window and
-the first action of the previous plan. Every call replans a `[B, 16, 8]` chunk
-and `select_action()` returns only its first action. Call `reset()` at every
+The v3 policy uses a four-frame tactile history. `none` feeds four zero frames,
+`real` consumes the two `(35,20,3)` Xense fields, and `tactigen` starts with four
+zero frames and then calls the embedded frozen generator once per successfully
+sent action. The generator receives the previous four observations and the
+actual `[B,8]` command; predicted future actions are never used.
+
+Online rollout uses a `[16,8]` diffusion plan at 30 Hz: the first eight actions
+are executed and the remaining eight provide a planning reserve. The sync
+inference engine atomically replaces only unexecuted future actions when a new
+plan is ready, drops expired timestamps, and returns no command (robot hold /
+safe stop) if the reserve is exhausted before replanning finishes; it never
+replays stale actions. RTC is rejected for ACMT-DP. Call `reset()` at every
 episode boundary.
 
-The default wrist cameras are `camera.cam1` and `camera.cam2`. Their RGB and
-depth frames are cropped to the training ROI `(y0, y1, x0, x1) =
-(176, 304, 256, 384)`. In addition to `observation.state`, all modes require
+The default wrist cameras are `camera.cam1` and `camera.cam2`. Raw RGB-D frames
+are expected as `[3,480,640]` and `[1,480,640]`; v3 crops columns `80:560` and
+resizes to 128×128 with antialiased bilinear RGB and nearest-neighbour depth.
+In addition to `observation.state`, all modes require
 `observation.fr3.dq`, `observation.fr3.tau_J`, the FT300 wrench, and gripper
 `gPO`. `real` requires both Xense force fields; `tactigen` requires
 `observation.fr3.O_T_EE` with shape `(4, 4)`.

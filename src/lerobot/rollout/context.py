@@ -197,18 +197,18 @@ def build_rollout_context(
     fails fast without touching the robot.
     """
     is_rtc = isinstance(cfg.inference, RTCInferenceConfig)
+    policy_config = cfg.policy
+
+    if policy_config is not None and policy_config.type == "acmt_dp":
+        if cfg.fps != 30.0:
+            raise ValueError("ACMT-DP v3 rollout requires fps=30")
+        if cfg.interpolation_multiplier != 1:
+            raise ValueError("ACMT-DP v3 rollout requires interpolation_multiplier=1")
+        if is_rtc:
+            raise ValueError("ACMT-DP v3 supports only --inference.type=sync; RTC is unsupported")
 
     # --- 1. Policy (heavy I/O, but no hardware yet) -------------------
     logger.info("Loading policy from '%s'...", cfg.policy.pretrained_path)
-    policy_config = cfg.policy
-    if (
-        is_rtc
-        and policy_config.type == "acmt_dp"
-        and getattr(policy_config, "tactile_source", None) == "tactigen"
-    ):
-        raise NotImplementedError(
-            "ACMT-DP TactiGen tactile inference is causal and only supports --inference.type=sync"
-        )
     policy_class = get_policy_class(policy_config.type)
 
     if hasattr(policy_config, "compile_model"):

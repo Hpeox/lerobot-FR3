@@ -3,13 +3,13 @@
 
 from __future__ import annotations
 
+import json
 from collections import deque
+from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F  # noqa: N812
 from torch import Tensor
 
 from lerobot.utils.constants import OBS_STATE
@@ -28,9 +28,14 @@ from .configuration_acmt_dp import (
     depth_key,
     rgb_key,
 )
-from .modeling_components import DFormerv2DualRGBDEncoder, TinyDualRGBDEncoder
+from .modeling_components import (
+    DFormerv2DualRGBDEncoder,
+    TemporalTactileGridEncoder,
+    TinyDualRGBDEncoder,
+)
 from .modeling_tactile_generator import TactiGenForceFieldModel
 from .modeling_unet import ConditionalUnet1D
+from .visual_preprocess import prepare_for_frozen_encoder
 
 
 class ActionNormalizer(nn.Module):
@@ -78,75 +83,73 @@ class LowdimHistoryEncoder(nn.Module):
         return hidden[-1]
 
 
-class TactileGridEncoder(nn.Module):
-    def __init__(self, mean: tuple[float, ...], std: tuple[float, ...], dim: int = 160) -> None:
-        super().__init__()
-        self.register_buffer("mean", torch.tensor(mean, dtype=torch.float32))
-        self.register_buffer("std", torch.tensor(std, dtype=torch.float32))
-        self.side_embedding = nn.Parameter(torch.zeros(1, 2, dim))
-        nn.init.trunc_normal_(self.side_embedding, std=0.02)
-        self.conv = nn.Sequential(
-            nn.Conv2d(3, 64, 5, padding=2),
-            nn.GroupNorm(8, 64),
-            nn.GELU(),
-            nn.Conv2d(64, dim, 3, padding=1),
-            nn.GroupNorm(8, dim),
-            nn.GELU(),
-        )
-        self.attention = nn.MultiheadAttention(dim, 4, batch_first=True)
-        self.norm = nn.LayerNorm(dim)
-
-    def forward(self, force: Tensor) -> Tensor:
-        batch = force.shape[0]
-        normalized = (force.float() - self.mean) / self.std.clamp_min(1e-6)
-        sides = normalized.permute(0, 1, 4, 2, 3).reshape(-1, 3, 35, 20)
-        pooled = F.adaptive_avg_pool2d(self.conv(sides), 1).flatten(1)
-        tokens = pooled.reshape(batch, 2, -1) + self.side_embedding
-        attended, _ = self.attention(tokens, tokens, tokens, need_weights=False)
-        return self.norm(tokens + attended).mean(1)
-
-
 def matrix_to_pose_xyzw(matrices: Tensor) -> Tensor:
     """Match the legacy ACMT-DP 4x4 -> xyz+xyzw conversion exactly."""
 
-    original_device = matrices.device
-    mats = matrices.detach().cpu().numpy()
-    flat = mats.reshape(-1, 4, 4)
-    quaternions = np.zeros((len(flat), 4), np.float32)
-    for index, matrix in enumerate(flat):
-        rotation = matrix[:3, :3]
-        trace = float(np.trace(rotation))
-        if trace > 0:
-            scale = np.sqrt(trace + 1.0) * 2
-            qw = 0.25 * scale
-            qx = (rotation[2, 1] - rotation[1, 2]) / scale
-            qy = (rotation[0, 2] - rotation[2, 0]) / scale
-            qz = (rotation[1, 0] - rotation[0, 1]) / scale
-        else:
-            axis = int(np.argmax(np.diag(rotation)))
-            if axis == 0:
-                scale = np.sqrt(max(1e-12, 1 + rotation[0, 0] - rotation[1, 1] - rotation[2, 2])) * 2
-                qw = (rotation[2, 1] - rotation[1, 2]) / scale
-                qx = 0.25 * scale
-                qy = (rotation[0, 1] + rotation[1, 0]) / scale
-                qz = (rotation[0, 2] + rotation[2, 0]) / scale
-            elif axis == 1:
-                scale = np.sqrt(max(1e-12, 1 + rotation[1, 1] - rotation[0, 0] - rotation[2, 2])) * 2
-                qw = (rotation[0, 2] - rotation[2, 0]) / scale
-                qx = (rotation[0, 1] + rotation[1, 0]) / scale
-                qy = 0.25 * scale
-                qz = (rotation[1, 2] + rotation[2, 1]) / scale
-            else:
-                scale = np.sqrt(max(1e-12, 1 + rotation[2, 2] - rotation[0, 0] - rotation[1, 1])) * 2
-                qw = (rotation[1, 0] - rotation[0, 1]) / scale
-                qx = (rotation[0, 2] + rotation[2, 0]) / scale
-                qy = (rotation[1, 2] + rotation[2, 1]) / scale
-                qz = 0.25 * scale
-        quaternions[index] = (qx, qy, qz, qw)
-    quaternions /= np.maximum(np.linalg.norm(quaternions, axis=-1, keepdims=True), 1e-6)
-    xyz = flat[:, :3, 3].astype(np.float32)
-    pose = np.concatenate([xyz, quaternions], axis=-1).reshape(*mats.shape[:-2], 7)
-    return torch.from_numpy(pose).to(original_device)
+    return matrix_to_pose_xyzw_fast(matrices)
+
+
+def matrix_to_pose_xyzw_fast(matrices: Tensor) -> Tensor:
+    """Vectorized GPU-friendly 4x4 -> xyz+xyzw conversion."""
+    if matrices.ndim < 3 or tuple(matrices.shape[-2:]) != (4, 4):
+        raise ValueError(f"expected [...,4,4] transforms, got {tuple(matrices.shape)}")
+    flat = matrices.reshape(-1, 4, 4)
+    rotation = flat[:, :3, :3]
+    diagonal = torch.diagonal(rotation, dim1=-2, dim2=-1)
+    trace = diagonal.sum(-1)
+    eps = torch.finfo(flat.dtype).eps if flat.dtype.is_floating_point else 1e-7
+    s = (torch.sqrt((trace + 1.0).clamp_min(eps)) * 2.0).clamp_min(eps)
+    positive = trace > 0
+    q_positive = torch.stack(
+        [
+            (rotation[:, 2, 1] - rotation[:, 1, 2]) / s,
+            (rotation[:, 0, 2] - rotation[:, 2, 0]) / s,
+            (rotation[:, 1, 0] - rotation[:, 0, 1]) / s,
+            0.25 * s,
+        ],
+        dim=-1,
+    )
+    s0 = (
+        torch.sqrt((1.0 + diagonal[:, 0] - diagonal[:, 1] - diagonal[:, 2]).clamp_min(eps)) * 2.0
+    ).clamp_min(eps)
+    q0 = torch.stack(
+        [
+            0.25 * s0,
+            (rotation[:, 0, 1] + rotation[:, 1, 0]) / s0,
+            (rotation[:, 0, 2] + rotation[:, 2, 0]) / s0,
+            (rotation[:, 2, 1] - rotation[:, 1, 2]) / s0,
+        ],
+        dim=-1,
+    )
+    s1 = (
+        torch.sqrt((1.0 + diagonal[:, 1] - diagonal[:, 0] - diagonal[:, 2]).clamp_min(eps)) * 2.0
+    ).clamp_min(eps)
+    q1 = torch.stack(
+        [
+            (rotation[:, 0, 1] + rotation[:, 1, 0]) / s1,
+            0.25 * s1,
+            (rotation[:, 1, 2] + rotation[:, 2, 1]) / s1,
+            (rotation[:, 0, 2] - rotation[:, 2, 0]) / s1,
+        ],
+        dim=-1,
+    )
+    s2 = (
+        torch.sqrt((1.0 + diagonal[:, 2] - diagonal[:, 0] - diagonal[:, 1]).clamp_min(eps)) * 2.0
+    ).clamp_min(eps)
+    q2 = torch.stack(
+        [
+            (rotation[:, 0, 2] + rotation[:, 2, 0]) / s2,
+            (rotation[:, 1, 2] + rotation[:, 2, 1]) / s2,
+            0.25 * s2,
+            (rotation[:, 1, 0] - rotation[:, 0, 1]) / s2,
+        ],
+        dim=-1,
+    )
+    axis = diagonal.argmax(-1)
+    fallback = torch.where(axis[:, None] == 0, q0, torch.where(axis[:, None] == 1, q1, q2))
+    quat = torch.where(positive[:, None], q_positive, fallback)
+    quat = quat / torch.linalg.vector_norm(quat, dim=-1, keepdim=True).clamp_min(eps)
+    return torch.cat([flat[:, :3, 3], quat], dim=-1).reshape(*matrices.shape[:-2], 7)
 
 
 class ACMTDPPolicy(PreTrainedPolicy):
@@ -167,7 +170,11 @@ class ACMTDPPolicy(PreTrainedPolicy):
         self.visual_encoder.eval()
         self.visual_pool = VisualAttentionPool()
         self.lowdim_encoder = LowdimHistoryEncoder(config.lowdim_mean, config.lowdim_std)
-        self.tactile_encoder = TactileGridEncoder(config.force_mean, config.force_std)
+        self.tactile_encoder = TemporalTactileGridEncoder(
+            config.force_mean,
+            config.force_std,
+            history=config.tactile_history,
+        )
         self.action_normalizer = ActionNormalizer(config.action_min, config.action_max)
         self.noise_predictor = ConditionalUnet1D(
             input_dim=8,
@@ -194,6 +201,61 @@ class ACMTDPPolicy(PreTrainedPolicy):
             self.tactile_generator.eval()
         self.reset()
 
+    @classmethod
+    def from_pretrained(cls, pretrained_name_or_path, *args, **kwargs):
+        """Reject local v1/generated artifacts before generic config parsing."""
+        local_path = Path(pretrained_name_or_path)
+        config_path = local_path / "config.json"
+        if config_path.is_file() and kwargs.get("config") is None:
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            if raw.get("tactile_source") == "generated" or raw.get("wrist_roi") is not None:
+                raise ValueError(
+                    "ACMT-DP v1/generated checkpoint rejected; reconvert from a v3 best.pt "
+                    "checkpoint using tactile_source=none|real|tactigen"
+                )
+            if raw.get("checkpoint_schema_version") != 3:
+                raise ValueError(
+                    "ACMT-DP checkpoint schema is not v3; reconvert from a v3 best.pt checkpoint"
+                )
+        manifest_path = local_path / "conversion_manifest.json"
+        requested_config = kwargs.get("config")
+        if manifest_path.is_file() and requested_config is not None:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            checkpoint_mode = manifest.get("tactile_source")
+            requested_mode = getattr(requested_config, "tactile_source", checkpoint_mode)
+            if checkpoint_mode in {"none", "real", "tactigen"} and requested_mode != checkpoint_mode:
+                raise ValueError(
+                    "ACMT-DP checkpoint/runtime tactile mode mismatch: "
+                    f"checkpoint={checkpoint_mode!r}, requested={requested_mode!r}; "
+                    "use the matching none|real|tactigen checkpoint"
+                )
+        return super().from_pretrained(pretrained_name_or_path, *args, **kwargs)
+
+    @classmethod
+    def _load_as_safetensor(
+        cls,
+        model: ACMTDPPolicy,
+        model_file: str,
+        map_location: str,
+        strict: bool,
+    ) -> ACMTDPPolicy:
+        from safetensors import safe_open
+
+        with safe_open(model_file, framework="pt", device="cpu") as archive:
+            keys = set(archive.keys())
+        required = {
+            "tactile_encoder.side_attention.in_proj_weight",
+            "tactile_encoder.temporal.weight_ih_l0",
+            "tactile_encoder.temporal_norm.weight",
+        }
+        missing = sorted(required - keys)
+        if missing:
+            raise ValueError(
+                "ACMT-DP v1 checkpoint rejected: missing v3 temporal tactile weights "
+                f"{missing}; reconvert from a v3 best.pt checkpoint"
+            )
+        return super()._load_as_safetensor(model, model_file, map_location, strict)
+
     def train(self, mode: bool = True) -> ACMTDPPolicy:
         super().train(mode)
         self.visual_encoder.eval()
@@ -209,14 +271,18 @@ class ACMTDPPolicy(PreTrainedPolicy):
         raise NotImplementedError("Migrated ACMT-DP checkpoints are inference-only")
 
     def reset(self) -> None:
+        if self.tactile_generator is not None and hasattr(self.tactile_generator, "reset"):
+            self.tactile_generator.reset()
         self._history: dict[str, deque[Tensor]] = {
             "rgb": deque(maxlen=4),
             "depth": deque(maxlen=4),
             "lowdim": deque(maxlen=4),
             "pose": deque(maxlen=4),
         }
-        self._previous_window: dict[str, Tensor] | None = None
+        self._tactile_history: deque[Tensor] = deque(maxlen=4)
+        self._latest_window: dict[str, Tensor] | None = None
         self._previous_action_chunk: Tensor | None = None
+        self._observed_batch_size: int | None = None
 
     @staticmethod
     def _require_shape(key: str, value: Tensor, tail: tuple[int, ...]) -> Tensor:
@@ -260,10 +326,12 @@ class ACMTDPPolicy(PreTrainedPolicy):
 
         rgbs, depths = [], []
         for camera in self.config.wrist_camera_keys:
-            rgbs.append(self._require_shape(rgb_key(camera), batch[rgb_key(camera)], (3, 128, 128)).float())
-            depths.append(
-                self._require_shape(depth_key(camera), batch[depth_key(camera)], (1, 128, 128)).float()
-            )
+            rgb, depth = prepare_for_frozen_encoder(batch[rgb_key(camera)], batch[depth_key(camera)])
+            rgb = self._require_shape(rgb_key(camera), rgb, (3, 128, 128)).float()
+            if rgb.numel() and rgb.detach().max() > 2.0:
+                rgb = rgb / 255.0
+            rgbs.append(rgb)
+            depths.append(self._require_shape(depth_key(camera), depth, (1, 128, 128)))
         current: dict[str, Tensor] = {
             "rgb": torch.stack(rgbs, dim=1),
             "depth": torch.stack(depths, dim=1),
@@ -279,6 +347,10 @@ class ACMTDPPolicy(PreTrainedPolicy):
         return current
 
     def _append_history(self, current: dict[str, Tensor]) -> dict[str, Tensor]:
+        batch_size = current["lowdim"].shape[0]
+        if self._observed_batch_size is not None and self._observed_batch_size != batch_size:
+            raise ValueError("ACMT-DP stateful online inference requires a fixed batch size")
+        self._observed_batch_size = batch_size
         for key in ("rgb", "depth", "lowdim"):
             if not self._history[key]:
                 self._history[key].extend(current[key] for _ in range(4))
@@ -290,44 +362,98 @@ class ACMTDPPolicy(PreTrainedPolicy):
                 self._history["pose"].extend(pose for _ in range(4))
             else:
                 self._history["pose"].append(pose)
-        return {key: torch.stack(list(values), dim=1) for key, values in self._history.items() if values}
+        if self.config.tactile_source == "real":
+            tactile = current["tactile"]
+            if not self._tactile_history:
+                self._tactile_history.extend(tactile for _ in range(4))
+            else:
+                self._tactile_history.append(tactile)
+        elif not self._tactile_history:
+            self._tactile_history.extend(
+                torch.zeros(batch_size, 2, 35, 20, 3, device=current["lowdim"].device) for _ in range(4)
+            )
+        return self._window()
+
+    def _window(self) -> dict[str, Tensor]:
+        if not self._history["lowdim"] or not self._tactile_history:
+            raise RuntimeError("ACMT-DP observation history is empty")
+        window = {key: torch.stack(list(values), dim=1) for key, values in self._history.items() if values}
+        window["tactile"] = torch.stack(list(self._tactile_history), dim=1)
+        return window
 
     @torch.no_grad()
-    def _generate_tactile(self, previous: dict[str, Tensor], action_chunk: Tensor) -> Tensor:
+    def observe(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Append one control-cycle observation without running diffusion."""
+        current = self._extract_current(dict(batch))
+        self._latest_window = self._append_history(current)
+        return self._latest_window
+
+    @torch.no_grad()
+    def _generate_tactile(self, previous: dict[str, Tensor], executed_action: Tensor) -> Tensor:
         if self.tactile_generator is None:
             raise RuntimeError("tactigen mode has no embedded TactiGen generator")
-        first = action_chunk[:, :1]
-        generator_batch = {
-            "realsense.cam1_color": previous["rgb"][:, :, 0],
-            "realsense.cam1_depth": previous["depth"][:, :, 0],
-            "realsense.cam2_color": previous["rgb"][:, :, 1],
-            "realsense.cam2_depth": previous["depth"][:, :, 1],
-            "robot.q": previous["lowdim"][..., :7],
-            "robot.O_T_EE": matrix_to_pose_xyzw(previous["pose"]),
-            "ft300.wrench": previous["lowdim"][..., 21:27],
-            "gripper.gripper_gPO": previous["lowdim"][..., 27:28],
-            "gello.future_q": first[..., :7],
-            "gello.future_gripper_width": first[..., 7:8],
-        }
-        outputs = self.tactile_generator.inference(generator_batch)
-        return torch.cat([outputs["force_xy"], outputs["force_z"]], dim=-1)[:, 0]
+        if executed_action.ndim == 1:
+            executed_action = executed_action.unsqueeze(0)
+        if tuple(executed_action.shape[1:]) != (8,):
+            raise ValueError(f"executed_action must have shape [B,8], got {tuple(executed_action.shape)}")
+        if hasattr(self.tactile_generator, "predict_next"):
+            generated = self.tactile_generator.predict_next(
+                {"rgb": previous["rgb"], "depth": previous["depth"], "lowdim": previous["lowdim"]},
+                previous["pose"],
+                executed_action,
+            )
+        else:
+            generator_batch = {
+                "realsense.cam1_color": previous["rgb"][:, :, 0],
+                "realsense.cam1_depth": previous["depth"][:, :, 0],
+                "realsense.cam2_color": previous["rgb"][:, :, 1],
+                "realsense.cam2_depth": previous["depth"][:, :, 1],
+                "robot.q": previous["lowdim"][..., :7],
+                "robot.O_T_EE": matrix_to_pose_xyzw_fast(previous["pose"]),
+                "ft300.wrench": previous["lowdim"][..., 21:27],
+                "gripper.gripper_gPO": previous["lowdim"][..., 27:28],
+                "gello.future_q": executed_action[:, None, :7],
+                "gello.future_gripper_width": executed_action[:, None, 7:8],
+            }
+            outputs = self.tactile_generator.inference(generator_batch)
+            generated = torch.cat([outputs["force_xy"], outputs["force_z"]], dim=-1)[:, 0]
+        expected = (executed_action.shape[0], 2, 35, 20, 3)
+        if tuple(generated.shape) != expected:
+            raise ValueError(f"TactiGen must return {expected}, got {tuple(generated.shape)}")
+        return generated
+
+    @torch.no_grad()
+    def notify_action_executed(self, action: Tensor, observation: dict[str, Tensor] | None = None) -> None:
+        """Feed the successfully sent action into the TactiGen causal chain."""
+        if self.config.tactile_source != "tactigen":
+            return
+        previous_window = (
+            observation if isinstance(observation, dict) and "rgb" in observation else self._latest_window
+        )
+        if previous_window is None:
+            raise RuntimeError("notify_action_executed called before an observation was planned")
+        generated = self._generate_tactile(previous_window, action)
+        self._tactile_history.append(generated)
+        self._previous_action_chunk = action.detach().clone()
+        self._latest_window = self._window()
 
     def encode_observation(self, observation: dict[str, Tensor]) -> Tensor:
+        depth1 = observation["depth"][:, :, 0].to(dtype=torch.int32)
+        depth2 = observation["depth"][:, :, 1].to(dtype=torch.int32)
         with torch.no_grad():
             memory, mask = self.visual_encoder(
                 observation["rgb"][:, :, 0],
-                observation["depth"][:, :, 0],
+                depth1,
                 observation["rgb"][:, :, 1],
-                observation["depth"][:, :, 1],
+                depth2,
                 ablation="dual",
             )
         visual = self.visual_pool(memory, mask)
         lowdim = self.lowdim_encoder(observation["lowdim"])
+        tactile_input = observation["tactile"]
         if self.config.tactile_source == "none":
-            tactile = torch.zeros(lowdim.shape[0], 160, device=lowdim.device, dtype=lowdim.dtype)
-            tactile = tactile + sum(parameter.sum() * 0.0 for parameter in self.tactile_encoder.parameters())
-        else:
-            tactile = self.tactile_encoder(observation["tactile"])
+            tactile_input = torch.zeros_like(tactile_input)
+        tactile = self.tactile_encoder(tactile_input)
         return torch.cat([visual, lowdim, tactile], dim=-1)
 
     @torch.no_grad()
@@ -345,30 +471,10 @@ class ACMTDPPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
-        current = self._extract_current(dict(batch))
-        window = self._append_history(current)
-        if self.config.tactile_source == "none":
-            window["tactile"] = torch.zeros(
-                window["lowdim"].shape[0], 2, 35, 20, 3, device=window["lowdim"].device
-            )
-        elif self.config.tactile_source == "real":
-            window["tactile"] = current["tactile"]
-        elif self.config.tactile_source == "tactigen" and (
-            self._previous_window is None or self._previous_action_chunk is None
-        ):
-            window["tactile"] = torch.zeros(
-                window["lowdim"].shape[0], 2, 35, 20, 3, device=window["lowdim"].device
-            )
-        elif self.config.tactile_source == "tactigen":
-            window["tactile"] = self._generate_tactile(self._previous_window, self._previous_action_chunk)
-        else:
-            raise RuntimeError(f"Unsupported tactile_source={self.config.tactile_source!r}")
+        window = self.observe(batch)
         action = self._plan(window, noise=noise)
-        if self.config.tactile_source == "tactigen":
-            self._previous_window = {
-                key: value.detach().clone() for key, value in window.items() if key != "tactile"
-            }
-            self._previous_action_chunk = action.detach().clone()
+        self._previous_action_chunk = action.detach().clone()
+        self._latest_window = {key: value.detach().clone() for key, value in window.items()}
         return action
 
     @torch.no_grad()
@@ -380,5 +486,6 @@ class ACMTDPPolicy(PreTrainedPolicy):
 
         return {
             "history_length": len(self._history["lowdim"]),
+            "tactile_history_length": len(self._tactile_history),
             "has_previous_plan": self._previous_action_chunk is not None,
         }

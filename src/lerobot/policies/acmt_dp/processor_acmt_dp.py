@@ -22,43 +22,63 @@ from lerobot.processor.pipeline import ObservationProcessorStep, ProcessorStepRe
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 from .configuration_acmt_dp import ACMTDPConfig, depth_key, rgb_key
+from .visual_preprocess import prepare_for_frozen_encoder
 
 
 @dataclass
-@ProcessorStepRegistry.register(name="acmt_dp_wrist_roi_processor")
-class ACMTDPWristROIProcessorStep(ObservationProcessorStep):
+@ProcessorStepRegistry.register(name="acmt_dp_center480_processor")
+class ACMTDPCenter480ProcessorStep(ObservationProcessorStep):
     camera_keys: tuple[str, str]
-    roi: tuple[int, int, int, int]
-
-    @staticmethod
-    def _channels_first(key: str, value: torch.Tensor, channels: int) -> torch.Tensor:
-        if value.ndim != 4:
-            raise ValueError(f"{key} must be BCHW or BHWC, got {tuple(value.shape)}")
-        if value.shape[1] == channels:
-            return value
-        if value.shape[-1] == channels:
-            return value.permute(0, 3, 1, 2).contiguous()
-        raise ValueError(f"{key} has no {channels}-channel axis: {tuple(value.shape)}")
+    visual_preprocess: str = "center480"
 
     def _prepare_image(self, key: str, value: Any, channels: int, rgb: bool) -> torch.Tensor:
         tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
-        tensor = self._channels_first(key, tensor, channels)
-        if tensor.shape[-2:] == (128, 128):
-            cropped = tensor
+        if self.visual_preprocess != "center480":
+            raise ValueError("ACMT-DP v3 requires visual_preprocess='center480'")
+        if tensor.ndim == 3:
+            if tensor.shape[0] == channels or tensor.shape[-1] == channels:
+                tensor = tensor.unsqueeze(0)
+            else:
+                raise ValueError(f"{key} has no {channels}-channel axis: {tuple(tensor.shape)}")
+        if tensor.ndim != 4:
+            raise ValueError(f"{key} must be BCHW or BHWC, got {tuple(tensor.shape)}")
+        if tensor.shape[1] != channels and tensor.shape[-1] != channels:
+            raise ValueError(f"{key} has no {channels}-channel axis: {tuple(tensor.shape)}")
+        channels_first = tensor if tensor.shape[1] == channels else tensor.permute(0, 3, 1, 2).contiguous()
+        if tuple(channels_first.shape[-2:]) == (128, 128):
+            processed = channels_first
         else:
-            y0, y1, x0, x1 = self.roi
-            if tensor.shape[-2] < y1 or tensor.shape[-1] < x1:
-                raise ValueError(f"{key} is too small for ROI {self.roi}: {tuple(tensor.shape)}")
-            cropped = tensor[..., y0:y1, x0:x1]
-        if cropped.shape[-2:] != (128, 128):
-            raise ValueError(f"{key} ROI must be 128x128, got {tuple(cropped.shape[-2:])}")
+            # Keep RGB-D processing paired so both streams receive the exact
+            # same crop. The depth result is selected below for this key.
+            dummy = torch.zeros(
+                channels_first.shape[0],
+                1,
+                channels_first.shape[-2],
+                channels_first.shape[-1],
+                dtype=channels_first.dtype,
+                device=channels_first.device,
+            )
+            if rgb:
+                processed, _ = prepare_for_frozen_encoder(channels_first, dummy)
+            else:
+                dummy_rgb = torch.zeros(
+                    channels_first.shape[0],
+                    3,
+                    channels_first.shape[-2],
+                    channels_first.shape[-1],
+                    dtype=channels_first.dtype,
+                    device=channels_first.device,
+                )
+                _, processed = prepare_for_frozen_encoder(dummy_rgb, channels_first)
         if rgb:
-            cropped = cropped.float()
-            if cropped.numel() and cropped.detach().max() > 2.0:
-                cropped = cropped / 255.0
+            processed = processed.float()
+            if processed.numel() and processed.detach().max() > 2.0:
+                processed = processed / 255.0
         else:
-            cropped = cropped.float()
-        return cropped.contiguous()
+            # Preserve millimetre values and integer sensor dtype until the
+            # model/DFormer boundary; never normalize depth in the processor.
+            processed = processed.contiguous()
+        return processed.contiguous()
 
     def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
         result = dict(observation)
@@ -74,7 +94,7 @@ class ACMTDPWristROIProcessorStep(ObservationProcessorStep):
     def get_config(self) -> dict[str, Any]:
         return {
             "camera_keys": list(self.camera_keys),
-            "roi": list(self.roi),
+            "visual_preprocess": self.visual_preprocess,
         }
 
     def transform_features(
@@ -88,6 +108,12 @@ class ACMTDPWristROIProcessorStep(ObservationProcessorStep):
         return transformed
 
 
+# Import compatibility for callers that only need to discover the processor
+# class. Passing the old ``roi`` argument is intentionally unsupported by the
+# v3 constructor/configuration validation.
+ACMTDPWristROIProcessorStep = ACMTDPCenter480ProcessorStep
+
+
 def make_acmt_dp_pre_post_processors(
     config: ACMTDPConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
@@ -97,9 +123,9 @@ def make_acmt_dp_pre_post_processors(
         steps=[
             RenameObservationsProcessorStep(rename_map={}),
             AddBatchDimensionProcessorStep(),
-            ACMTDPWristROIProcessorStep(
+            ACMTDPCenter480ProcessorStep(
                 camera_keys=config.wrist_camera_keys,
-                roi=config.wrist_roi,
+                visual_preprocess=config.visual_preprocess,
             ),
             DeviceProcessorStep(device=config.device),
         ],

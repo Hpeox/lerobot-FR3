@@ -31,8 +31,8 @@ from lerobot.policies.acmt_dp.processor_acmt_dp import make_acmt_dp_pre_post_pro
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 DEFAULT_POLICY_CHECKPOINTS = {
-    "peg": Path("/data2/TactiGen/ACMT-DP-peg-runs/outputs"),
-    "gear": Path("/data2/TactiGen/ACMT-DP-gear-runs/outputs"),
+    "peg": Path("/data2/TactiGen/ACMT-DP-peg-runs"),
+    "gear": Path("/cym/TactiGen/ACMT-DP/outputs/gear_big2small"),
 }
 DEFAULT_GENERATOR_CHECKPOINTS = {
     "peg": Path("/cym/TactiGen/ACMTv4/checkpoints/action_cmt_drifting_fz_xy_v2_seed42_e20/best.pt"),
@@ -42,6 +42,7 @@ DEFAULT_GENERATOR_CHECKPOINTS = {
 }
 MODES = ("none", "real", "tactigen")
 TASKS = ("peg", "gear")
+V3_RUN_NAME = "v3_center480_cached_visual"
 
 
 def _sha256(path: Path) -> str:
@@ -77,6 +78,19 @@ def _ema_policy_state(checkpoint: Mapping[str, Any]) -> tuple[dict[str, Tensor],
         if not isinstance(value, Tensor) or not torch.is_floating_point(value):
             raise TypeError(f"EMA shadow {name!r} is not a floating-point tensor")
         state[name] = value
+    required_temporal = {
+        "tactile_encoder.side_attention.in_proj_weight",
+        "tactile_encoder.temporal.weight_ih_l0",
+        "tactile_encoder.temporal_norm.weight",
+    }
+    missing_temporal = sorted(required_temporal - set(state))
+    if missing_temporal:
+        raise ValueError(
+            "This is an ACMT-DP v1 checkpoint without the v3 temporal tactile encoder; "
+            f"retrain/reconvert from v3 best.pt (missing {missing_temporal})"
+        )
+    if any(name.startswith("tactile_encoder.attention.") for name in state):
+        raise ValueError("Legacy single-frame ACMT-DP checkpoint rejected; use v3 best.pt")
     return state, float(ema["decay"])
 
 
@@ -123,6 +137,14 @@ def _make_config(
         raise ValueError("Legacy checkpoint pred_horizon is not 16")
     if int(legacy_config.get("action_dim", -1)) != 8:
         raise ValueError("Legacy checkpoint action_dim is not 8")
+    if int(legacy_config.get("tactile_history", -1)) != 4:
+        raise ValueError("ACMT-DP checkpoint tactile_history must be 4; use a v3 checkpoint")
+    if legacy_config.get("visual_preprocess") != "center480":
+        raise ValueError("ACMT-DP checkpoint visual_preprocess must be center480; use a v3 checkpoint")
+    if int(legacy_config.get("action_execution_horizon", -1)) != 8:
+        raise ValueError("ACMT-DP checkpoint action_execution_horizon must be 8")
+    if float(legacy_config.get("control_hz", -1)) != 30.0:
+        raise ValueError("ACMT-DP checkpoint control_hz must be 30")
     return ACMTDPConfig(
         tactile_source=mode,
         checkpoint_tactile_source=expected_source_mode,
@@ -131,6 +153,11 @@ def _make_config(
         diffusion_train_steps=int(legacy_config["diffusion_train_steps"]),
         diffusion_inference_steps=int(legacy_config["diffusion_inference_steps"]),
         unet_dims=tuple(legacy_config["unet_dims"]),
+        tactile_history=4,
+        action_execution_horizon=8,
+        control_hz=30.0,
+        visual_preprocess="center480",
+        checkpoint_schema_version=3,
         visual_encoder_name="dformerv2",
         generator_model_config=generator_config,
         lowdim_mean=tuple(statistics["lowdim_mean"]),
@@ -206,24 +233,39 @@ def convert_one(
     backup: Path | None = None
     try:
         policy.save_pretrained(temporary, state_dict=target_state)
+        # PreTrainedConfig.from_pretrained discovers the registered subclass
+        # through this discriminator. draccus does not serialize @property
+        # ``type`` by itself.
+        config_path = temporary / "config.json"
+        serialized_config = json.loads(config_path.read_text(encoding="utf-8"))
+        serialized_config["type"] = "acmt_dp"
+        config_path.write_text(json.dumps(serialized_config, indent=4) + "\n", encoding="utf-8")
         preprocessor, postprocessor = make_acmt_dp_pre_post_processors(config)
         preprocessor.save_pretrained(temporary, config_filename=f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json")
         postprocessor.save_pretrained(temporary, config_filename=f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json")
         manifest = {
-            "schema_version": 2,
+            "schema_version": 3,
+            "checkpoint_schema": "v3_temporal_center480",
             "policy_type": "acmt_dp",
             "task_variant": task,
             "tactile_source": mode,
             "policy_checkpoint_tactile_source": "real" if mode == "tactigen" else mode,
             "protocol": "single_frozen_inference" if mode == "tactigen" else "direct_policy",
+            "online_protocol": "16_predict_8_execute_at_30hz",
+            "tactile_history": 4,
+            "visual_preprocess": "center480",
+            "action_execution_horizon": 8,
+            "control_hz": 30.0,
             "seed": 42,
-            "source_checkpoint": str(source_checkpoint),
+            # Keep provenance portable: the runtime artifact never needs the
+            # machine-specific legacy source path (which may contain /cym).
+            "source_checkpoint": source_checkpoint.name,
             "source_policy_tactile_source": source.get("config", {}).get("tactile_source"),
             "source_checkpoint_sha256": _sha256(source_checkpoint),
             "source_global_step": int(source.get("global_step", -1)),
             "source_best_val_loss": float(source.get("best_val_loss", float("nan"))),
             "ema": {"selected": True, "decay": ema_decay, "base": "model_state_dict"},
-            "generator_checkpoint": str(generator_checkpoint) if generator_checkpoint else None,
+            "generator_checkpoint": generator_checkpoint.name if generator_checkpoint else None,
             "generator_checkpoint_sha256": (
                 _sha256(generator_checkpoint) if generator_checkpoint is not None else None
             ),
@@ -282,7 +324,7 @@ def main() -> None:
         generator_checkpoint = args.generator_checkpoint or DEFAULT_GENERATOR_CHECKPOINTS[task]
         for mode in modes:
             source_mode = "real" if mode == "tactigen" else mode
-            source = policy_root / source_mode / "seed42" / "best.pt"
+            source = policy_root / source_mode / V3_RUN_NAME / "seed42" / "best.pt"
             output = args.output_root / task / mode / "seed42" / "pretrained_model"
             print(f"Converting {task}/{mode}: {source} -> {output}", flush=True)
             converted = convert_one(

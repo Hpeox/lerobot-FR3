@@ -394,12 +394,63 @@ class SpatialConvBlock(nn.Module):
         return self.norm2(value + self.ffn(value))
 
 
+class TemporalTactileGridEncoder(nn.Module):
+    """Encode an ordered four-frame, two-sided tactile history to 160-D."""
+
+    def __init__(
+        self,
+        mean: tuple[float, ...],
+        std: tuple[float, ...],
+        history: int = 4,
+        dim: int = 160,
+    ) -> None:
+        super().__init__()
+        if history != 4:
+            raise ValueError("ACMT-DP temporal tactile history is fixed at 4")
+        self.history = int(history)
+        self.register_buffer("mean", torch.tensor(mean, dtype=torch.float32))
+        self.register_buffer("std", torch.tensor(std, dtype=torch.float32))
+        self.side_embedding = nn.Parameter(torch.zeros(1, 2, dim))
+        nn.init.trunc_normal_(self.side_embedding, std=0.02)
+        self.conv = nn.Sequential(
+            nn.Conv2d(3, 64, 5, padding=2),
+            nn.GroupNorm(8, 64),
+            nn.GELU(),
+            nn.Conv2d(64, dim, 3, padding=1),
+            nn.GroupNorm(8, dim),
+            nn.GELU(),
+        )
+        # Names intentionally match the v3 training checkpoint.
+        self.side_attention = nn.MultiheadAttention(dim, 4, batch_first=True)
+        self.side_norm = nn.LayerNorm(dim)
+        self.temporal = nn.GRU(dim, dim, batch_first=True)
+        self.temporal_norm = nn.LayerNorm(dim)
+
+    def forward(self, force: torch.Tensor) -> torch.Tensor:
+        expected = (self.history, 2, 35, 20, 3)
+        if force.ndim != 6 or tuple(force.shape[1:]) != expected:
+            raise ValueError(
+                "Temporal tactile input must be [B,history,2,35,20,3], "
+                f"got {tuple(force.shape)}; expected [B,{self.history},2,35,20,3]"
+            )
+        batch = force.shape[0]
+        normalized = (force.float() - self.mean) / self.std.clamp_min(1e-6)
+        sides = normalized.permute(0, 1, 2, 5, 3, 4).reshape(batch * self.history * 2, 3, 35, 20)
+        pooled = F.adaptive_avg_pool2d(self.conv(sides), 1).flatten(1)
+        tokens = pooled.reshape(batch * self.history, 2, -1) + self.side_embedding
+        attended, _ = self.side_attention(tokens, tokens, tokens, need_weights=False)
+        frame_tokens = self.side_norm(tokens + attended).mean(1)
+        sequence, _ = self.temporal(frame_tokens.reshape(batch, self.history, -1))
+        return self.temporal_norm(sequence[:, -1])
+
+
 __all__ = [
     "DFormerv2DualRGBDEncoder",
     "HistoryEncoder",
     "ModalityDropout",
     "QueryFiLM",
     "SpatialConvBlock",
+    "TemporalTactileGridEncoder",
     "TensorBatch",
     "TinyDualRGBDEncoder",
     "coordinate_grid",
