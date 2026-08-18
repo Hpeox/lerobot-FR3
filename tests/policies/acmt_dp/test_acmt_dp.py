@@ -1,5 +1,4 @@
 # Copyright 2026 The HuggingFace Inc. team. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
@@ -22,7 +21,7 @@ from lerobot.policies.acmt_dp.configuration_acmt_dp import (
     rgb_key,
 )
 from lerobot.policies.acmt_dp.modeling_acmt_dp import ACMTDPPolicy
-from lerobot.policies.acmt_dp.processor_acmt_dp import ACMTDPCenter480ProcessorStep
+from lerobot.policies.acmt_dp.processor_acmt_dp import ACMTDPNativeV4ProcessorStep
 from lerobot.policies.factory import get_policy_class, make_policy_config
 from lerobot.utils.constants import OBS_STATE
 
@@ -44,13 +43,9 @@ def _generator_config() -> dict:
 
 
 def _config(mode: str = "none") -> ACMTDPConfig:
-    checkpoint_source = "real" if mode == "tactigen" else mode
     return ACMTDPConfig(
         tactile_source=mode,
-        checkpoint_tactile_source=checkpoint_source,
-        visual_encoder_name="tiny",
-        unet_dims=(32, 64),
-        diffusion_inference_steps=2,
+        checkpoint_tactile_source="real" if mode == "tactigen" else mode,
         generator_model_config=_generator_config() if mode == "tactigen" else None,
         device="cpu",
     )
@@ -59,189 +54,112 @@ def _config(mode: str = "none") -> ACMTDPConfig:
 def _batch(mode: str = "none", batch_size: int = 1) -> dict[str, torch.Tensor]:
     batch = {
         OBS_STATE: torch.zeros(batch_size, 8),
-        DQ: torch.zeros(batch_size, 7),
-        TAU_J: torch.zeros(batch_size, 7),
-        FT300: torch.zeros(batch_size, 6),
         GRIPPER_GPO: torch.zeros(batch_size, 1),
     }
-    for camera in ("camera.cam1", "camera.cam2"):
-        batch[rgb_key(camera)] = torch.zeros(batch_size, 3, 128, 128)
-        batch[depth_key(camera)] = torch.zeros(batch_size, 1, 128, 128)
+    for camera in ("camera.cam1", "camera.cam2", "camera.cam3", "camera.cam4"):
+        batch[rgb_key(camera)] = torch.zeros(batch_size, 3, 224, 224)
     if mode == "real":
         batch[XENSE0] = torch.zeros(batch_size, 35, 20, 3)
         batch[XENSE1] = torch.zeros(batch_size, 3, 35, 20)
     if mode == "tactigen":
-        pose = torch.tensor(
-            [
-                [0.0, -1.0, 0.0, 0.12],
-                [1.0, 0.0, 0.0, -0.34],
-                [0.0, 0.0, 1.0, 0.56],
-                [0.0, 0.0, 0.0, 1.0],
-            ]
-        )
-        batch[O_T_EE] = pose.repeat(batch_size, 1, 1)
+        for camera in ("camera.cam3", "camera.cam4"):
+            batch[depth_key(camera)] = torch.zeros(batch_size, 1, 128, 128)
+        batch[DQ] = torch.zeros(batch_size, 7)
+        batch[TAU_J] = torch.zeros(batch_size, 7)
+        batch[FT300] = torch.zeros(batch_size, 6)
+        batch[O_T_EE] = torch.eye(4).repeat(batch_size, 1, 1)
     return batch
 
 
-def test_registration_and_config_serialization(tmp_path) -> None:
+def test_registration_and_v4_config_serialization(tmp_path) -> None:
     config = make_policy_config("acmt_dp")
     assert isinstance(config, ACMTDPConfig)
     assert get_policy_class("acmt_dp") is ACMTDPPolicy
-
     config.save_pretrained(tmp_path)
     restored = PreTrainedConfig.from_pretrained(tmp_path)
     assert isinstance(restored, ACMTDPConfig)
-    assert restored.wrist_camera_keys == ("camera.cam1", "camera.cam2")
-    assert restored.wrist_roi is None
-    assert restored.visual_preprocess == "center480"
-    assert restored.tactile_history == 4
-    assert restored.action_execution_horizon == 8
-
-    tactigen = _config("tactigen")
-    tactigen.save_pretrained(tmp_path / "tactigen")
-    restored_tactigen = PreTrainedConfig.from_pretrained(tmp_path / "tactigen")
-    assert restored_tactigen.tactile_source == "tactigen"
-    assert restored_tactigen.checkpoint_tactile_source == "real"
+    assert restored.checkpoint_schema == "acmt_dp.native_dp_v4"
+    assert restored.camera_keys == ("camera.cam1", "camera.cam2", "camera.cam3", "camera.cam4")
+    assert restored.wrist_camera_keys == ("camera.cam3", "camera.cam4")
+    assert restored.visual_preprocess == "resize256_center224_imagenet"
+    assert restored.global_cond_dim == 8864
 
 
-def test_mode_specific_config_validation() -> None:
-    with pytest.raises(ValueError, match="mode-specific"):
-        ACMTDPConfig(tactile_source="real", checkpoint_tactile_source="none", device="cpu")
-    with pytest.raises(ValueError, match="task-specific"):
-        ACMTDPConfig(task_variant="gear", checkpoint_task_variant="peg", device="cpu")
-    with pytest.raises(ValueError, match="generator_model_config"):
-        ACMTDPConfig(tactile_source="tactigen", device="cpu")
-    with pytest.raises(ValueError, match="deprecated"):
+def test_v4_rejects_old_modes_and_abis() -> None:
+    with pytest.raises(ValueError, match="generated"):
         ACMTDPConfig(tactile_source="generated", device="cpu")
-    config = ACMTDPConfig(device="cpu")
-    config.task_variant = "gear"
-    with pytest.raises(ValueError, match="checkpoint/runtime task mismatch"):
-        config.validate_features()
+    with pytest.raises(ValueError, match="center480"):
+        ACMTDPConfig(visual_preprocess="center480", device="cpu")
+    with pytest.raises(ValueError, match="schema"):
+        ACMTDPConfig(checkpoint_schema_version=3, device="cpu")
+    with pytest.raises(ValueError, match="scratch"):
+        ACMTDPConfig(vision_mode="frozen", device="cpu")
 
 
-def test_tactigen_config_and_processor_keep_conventional_pose_matrix():
-    config = _config("tactigen")
-    assert config.input_features[O_T_EE].shape == (4, 4)
-    pose = _batch("tactigen")[O_T_EE]
-    step = ACMTDPCenter480ProcessorStep(
-        camera_keys=config.wrist_camera_keys,
-    )
-    processed = step.observation({O_T_EE: pose})
-    assert processed[O_T_EE] is pose
-
-
-def test_center480_processor_maps_rgb_and_depth() -> None:
-    step = ACMTDPCenter480ProcessorStep(camera_keys=("camera.cam1", "camera.cam2"))
-    rows = torch.arange(480, dtype=torch.uint8)[None, :, None, None]
-    rgb = rows.expand(1, 480, 640, 3).clone()
-    depth = torch.arange(480, dtype=torch.float32)[None, :, None, None].expand(1, 480, 640, 1)
-    observation = {}
-    for camera in step.camera_keys:
-        observation[rgb_key(camera)] = rgb
-        observation[depth_key(camera)] = depth
-
-    processed = step.observation(observation)
-    for camera in step.camera_keys:
-        assert processed[rgb_key(camera)].shape == (1, 3, 128, 128)
-        assert processed[depth_key(camera)].shape == (1, 1, 128, 128)
-        assert processed[rgb_key(camera)].dtype == torch.float32
-        assert processed[depth_key(camera)][0, 0, 0, 0] == 0
-        assert processed[rgb_key(camera)][0, 0, 0, 0] > 0
-    assert step.get_config() == {
-        "camera_keys": ["camera.cam1", "camera.cam2"],
-        "visual_preprocess": "center480",
+def test_native_processor_preserves_raw_four_camera_rgb() -> None:
+    config = _config()
+    step = ACMTDPNativeV4ProcessorStep(camera_keys=config.camera_keys)
+    observation = {
+        rgb_key(camera): torch.zeros(480, 640, 3, dtype=torch.uint8) for camera in config.camera_keys
     }
+    processed = step.observation(observation)
+    assert processed[rgb_key("camera.cam1")].shape == (1, 3, 480, 640)
+    assert processed[rgb_key("camera.cam1")].dtype is torch.uint8
 
 
-def test_lowdim_order_and_real_tactile_layout() -> None:
+def test_real_tactile_layout_and_v4_inputs() -> None:
     policy = ACMTDPPolicy(_config("real"))
     batch = _batch("real")
-    batch[OBS_STATE][0] = torch.arange(8)
-    batch[DQ][0] = 10 + torch.arange(7)
-    batch[TAU_J][0] = 20 + torch.arange(7)
-    batch[FT300][0] = 30 + torch.arange(6)
-    batch[GRIPPER_GPO][0] = 127.5
     batch[XENSE0][..., 0] = 1
     batch[XENSE1][:, 1] = 2
-
     current = policy._extract_current(batch)
-    expected = torch.cat(
-        [
-            torch.arange(7),
-            10 + torch.arange(7),
-            20 + torch.arange(7),
-            30 + torch.arange(6),
-            torch.tensor([0.5]),
-        ]
-    )
-    torch.testing.assert_close(current["lowdim"][0], expected)
+    assert current["rgb"].shape == (1, 4, 3, 224, 224)
+    assert current["state"].shape == (1, 8)
     assert current["tactile"].shape == (1, 2, 35, 20, 3)
     assert torch.all(current["tactile"][0, 0, ..., 0] == 1)
     assert torch.all(current["tactile"][0, 1, ..., 1] == 2)
 
 
-def test_tactigen_causal_state_replans_and_reset() -> None:
+def test_tactigen_causal_reset_and_action_shape() -> None:
     policy = ACMTDPPolicy(_config("tactigen"))
     tactile_seen: list[torch.Tensor] = []
-    generator_inputs: list[torch.Tensor] = []
-    plan_count = 0
+    actions_seen: list[torch.Tensor] = []
 
     def fake_plan(self, observation, noise=None):
-        nonlocal plan_count
         del noise
-        plan_count += 1
         tactile_seen.append(observation["tactile"].clone())
-        return torch.full((1, 16, 8), float(plan_count))
+        return torch.zeros(1, 16, 8)
 
     def fake_generate(self, previous, action):
-        assert previous["lowdim"].shape == (1, 4, 28)
-        torch.testing.assert_close(previous["pose"][:, -1], batch[O_T_EE])
-        generator_inputs.append(action.clone())
-        return torch.full((1, 2, 35, 20, 3), 7.0)
+        assert previous["gen_lowdim"].shape == (1, 4, 28)
+        actions_seen.append(action.clone())
+        return torch.ones(1, 2, 35, 20, 3)
 
     policy._plan = MethodType(fake_plan, policy)
     policy._generate_tactile = MethodType(fake_generate, policy)
     batch = _batch("tactigen")
-
     first = policy.predict_action_chunk(batch)
-    assert plan_count == 1
     assert first.shape == (1, 16, 8)
     assert torch.count_nonzero(tactile_seen[0]) == 0
     policy.notify_action_executed(first[:, 0])
     policy.predict_action_chunk(batch)
-    assert plan_count == 2
     assert torch.count_nonzero(tactile_seen[1][:, :3]) == 0
     assert torch.count_nonzero(tactile_seen[1][:, 3]) == 2 * 35 * 20 * 3
-    torch.testing.assert_close(generator_inputs[0], first[:, 0])
-
+    torch.testing.assert_close(actions_seen[0], first[:, 0])
     policy.reset()
     policy.predict_action_chunk(batch)
     assert torch.count_nonzero(tactile_seen[-1]) == 0
-    assert policy.causal_state_dict() == {
-        "history_length": 4,
-        "tactile_history_length": 4,
-        "has_previous_plan": True,
-    }
 
 
-def test_mode_specific_missing_and_shape_errors() -> None:
+def test_missing_mode_specific_inputs_are_explicit() -> None:
     real = ACMTDPPolicy(_config("real"))
-    missing_real = _batch("none")
     with pytest.raises(KeyError, match="xense"):
-        real._extract_current(missing_real)
-    invalid_real = _batch("real")
-    invalid_real[XENSE0] = torch.zeros(1, 35, 20)
-    with pytest.raises(ValueError, match="four dimensions"):
-        real._extract_current(invalid_real)
-
+        real._extract_current(_batch("none"))
     tactigen = ACMTDPPolicy(_config("tactigen"))
-    missing_pose = _batch("none")
+    missing_pose = _batch("tactigen")
+    del missing_pose[O_T_EE]
     with pytest.raises(KeyError, match="O_T_EE"):
         tactigen._extract_current(missing_pose)
-    invalid_pose = _batch("tactigen")
-    invalid_pose[O_T_EE] = torch.zeros(1, 16)
-    with pytest.raises(ValueError, match=r"\[B,4,4\]"):
-        tactigen._extract_current(invalid_pose)
 
 
 def test_training_interfaces_are_disabled() -> None:

@@ -11,6 +11,15 @@ import torch.nn.functional as F  # noqa: N812
 
 from .modeling_dformer import DFormerv2_B, DFormerv2_L, DFormerv2_S
 
+# Native-DP v4 components live in a separate module to keep the legacy
+# TactiGen/DFormer definitions self-contained. Re-export them here for callers
+# that historically imported all ACMT model components from this module.
+from .modeling_native_v4 import (  # noqa: E402
+    FrameTactileEncoder,  # noqa: F401
+    NativeLinearNormalizer,  # noqa: F401
+    NativeVisionEncoder,  # noqa: F401
+)
+
 TensorBatch = Mapping[str, torch.Tensor]
 
 

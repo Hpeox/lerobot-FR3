@@ -3,10 +3,11 @@
 # Copyright 2026 The HuggingFace Inc. team. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Convert the six legacy ACMT-DP checkpoints to native LeRobot directories.
+"""Convert Native-DP v4 scratch checkpoints to LeRobot format.
 
-The converter reads tensors and metadata only. It deliberately does not import the
-legacy ACMT-DP, ACMTv4, or DFormer Python packages.
+The converter intentionally accepts only ``acmt_dp.native_dp_v4`` scratch
+checkpoints.  Training-only paths and caches are ignored; runtime artifacts
+contain no dependency on the ACMT-DP source tree.
 """
 
 from __future__ import annotations
@@ -30,9 +31,12 @@ from lerobot.policies.acmt_dp.modeling_acmt_dp import ACMTDPPolicy
 from lerobot.policies.acmt_dp.processor_acmt_dp import make_acmt_dp_pre_post_processors
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
-DEFAULT_POLICY_CHECKPOINTS = {
-    "peg": Path("/data2/TactiGen/ACMT-DP-peg-runs"),
-    "gear": Path("/cym/TactiGen/ACMT-DP/outputs/gear_big2small"),
+MODES = ("none", "real", "tactigen")
+TASKS = ("peg", "gear")
+UPSTREAM_COMMIT = "770a30f6941bf0d9d096fdc2025bd486b7248b23"
+DEFAULT_POLICY_ROOTS = {
+    "peg": Path("/data2/cym/16mm_peg_in_hole/native_dp_v4"),
+    "gear": Path("/data2/cym/gear_big2small/native_dp_v4"),
 }
 DEFAULT_GENERATOR_CHECKPOINTS = {
     "peg": Path("/cym/TactiGen/ACMTv4/checkpoints/action_cmt_drifting_fz_xy_v2_seed42_e20/best.pt"),
@@ -40,9 +44,6 @@ DEFAULT_GENERATOR_CHECKPOINTS = {
         "/cym/TactiGen/ACMTv4/checkpoints/action_cmt_drifting_fz_xy_v2_gear_big2small_seed42_e20/best.pt"
     ),
 }
-MODES = ("none", "real", "tactigen")
-TASKS = ("peg", "gear")
-V3_RUN_NAME = "v3_center480_cached_visual"
 
 
 def _sha256(path: Path) -> str:
@@ -62,110 +63,123 @@ def _load_checkpoint(path: Path) -> dict[str, Any]:
     return checkpoint
 
 
+def _validate_v4_scratch(checkpoint: Mapping[str, Any], path: Path) -> None:
+    if checkpoint.get("schema") != "acmt_dp.native_dp_v4":
+        raise ValueError(
+            f"{path} is not a Native-DP v4 checkpoint (schema={checkpoint.get('schema')!r}); "
+            "v3/legacy checkpoints must be reconverted from v4"
+        )
+    if checkpoint.get("stage") != "scratch":
+        raise ValueError(
+            f"{path} has stage={checkpoint.get('stage')!r}; only scratch checkpoints are supported "
+            "(frozen/finetune artifacts are rejected)"
+        )
+    config = checkpoint.get("config")
+    if not isinstance(config, Mapping):
+        raise KeyError("v4 checkpoint requires config")
+    for field, expected in (
+        ("obs_horizon", 4),
+        ("pred_horizon", 16),
+        ("action_execution_horizon", 8),
+        ("state_dim", 8),
+        ("action_dim", 8),
+        ("tactile_dim", 160),
+        ("feature_dim", 512),
+        ("unet_kernel_size", 5),
+        ("diffusion_step_embed_dim", 128),
+    ):
+        if int(config.get(field, -1)) != expected:
+            raise ValueError(f"v4 checkpoint config {field} must be {expected}")
+    if float(config.get("control_hz", -1)) != 30.0:
+        raise ValueError("v4 checkpoint config control_hz must be 30")
+    if tuple(config.get("camera_names", ())) != ("top", "side", "wrist_left", "wrist_right"):
+        raise ValueError("v4 checkpoint camera_names must be top, side, wrist_left, wrist_right")
+    if config.get("vision_mode") != "scratch":
+        raise ValueError("only vision_mode='scratch' checkpoints can be converted")
+    if config.get("vision_weights") not in (None, "none", "NONE"):
+        raise ValueError("scratch v4 checkpoint must not contain vision_weights")
+    if not isinstance(checkpoint.get("statistics"), Mapping):
+        raise KeyError("v4 checkpoint requires statistics")
+    if not isinstance(checkpoint.get("model_state_dict"), Mapping):
+        raise KeyError("v4 checkpoint requires model_state_dict")
+    if not isinstance(checkpoint.get("ema_state_dict"), Mapping):
+        raise KeyError("v4 checkpoint requires ema_state_dict")
+
+
 def _ema_policy_state(checkpoint: Mapping[str, Any]) -> tuple[dict[str, Tensor], float]:
-    raw = checkpoint.get("model_state_dict")
-    ema = checkpoint.get("ema_state_dict")
-    if not isinstance(raw, Mapping) or not isinstance(ema, Mapping):
-        raise KeyError("Legacy policy checkpoint requires model_state_dict and ema_state_dict")
+    raw = checkpoint["model_state_dict"]
+    ema = checkpoint["ema_state_dict"]
     shadow = ema.get("shadow")
-    if not isinstance(shadow, Mapping):
-        raise KeyError("Legacy policy checkpoint requires ema_state_dict.shadow")
+    if not isinstance(raw, Mapping) or not isinstance(shadow, Mapping):
+        raise KeyError("v4 checkpoint requires model_state_dict and ema_state_dict.shadow")
     state = dict(raw)
     unknown = sorted(set(shadow) - set(state))
     if unknown:
-        raise KeyError(f"EMA contains keys absent from the full model state: {unknown[:10]}")
+        raise KeyError(f"EMA contains keys absent from model_state_dict: {unknown[:10]}")
     for name, value in shadow.items():
         if not isinstance(value, Tensor) or not torch.is_floating_point(value):
-            raise TypeError(f"EMA shadow {name!r} is not a floating-point tensor")
+            raise TypeError(f"EMA shadow {name!r} must be a floating-point tensor")
         state[name] = value
-    required_temporal = {
-        "tactile_encoder.side_attention.in_proj_weight",
-        "tactile_encoder.temporal.weight_ih_l0",
-        "tactile_encoder.temporal_norm.weight",
+    required = {
+        "visual_encoder.obs_encoder.key_model_map.rgb.conv1.weight",
+        "tactile_encoder.spatial.0.weight",
+        "normalizer.params_dict.state.offset",
     }
-    missing_temporal = sorted(required_temporal - set(state))
-    if missing_temporal:
-        raise ValueError(
-            "This is an ACMT-DP v1 checkpoint without the v3 temporal tactile encoder; "
-            f"retrain/reconvert from v3 best.pt (missing {missing_temporal})"
-        )
-    if any(name.startswith("tactile_encoder.attention.") for name in state):
-        raise ValueError("Legacy single-frame ACMT-DP checkpoint rejected; use v3 best.pt")
-    return state, float(ema["decay"])
+    missing = sorted(required - set(state))
+    if missing:
+        raise ValueError(f"v4 checkpoint is missing required state keys: {missing}")
+    if any("temporal" in name or "side_attention" in name for name in state):
+        raise ValueError("v3 temporal tactile state is incompatible with Native-DP v4")
+    return state, float(ema.get("decay", 0.9999))
 
 
 def _generator_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
     config = checkpoint.get("model_config")
     if not isinstance(config, Mapping):
-        raise KeyError("ACMT generator checkpoint requires model_config")
+        raise KeyError("TactiGen checkpoint requires model_config")
     result = dict(config)
     loss_weights = checkpoint.get("loss_weights")
     if isinstance(loss_weights, Mapping) and "contact_pos_weight" in loss_weights:
         result["contact_pos_weight"] = float(loss_weights["contact_pos_weight"])
-    # These legacy source locations are constructor-only hints and must never enter a
-    # runtime checkpoint. The native DFormer implementation is bundled with LeRobot.
     result.pop("dformerv2_repo_path", None)
     result.pop("dformerv2_checkpoint", None)
     return result
 
 
 def _make_config(
-    task: str,
-    mode: str,
-    checkpoint: Mapping[str, Any],
-    generator_config: dict[str, Any] | None,
+    task: str, mode: str, checkpoint: Mapping[str, Any], generator_config: dict[str, Any] | None
 ) -> ACMTDPConfig:
-    legacy_config = checkpoint.get("config")
-    statistics = checkpoint.get("statistics")
-    if not isinstance(legacy_config, Mapping) or not isinstance(statistics, Mapping):
-        raise KeyError("Legacy policy checkpoint requires config and statistics")
-    source_mode = legacy_config.get("tactile_source")
-    expected_source_mode = "real" if mode == "tactigen" else mode
-    if source_mode == "generated":
+    source_config = checkpoint["config"]
+    statistics = checkpoint["statistics"]
+    source_mode = source_config.get("tactile_source")
+    expected_source = "real" if mode == "tactigen" else mode
+    if source_mode != expected_source:
         raise ValueError(
-            "Legacy generated policy checkpoints are deprecated; use the real "
-            "policy checkpoint as the tactigen policy base"
+            f"checkpoint tactile_source={source_mode!r}, requested mode={mode!r}; "
+            f"expected source={expected_source!r}"
         )
-    if source_mode != expected_source_mode:
-        raise ValueError(
-            f"Checkpoint tactile_source={source_mode!r}, requested mode={mode!r}; "
-            f"expected policy source={expected_source_mode!r}"
-        )
-    if int(legacy_config.get("obs_horizon", -1)) != 4:
-        raise ValueError("Legacy checkpoint obs_horizon is not 4")
-    if int(legacy_config.get("pred_horizon", -1)) != 16:
-        raise ValueError("Legacy checkpoint pred_horizon is not 16")
-    if int(legacy_config.get("action_dim", -1)) != 8:
-        raise ValueError("Legacy checkpoint action_dim is not 8")
-    if int(legacy_config.get("tactile_history", -1)) != 4:
-        raise ValueError("ACMT-DP checkpoint tactile_history must be 4; use a v3 checkpoint")
-    if legacy_config.get("visual_preprocess") != "center480":
-        raise ValueError("ACMT-DP checkpoint visual_preprocess must be center480; use a v3 checkpoint")
-    if int(legacy_config.get("action_execution_horizon", -1)) != 8:
-        raise ValueError("ACMT-DP checkpoint action_execution_horizon must be 8")
-    if float(legacy_config.get("control_hz", -1)) != 30.0:
-        raise ValueError("ACMT-DP checkpoint control_hz must be 30")
     return ACMTDPConfig(
         tactile_source=mode,
-        checkpoint_tactile_source=expected_source_mode,
+        checkpoint_tactile_source=expected_source,
         task_variant=task,
         checkpoint_task_variant=task,
-        diffusion_train_steps=int(legacy_config["diffusion_train_steps"]),
-        diffusion_inference_steps=int(legacy_config["diffusion_inference_steps"]),
-        unet_dims=tuple(legacy_config["unet_dims"]),
-        tactile_history=4,
-        action_execution_horizon=8,
-        control_hz=30.0,
-        visual_preprocess="center480",
-        checkpoint_schema_version=3,
-        visual_encoder_name="dformerv2",
-        generator_model_config=generator_config,
-        lowdim_mean=tuple(statistics["lowdim_mean"]),
-        lowdim_std=tuple(statistics["lowdim_std"]),
+        checkpoint_schema_version=4,
+        checkpoint_schema="acmt_dp.native_dp_v4",
+        vision_mode="scratch",
+        visual_preprocess="resize256_center224_imagenet",
+        diffusion_train_steps=int(source_config["diffusion_train_steps"]),
+        diffusion_inference_steps=int(source_config.get("diffusion_inference_steps", 8)),
+        unet_dims=tuple(source_config["unet_dims"]),
+        unet_kernel_size=int(source_config["unet_kernel_size"]),
+        diffusion_step_embed_dim=int(source_config["diffusion_step_embed_dim"]),
+        cond_predict_scale=bool(source_config["cond_predict_scale"]),
+        state_mean=tuple(statistics["state_mean"]),
+        state_std=tuple(statistics["state_std"]),
         action_min=tuple(statistics["action_min"]),
         action_max=tuple(statistics["action_max"]),
         force_mean=tuple(statistics["force_mean"]),
         force_std=tuple(statistics["force_std"]),
+        generator_model_config=generator_config,
         device="cpu",
         push_to_hub=False,
     )
@@ -182,19 +196,17 @@ def _strict_target_state(
     expected = policy.state_dict()
     missing = sorted(set(expected) - set(target))
     unexpected = sorted(set(target) - set(expected))
-    shape_mismatch = sorted(
-        name for name in set(expected) & set(target) if expected[name].shape != target[name].shape
+    mismatch = sorted(
+        name
+        for name in set(expected) & set(target)
+        if tuple(expected[name].shape) != tuple(target[name].shape)
     )
-    if missing or unexpected or shape_mismatch:
+    if missing or unexpected or mismatch:
         raise RuntimeError(
-            "Strict ACMT-DP state mapping failed: "
-            f"missing={missing[:20]}, unexpected={unexpected[:20]}, "
-            f"shape_mismatch={shape_mismatch[:20]}"
+            "Strict Native-DP v4 state mapping failed: "
+            f"missing={missing[:20]}, unexpected={unexpected[:20]}, shape_mismatch={mismatch[:20]}"
         )
     policy.load_state_dict(target, strict=True)
-    # Use the model-owned tensors after strict loading. Some tensors in a legacy
-    # torch.save archive are storage views; safetensors correctly refuses those
-    # because persisting the backing storage would be ambiguous.
     return dict(policy.state_dict())
 
 
@@ -204,24 +216,27 @@ def convert_one(
     mode: str,
     source_checkpoint: Path,
     output_dir: Path,
-    generator_checkpoint: Path | None,
+    generator_checkpoint: Path | None = None,
 ) -> Path:
+    if mode not in MODES:
+        raise ValueError(f"mode must be one of {MODES}")
     source_checkpoint = source_checkpoint.resolve()
     source = _load_checkpoint(source_checkpoint)
+    _validate_v4_scratch(source, source_checkpoint)
     policy_state, ema_decay = _ema_policy_state(source)
 
-    generator = None
-    generator_state = None
     generator_config = None
+    generator_state = None
+    generator = None
     if mode == "tactigen":
         if generator_checkpoint is None:
-            raise ValueError("tactigen conversion requires a TactiGen checkpoint")
+            raise ValueError("tactigen conversion requires the task-matched TactiGen checkpoint")
         generator_checkpoint = generator_checkpoint.resolve()
         generator = _load_checkpoint(generator_checkpoint)
         generator_config = _generator_config(generator)
         generator_state = generator.get("model_state_dict")
         if not isinstance(generator_state, Mapping):
-            raise KeyError("ACMT generator checkpoint requires model_state_dict")
+            raise KeyError("TactiGen checkpoint requires model_state_dict")
 
     config = _make_config(task, mode, source, generator_config)
     policy = ACMTDPPolicy(config)
@@ -233,44 +248,51 @@ def convert_one(
     backup: Path | None = None
     try:
         policy.save_pretrained(temporary, state_dict=target_state)
-        # PreTrainedConfig.from_pretrained discovers the registered subclass
-        # through this discriminator. draccus does not serialize @property
-        # ``type`` by itself.
         config_path = temporary / "config.json"
-        serialized_config = json.loads(config_path.read_text(encoding="utf-8"))
-        serialized_config["type"] = "acmt_dp"
-        config_path.write_text(json.dumps(serialized_config, indent=4) + "\n", encoding="utf-8")
+        serialized = json.loads(config_path.read_text(encoding="utf-8"))
+        serialized["type"] = "acmt_dp"
+        serialized["checkpoint_schema"] = "acmt_dp.native_dp_v4"
+        serialized["checkpoint_schema_version"] = 4
+        config_path.write_text(json.dumps(serialized, indent=4) + "\n", encoding="utf-8")
         preprocessor, postprocessor = make_acmt_dp_pre_post_processors(config)
         preprocessor.save_pretrained(temporary, config_filename=f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json")
         postprocessor.save_pretrained(temporary, config_filename=f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json")
+        source_sha = _sha256(source_checkpoint)
+        generator_sha = _sha256(generator_checkpoint) if generator_checkpoint else None
         manifest = {
-            "schema_version": 3,
-            "checkpoint_schema": "v3_temporal_center480",
+            "schema_version": 4,
+            "checkpoint_schema": "acmt_dp.native_dp_v4",
+            "upstream_commit": UPSTREAM_COMMIT,
             "policy_type": "acmt_dp",
             "task_variant": task,
             "tactile_source": mode,
             "policy_checkpoint_tactile_source": "real" if mode == "tactigen" else mode,
+            "policy_weight_source": "real" if mode == "tactigen" else mode,
             "protocol": "single_frozen_inference" if mode == "tactigen" else "direct_policy",
             "online_protocol": "16_predict_8_execute_at_30hz",
             "tactile_history": 4,
-            "visual_preprocess": "center480",
+            "tactile_encoder": "frame_spatial_cnn_shared_no_gru",
+            "camera_order": ["top", "side", "wrist_left", "wrist_right"],
+            "camera_keys": list(config.camera_keys),
+            "visual_preprocess": "resize256_center224_imagenet",
+            "state_dim": 8,
+            "feature_dim": 512,
+            "tactile_dim": 160,
             "action_execution_horizon": 8,
             "control_hz": 30.0,
-            "seed": 42,
-            # Keep provenance portable: the runtime artifact never needs the
-            # machine-specific legacy source path (which may contain /cym).
+            "vision_mode": "scratch",
+            "seed": int(source.get("config", {}).get("seed", 42)),
             "source_checkpoint": source_checkpoint.name,
-            "source_policy_tactile_source": source.get("config", {}).get("tactile_source"),
-            "source_checkpoint_sha256": _sha256(source_checkpoint),
+            "source_checkpoint_sha256": source_sha,
+            "policy_checkpoint_sha256": source_sha,
+            "real_policy_checkpoint_sha256": source_sha if mode == "tactigen" else None,
             "source_global_step": int(source.get("global_step", -1)),
             "source_best_val_loss": float(source.get("best_val_loss", float("nan"))),
             "ema": {"selected": True, "decay": ema_decay, "base": "model_state_dict"},
             "generator_checkpoint": generator_checkpoint.name if generator_checkpoint else None,
-            "generator_checkpoint_sha256": (
-                _sha256(generator_checkpoint) if generator_checkpoint is not None else None
-            ),
+            "generator_checkpoint_sha256": generator_sha,
+            "tactigen_checkpoint_sha256": generator_sha,
             "generator_global_step": int(generator.get("global_step", -1)) if generator else None,
-            "generator_epoch": int(generator.get("epoch", -1)) if generator else None,
             "runtime_external_python_dependencies": [],
         }
         (temporary / "conversion_manifest.json").write_text(
@@ -290,26 +312,34 @@ def convert_one(
     return output_dir
 
 
+def _resolve_policy_source(root: Path, task: str, mode: str) -> Path:
+    source_mode = "real" if mode == "tactigen" else mode
+    if root.is_file():
+        return root
+    candidates = (
+        root / source_mode / "scratch_progress_fixed" / "seed42" / "best.pt",
+        root / source_mode / "scratch" / "seed42" / "best.pt",
+        root / source_mode / "seed42" / "best.pt",
+        root / task / source_mode / "scratch_progress_fixed" / "seed42" / "best.pt",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"No v4 scratch checkpoint found for {task}/{mode} below {root}; pass --policy-checkpoint explicitly"
+    )
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", choices=(*TASKS, "all"), default="all")
     parser.add_argument("--mode", choices=(*MODES, "all"), default="all")
+    parser.add_argument("--output-root", type=Path, default=Path("outputs/acmt_dp"))
+    parser.add_argument("--policy-source-root", type=Path)
     parser.add_argument(
-        "--output-root",
-        type=Path,
-        default=Path("outputs/acmt_dp"),
-        help="Output root containing task/mode/seed42/pretrained_model",
+        "--policy-checkpoint", type=Path, help="Explicit v4 scratch best.pt (single task/mode)"
     )
-    parser.add_argument(
-        "--policy-source-root",
-        type=Path,
-        help="Override the selected task's legacy outputs root (single task only)",
-    )
-    parser.add_argument(
-        "--generator-checkpoint",
-        type=Path,
-        help="Override the selected task's full generator checkpoint (single task only)",
-    )
+    parser.add_argument("--generator-checkpoint", type=Path)
     return parser.parse_args()
 
 
@@ -317,24 +347,24 @@ def main() -> None:
     args = _parse_args()
     tasks = TASKS if args.task == "all" else (args.task,)
     modes = MODES if args.mode == "all" else (args.mode,)
-    if len(tasks) != 1 and (args.policy_source_root or args.generator_checkpoint):
-        raise ValueError("Source overrides require a single --task")
+    if args.policy_checkpoint and (len(tasks) != 1 or len(modes) != 1):
+        raise ValueError("--policy-checkpoint requires one --task and one --mode")
+    if args.generator_checkpoint and len(tasks) != 1:
+        raise ValueError("--generator-checkpoint requires one --task")
     for task in tasks:
-        policy_root = args.policy_source_root or DEFAULT_POLICY_CHECKPOINTS[task]
-        generator_checkpoint = args.generator_checkpoint or DEFAULT_GENERATOR_CHECKPOINTS[task]
+        root = args.policy_source_root or DEFAULT_POLICY_ROOTS[task]
+        generator = args.generator_checkpoint or DEFAULT_GENERATOR_CHECKPOINTS[task]
         for mode in modes:
-            source_mode = "real" if mode == "tactigen" else mode
-            source = policy_root / source_mode / V3_RUN_NAME / "seed42" / "best.pt"
+            source = args.policy_checkpoint or _resolve_policy_source(root, task, mode)
             output = args.output_root / task / mode / "seed42" / "pretrained_model"
             print(f"Converting {task}/{mode}: {source} -> {output}", flush=True)
-            converted = convert_one(
+            convert_one(
                 task=task,
                 mode=mode,
                 source_checkpoint=source,
                 output_dir=output,
-                generator_checkpoint=generator_checkpoint if mode == "tactigen" else None,
+                generator_checkpoint=generator if mode == "tactigen" else None,
             )
-            print(f"Saved {converted}", flush=True)
             gc.collect()
 
 
