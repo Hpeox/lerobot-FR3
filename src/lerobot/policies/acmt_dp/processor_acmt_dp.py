@@ -1,6 +1,13 @@
 # Copyright 2026 The HuggingFace Inc. team. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+"""LeRobot input processing for Native-DP v4.
+
+Unlike v3, the policy RGB path remains raw here.  The model owns the exact
+256-resize/224-center-crop/quantization/ImageNet transform, while raw wrist
+RGB-D is retained for the TactiGen side branch.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -22,78 +29,59 @@ from lerobot.processor.pipeline import ObservationProcessorStep, ProcessorStepRe
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 from .configuration_acmt_dp import ACMTDPConfig, depth_key, rgb_key
-from .visual_preprocess import prepare_for_frozen_encoder
+
+
+def _as_bchw(value: Any, channels: int, key: str) -> torch.Tensor:
+    tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+    if tensor.ndim == 3:
+        if tensor.shape[0] == channels or tensor.shape[-1] == channels:
+            tensor = tensor.unsqueeze(0)
+        else:
+            raise ValueError(f"{key} has no {channels}-channel axis: {tuple(tensor.shape)}")
+    if tensor.ndim != 4:
+        raise ValueError(f"{key} must be BCHW or BHWC, got {tuple(tensor.shape)}")
+    if tensor.shape[1] == channels:
+        result = tensor
+    elif tensor.shape[-1] == channels:
+        result = tensor.permute(0, 3, 1, 2).contiguous()
+    else:
+        raise ValueError(f"{key} has no {channels}-channel axis: {tuple(tensor.shape)}")
+    spatial = tuple(result.shape[-2:])
+    allowed = {(480, 640), (224, 224)} if channels == 3 else {(480, 640), (128, 128)}
+    if spatial not in allowed:
+        raise ValueError(f"{key} has unsupported resolution {spatial}; expected one of {sorted(allowed)}")
+    return result.contiguous()
 
 
 @dataclass
-@ProcessorStepRegistry.register(name="acmt_dp_center480_processor")
-class ACMTDPCenter480ProcessorStep(ObservationProcessorStep):
-    camera_keys: tuple[str, str]
-    visual_preprocess: str = "center480"
-
-    def _prepare_image(self, key: str, value: Any, channels: int, rgb: bool) -> torch.Tensor:
-        tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
-        if self.visual_preprocess != "center480":
-            raise ValueError("ACMT-DP v3 requires visual_preprocess='center480'")
-        if tensor.ndim == 3:
-            if tensor.shape[0] == channels or tensor.shape[-1] == channels:
-                tensor = tensor.unsqueeze(0)
-            else:
-                raise ValueError(f"{key} has no {channels}-channel axis: {tuple(tensor.shape)}")
-        if tensor.ndim != 4:
-            raise ValueError(f"{key} must be BCHW or BHWC, got {tuple(tensor.shape)}")
-        if tensor.shape[1] != channels and tensor.shape[-1] != channels:
-            raise ValueError(f"{key} has no {channels}-channel axis: {tuple(tensor.shape)}")
-        channels_first = tensor if tensor.shape[1] == channels else tensor.permute(0, 3, 1, 2).contiguous()
-        if tuple(channels_first.shape[-2:]) == (128, 128):
-            processed = channels_first
-        else:
-            # Keep RGB-D processing paired so both streams receive the exact
-            # same crop. The depth result is selected below for this key.
-            dummy = torch.zeros(
-                channels_first.shape[0],
-                1,
-                channels_first.shape[-2],
-                channels_first.shape[-1],
-                dtype=channels_first.dtype,
-                device=channels_first.device,
-            )
-            if rgb:
-                processed, _ = prepare_for_frozen_encoder(channels_first, dummy)
-            else:
-                dummy_rgb = torch.zeros(
-                    channels_first.shape[0],
-                    3,
-                    channels_first.shape[-2],
-                    channels_first.shape[-1],
-                    dtype=channels_first.dtype,
-                    device=channels_first.device,
-                )
-                _, processed = prepare_for_frozen_encoder(dummy_rgb, channels_first)
-        if rgb:
-            processed = processed.float()
-            if processed.numel() and processed.detach().max() > 2.0:
-                processed = processed / 255.0
-        else:
-            # Preserve millimetre values and integer sensor dtype until the
-            # model/DFormer boundary; never normalize depth in the processor.
-            processed = processed.contiguous()
-        return processed.contiguous()
+@ProcessorStepRegistry.register(name="acmt_dp_native_v4_processor")
+class ACMTDPNativeV4ProcessorStep(ObservationProcessorStep):
+    camera_keys: tuple[str, ...]
+    wrist_camera_keys: tuple[str, str] = ("camera.cam3", "camera.cam4")
+    tactile_source: str = "none"
+    visual_preprocess: str = "resize256_center224_imagenet"
 
     def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
         result = dict(observation)
-        for camera in self.camera_keys:
-            rgb = rgb_key(camera)
-            depth = depth_key(camera)
-            if rgb in result:
-                result[rgb] = self._prepare_image(rgb, result[rgb], 3, rgb=True)
-            if depth in result:
-                result[depth] = self._prepare_image(depth, result[depth], 1, rgb=False)
+        expected_cameras = self.camera_keys
+        for camera in expected_cameras:
+            key = rgb_key(camera)
+            if key not in result:
+                raise KeyError(f"ACMT-DP v4 observation is missing {key}")
+            result[key] = _as_bchw(result[key], 3, key)
+        if self.tactile_source == "tactigen":
+            for camera in self.wrist_camera_keys:
+                key = depth_key(camera)
+                if key not in result:
+                    raise KeyError(f"tactigen observation is missing generator depth {key}")
+                result[key] = _as_bchw(result[key], 1, key)
         return result
 
     def get_config(self) -> dict[str, Any]:
         return {
             "camera_keys": list(self.camera_keys),
+            "wrist_camera_keys": list(self.wrist_camera_keys),
+            "tactile_source": self.tactile_source,
             "visual_preprocess": self.visual_preprocess,
         }
 
@@ -101,17 +89,19 @@ class ACMTDPCenter480ProcessorStep(ObservationProcessorStep):
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
         transformed = {kind: dict(bucket) for kind, bucket in features.items()}
-        observations = transformed.get(PipelineFeatureType.OBSERVATION, {})
+        observations = transformed.setdefault(PipelineFeatureType.OBSERVATION, {})
         for camera in self.camera_keys:
-            observations[rgb_key(camera)] = PolicyFeature(type=FeatureType.VISUAL, shape=(3, 128, 128))
-            observations[depth_key(camera)] = PolicyFeature(type=FeatureType.VISUAL, shape=(1, 128, 128))
+            observations[rgb_key(camera)] = PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640))
+        if self.tactile_source == "tactigen":
+            for camera in self.wrist_camera_keys:
+                observations[depth_key(camera)] = PolicyFeature(type=FeatureType.VISUAL, shape=(1, 480, 640))
         return transformed
 
 
-# Import compatibility for callers that only need to discover the processor
-# class. Passing the old ``roi`` argument is intentionally unsupported by the
-# v3 constructor/configuration validation.
-ACMTDPWristROIProcessorStep = ACMTDPCenter480ProcessorStep
+# Keep import compatibility for applications that used the v3 class name. It
+# now deliberately implements the v4 raw-input ABI.
+ACMTDPCenter480ProcessorStep = ACMTDPNativeV4ProcessorStep
+ACMTDPWristROIProcessorStep = ACMTDPNativeV4ProcessorStep
 
 
 def make_acmt_dp_pre_post_processors(
@@ -123,8 +113,10 @@ def make_acmt_dp_pre_post_processors(
         steps=[
             RenameObservationsProcessorStep(rename_map={}),
             AddBatchDimensionProcessorStep(),
-            ACMTDPCenter480ProcessorStep(
-                camera_keys=config.wrist_camera_keys,
+            ACMTDPNativeV4ProcessorStep(
+                camera_keys=config.camera_keys,
+                wrist_camera_keys=config.wrist_camera_keys,
+                tactile_source=config.tactile_source,
                 visual_preprocess=config.visual_preprocess,
             ),
             DeviceProcessorStep(device=config.device),

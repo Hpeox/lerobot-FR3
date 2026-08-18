@@ -1,12 +1,37 @@
-# ACMT-DP policy
+# ACMT-DP Native-DP v4
 
-This directory contains the inference-only LeRobot port of ACMT-DP. Runtime
-loading does not import the legacy `/cym/TactiGen/ACMT-DP` or ACMTv4 source
-trees. `tactigen` checkpoints contain the task-matched real-policy weights plus
-their full TactiGen force generator.
+This directory contains the inference-only LeRobot port of upstream ACMT-DP
+commit `770a30f`. It is v4-only: v3 center480/DFormer policy checkpoints,
+28-dimensional state checkpoints, and the old `generated` mode are rejected.
 
-Select one of the policy modes by pairing its checkpoint directory with the
-same `tactile_source` value:
+The policy type remains `acmt_dp` and the three runtime modes remain:
+
+- `none`: four RGB views and four zero tactile frames;
+- `real`: four RGB views and the two real Xense force fields;
+- `tactigen`: the task-matched real scratch policy plus a frozen TactiGen
+  generator. The generator receives only each successfully sent 8-D action,
+  never an unexecuted predicted action.
+
+The fixed camera order is `camera.cam1` (top), `camera.cam2` (side),
+`camera.cam3` (wrist left), and `camera.cam4` (wrist right). Policy RGB is
+provided as raw `480x640` frames. The model applies the native transform:
+resize to 256, center crop to 224, clamp/round to uint8, divide by 255, and
+ImageNet normalization. TactiGen wrist RGB-D retains the existing center480 to
+128 preprocessing on its private branch.
+
+Native v4 uses a shared scratch ResNet18, an 8-D Gaussian-normalized state,
+the shared spatial force-field CNN (160-D per frame, no GRU), and an 8-step
+diffusion sampler. Its condition is four frames of four camera features,
+state, and tactile features. `predict_action_chunk()` returns `[B,16,8]`;
+`select_action()` returns the first `[B,8]` action. Training methods are
+intentionally unavailable.
+
+Online rollout keeps the existing LeRobot 16/8, 30 Hz runtime: eight commands
+execute while eight remain as a replanning reserve. TactiGen starts with four
+zero frames, and `reset()` clears all visual/state/tactile causal history.
+RTC is unsupported for `tactigen`.
+
+Example:
 
 ```bash
 lerobot-rollout \
@@ -14,40 +39,12 @@ lerobot-rollout \
   --policy.tactile_source=tactigen \
   --inference.type=sync
 ```
-
-The v3 policy uses a four-frame tactile history. `none` feeds four zero frames,
-`real` consumes the two `(35,20,3)` Xense fields, and `tactigen` starts with four
-zero frames and then calls the embedded frozen generator once per successfully
-sent action. The generator receives the previous four observations and the
-actual `[B,8]` command; predicted future actions are never used.
-
-Online rollout uses a `[16,8]` diffusion plan at 30 Hz: the first eight actions
-are executed and the remaining eight provide a planning reserve. The sync
-inference engine atomically replaces only unexecuted future actions when a new
-plan is ready, drops expired timestamps, and returns no command (robot hold /
-safe stop) if the reserve is exhausted before replanning finishes; it never
-replays stale actions. RTC is rejected for ACMT-DP. Call `reset()` at every
-episode boundary.
-
-The default wrist cameras are `camera.cam1` and `camera.cam2`. Raw RGB-D frames
-are expected as `[3,480,640]` and `[1,480,640]`; v3 crops columns `80:560` and
-resizes to 128×128 with antialiased bilinear RGB and nearest-neighbour depth.
-In addition to `observation.state`, all modes require
-`observation.fr3.dq`, `observation.fr3.tau_J`, the FT300 wrench, and gripper
-`gPO`. `real` requires both Xense force fields; `tactigen` requires
-`observation.fr3.O_T_EE` with shape `(4, 4)`.
-
-The `tactigen` policy checkpoint is always based on the task-matched `real`
-policy checkpoint. The former independent `generated` policy checkpoint format
-is deprecated and rejected.
-
-Recreate checkpoints with:
+Convert only v4 scratch checkpoints. The converter performs strict EMA state
+mapping and atomic output replacement; it does not upload checkpoints:
 
 ```bash
-lerobot-convert-acmt-dp-checkpoint --task all --mode all \
+lerobot-convert-acmt-dp-checkpoint \
+  --task peg --mode none \
+  --policy-checkpoint /path/to/native_dp_v4/none/scratch/seed42/best.pt \
   --output-root outputs/acmt_dp
 ```
-
-The converter overlays EMA floating-point tensors on the complete legacy state,
-checks every target key and shape strictly, writes LeRobot processors, and
-records source SHA256 values in `conversion_manifest.json`.

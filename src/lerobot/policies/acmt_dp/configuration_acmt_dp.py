@@ -1,11 +1,11 @@
 # Copyright 2026 The HuggingFace Inc. team. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+"""LeRobot configuration for the Native-DP v4 ACMT-DP policy."""
+
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
@@ -44,43 +44,58 @@ def _coerce_features(features: dict[str, Any] | None) -> dict[str, PolicyFeature
 @PreTrainedConfig.register_subclass("acmt_dp")
 @dataclass
 class ACMTDPConfig(PreTrainedConfig):
-    """Inference-only configuration for the migrated ACMT-DP policy."""
+    """Inference-only Native-DP v4 configuration."""
 
     tactile_source: str = "none"
     checkpoint_tactile_source: str | None = None
     task_variant: str = "peg"
     checkpoint_task_variant: str | None = None
-    wrist_camera_keys: tuple[str, str] = ("camera.cam1", "camera.cam2")
-    # v3 replaces the old fixed 128px ROI with a raw-frame center crop.
-    # Keep the field only so loading an old JSON can fail with a useful message.
-    wrist_roi: tuple[int, int, int, int] | None = None
-    visual_preprocess: str = "center480"
-    checkpoint_schema_version: int = 3
-    tactile_history: int = 4
-    action_execution_horizon: int = 8
-    control_hz: float = 30.0
+    checkpoint_schema_version: int = 4
+    checkpoint_schema: str = "acmt_dp.native_dp_v4"
+    vision_mode: str = "scratch"
+    visual_preprocess: str = "resize256_center224_imagenet"
 
-    n_obs_steps: int = 4
+    # This order is part of the v4 checkpoint ABI.
+    camera_keys: tuple[str, str, str, str] = (
+        "camera.cam1",
+        "camera.cam2",
+        "camera.cam3",
+        "camera.cam4",
+    )
+    camera_names: tuple[str, str, str, str] = ("top", "side", "wrist_left", "wrist_right")
+    wrist_camera_keys: tuple[str, str] = ("camera.cam3", "camera.cam4")
+    rgb_camera_keys: tuple[str, ...] | None = None
+
     obs_horizon: int = 4
-    # Keep the upstream name alongside LeRobot's historical ``action_horizon``
-    # spelling. Both are fixed and serialized for unambiguous v3 manifests.
+    n_obs_steps: int = 4
     pred_horizon: int = 16
     action_horizon: int = 16
     n_action_steps: int = 8
+    action_execution_horizon: int = 8
+    tactile_history: int = 4
+    control_hz: float = 30.0
+    state_dim: int = 8
     action_dim: int = 8
-    diffusion_train_steps: int = 100
-    diffusion_inference_steps: int = 100
-    unet_dims: tuple[int, ...] = (256, 512, 1024)
-    visual_encoder_name: str = "dformerv2"
-    generator_model_config: dict[str, Any] | None = None
+    feature_dim: int = 512
+    tactile_dim: int = 160
 
-    lowdim_mean: tuple[float, ...] = field(default_factory=lambda: (0.0,) * 28)
-    lowdim_std: tuple[float, ...] = field(default_factory=lambda: (1.0,) * 28)
+    diffusion_train_steps: int = 100
+    diffusion_inference_steps: int = 8
+    unet_dims: tuple[int, ...] = (256, 512, 1024)
+    unet_kernel_size: int = 5
+    diffusion_step_embed_dim: int = 128
+    cond_predict_scale: bool = True
+
+    state_mean: tuple[float, ...] = field(default_factory=lambda: (0.0,) * 8)
+    state_std: tuple[float, ...] = field(default_factory=lambda: (1.0,) * 8)
     action_min: tuple[float, ...] = field(default_factory=lambda: (-1.0,) * 7 + (0.0,))
     action_max: tuple[float, ...] = field(default_factory=lambda: (1.0,) * 8)
     force_mean: tuple[float, ...] = field(default_factory=lambda: (0.0,) * 3)
     force_std: tuple[float, ...] = field(default_factory=lambda: (1.0,) * 3)
 
+    generator_model_config: dict[str, Any] | None = None
+    input_features: dict[str, PolicyFeature] | None = None
+    output_features: dict[str, PolicyFeature] | None = None
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.IDENTITY,
@@ -88,31 +103,39 @@ class ACMTDPConfig(PreTrainedConfig):
             "ACTION": NormalizationMode.IDENTITY,
         }
     )
-    input_features: dict[str, PolicyFeature] | None = None
-    output_features: dict[str, PolicyFeature] | None = None
     action_feature_names: list[str] = field(
         default_factory=lambda: [*(f"fr3_joint{i}.pos" for i in range(1, 8)), "gripper.pos"]
     )
 
+    # Legacy fields are retained only so generic config loading can produce a
+    # targeted migration message instead of an opaque unknown-field failure.
+    wrist_roi: tuple[int, int, int, int] | None = None
+    lowdim_mean: tuple[float, ...] | None = None
+    lowdim_std: tuple[float, ...] | None = None
+    visual_encoder_name: str | None = None
+
     def __post_init__(self) -> None:
         super().__post_init__()
+        self.camera_keys = tuple(self.camera_keys)
+        self.camera_names = tuple(self.camera_names)
+        if self.rgb_camera_keys is not None:
+            self.camera_keys = tuple(self.rgb_camera_keys)
+        self.rgb_camera_keys = tuple(self.camera_keys)
         self.wrist_camera_keys = tuple(self.wrist_camera_keys)
-        if self.wrist_roi is not None:
-            self.wrist_roi = tuple(self.wrist_roi)
-        self.unet_dims = tuple(self.unet_dims)
-        self.lowdim_mean = tuple(self.lowdim_mean)
-        self.lowdim_std = tuple(self.lowdim_std)
-        self.action_min = tuple(self.action_min)
-        self.action_max = tuple(self.action_max)
-        self.force_mean = tuple(self.force_mean)
-        self.force_std = tuple(self.force_std)
+        self.unet_dims = tuple(int(value) for value in self.unet_dims)
+        self.state_mean = tuple(float(value) for value in self.state_mean)
+        self.state_std = tuple(float(value) for value in self.state_std)
+        self.action_min = tuple(float(value) for value in self.action_min)
+        self.action_max = tuple(float(value) for value in self.action_max)
+        self.force_mean = tuple(float(value) for value in self.force_mean)
+        self.force_std = tuple(float(value) for value in self.force_std)
         self.input_features = _coerce_features(self.input_features)
         self.output_features = _coerce_features(self.output_features)
 
         if self.tactile_source == "generated":
             raise ValueError(
-                "tactile_source='generated' is deprecated: use 'tactigen' with a real "
-                "policy checkpoint and an embedded TactiGen generator"
+                "tactile_source='generated' is no longer supported; reconvert a v4 scratch "
+                "real checkpoint and use tactile_source='tactigen'"
             )
         if self.tactile_source not in {"none", "real", "tactigen"}:
             raise ValueError("tactile_source must be one of: none, real, tactigen")
@@ -121,15 +144,13 @@ class ACMTDPConfig(PreTrainedConfig):
                 "real" if self.tactile_source == "tactigen" else self.tactile_source
             )
         if self.checkpoint_tactile_source == "generated":
-            raise ValueError("checkpoint_tactile_source='generated' is deprecated: use 'real'")
-        if self.checkpoint_tactile_source not in {"none", "real"}:
-            raise ValueError("checkpoint_tactile_source must be 'none' or 'real'")
-        expected_checkpoint_source = "real" if self.tactile_source == "tactigen" else self.tactile_source
-        if self.checkpoint_tactile_source != expected_checkpoint_source:
+            raise ValueError("checkpoint_tactile_source='generated' is no longer supported; use 'real'")
+        expected_source = "real" if self.tactile_source == "tactigen" else self.tactile_source
+        if self.checkpoint_tactile_source != expected_source:
             raise ValueError(
-                "ACMT-DP checkpoints are mode-specific: "
+                "ACMT-DP checkpoint/runtime tactile mode mismatch: "
                 f"checkpoint={self.checkpoint_tactile_source!r}, requested={self.tactile_source!r}; "
-                f"expected checkpoint source={expected_checkpoint_source!r}"
+                f"expected checkpoint source={expected_source!r}"
             )
         if self.task_variant not in {"peg", "gear"}:
             raise ValueError("task_variant must be 'peg' or 'gear'")
@@ -140,38 +161,57 @@ class ACMTDPConfig(PreTrainedConfig):
                 "ACMT-DP checkpoints are task-specific: "
                 f"checkpoint={self.checkpoint_task_variant!r}, requested={self.task_variant!r}"
             )
+        if self.checkpoint_schema_version != 4 or self.checkpoint_schema != "acmt_dp.native_dp_v4":
+            raise ValueError(
+                "ACMT-DP v3/legacy checkpoints are incompatible with Native-DP v4; "
+                "reconvert a schema=acmt_dp.native_dp_v4 scratch checkpoint"
+            )
+        if self.vision_mode != "scratch":
+            raise ValueError(
+                "LeRobot ACMT-DP v4 only supports scratch checkpoints; "
+                "frozen/finetune artifacts must be reconverted from scratch"
+            )
+        if self.visual_preprocess != "resize256_center224_imagenet":
+            raise ValueError(
+                "ACMT-DP v4 requires visual_preprocess='resize256_center224_imagenet'; "
+                "the old center480 ROI is incompatible"
+            )
+        if self.wrist_roi is not None:
+            raise ValueError("wrist_roi/center480 is a v3 ABI; reconvert the checkpoint for v4")
+        if self.visual_encoder_name not in (None, "resnet18"):
+            raise ValueError("DFormer policy visual encoders are v3-only; v4 uses shared scratch ResNet18")
+        if self.lowdim_mean is not None or self.lowdim_std is not None:
+            raise ValueError("28-dimensional v3 lowdim statistics are incompatible; use v4 state statistics")
+        if len(self.camera_keys) != 4 or len(set(self.camera_keys)) != 4:
+            raise ValueError("ACMT-DP v4 camera_keys must contain four distinct camera names")
+        if self.camera_names != ("top", "side", "wrist_left", "wrist_right"):
+            raise ValueError("ACMT-DP v4 camera_names must be top, side, wrist_left, wrist_right")
         if len(self.wrist_camera_keys) != 2 or len(set(self.wrist_camera_keys)) != 2:
             raise ValueError("wrist_camera_keys must contain two distinct camera names")
-        if self.wrist_roi is not None:
-            raise ValueError(
-                "ACMT-DP v3 no longer supports wrist_roi=(176,304,256,384); "
-                "use visual_preprocess='center480' and reconvert the checkpoint"
-            )
-        if self.checkpoint_schema_version != 3:
-            raise ValueError(
-                "ACMT-DP only supports checkpoint schema v3 (temporal tactile + center480); "
-                "reconvert the checkpoint"
-            )
-        if self.visual_preprocess != "center480":
-            raise ValueError("ACMT-DP v3 requires visual_preprocess='center480'")
-        if self.tactile_history != 4:
-            raise ValueError("ACMT-DP v3 fixes tactile_history=4")
-        if self.action_execution_horizon != 8 or self.control_hz != 30.0:
-            raise ValueError("ACMT-DP v3 fixes action_execution_horizon=8 and control_hz=30")
+        if self.wrist_camera_keys != self.camera_keys[2:]:
+            raise ValueError("wrist_camera_keys must be camera.cam3 and camera.cam4 in v4")
+        if (self.obs_horizon, self.n_obs_steps, self.tactile_history) != (4, 4, 4):
+            raise ValueError("ACMT-DP v4 fixes obs_horizon=n_obs_steps=tactile_history=4")
         if (
-            self.n_obs_steps,
-            self.obs_horizon,
             self.pred_horizon,
             self.action_horizon,
             self.n_action_steps,
+            self.action_execution_horizon,
             self.action_dim,
-        ) != (4, 4, 16, 16, 8, 8):
-            raise ValueError("ACMT-DP v3 fixes obs/action horizons to 4/16/8 and action_dim to 8")
-        if self.visual_encoder_name not in {"dformerv2", "tiny"}:
-            raise ValueError("visual_encoder_name must be dformerv2 or tiny")
+            self.state_dim,
+        ) != (16, 16, 8, 8, 8, 8):
+            raise ValueError("ACMT-DP v4 fixes action/state protocol to 16/8 and dimensions 8")
+        if self.control_hz != 30.0:
+            raise ValueError("ACMT-DP v4 fixes control_hz=30")
+        if self.feature_dim != 512 or self.tactile_dim != 160:
+            raise ValueError("ACMT-DP v4 fixes ResNet feature_dim=512 and tactile_dim=160")
+        if self.unet_dims != (256, 512, 1024) or self.unet_kernel_size != 5:
+            raise ValueError("ACMT-DP v4 requires U-Net dims=(256,512,1024) and kernel_size=5")
+        if self.diffusion_step_embed_dim != 128 or not self.cond_predict_scale:
+            raise ValueError("ACMT-DP v4 requires step embedding 128 and cond_predict_scale=true")
         expected_lengths = {
-            "lowdim_mean": (self.lowdim_mean, 28),
-            "lowdim_std": (self.lowdim_std, 28),
+            "state_mean": (self.state_mean, 8),
+            "state_std": (self.state_std, 8),
             "action_min": (self.action_min, 8),
             "action_max": (self.action_max, 8),
             "force_mean": (self.force_mean, 3),
@@ -186,60 +226,58 @@ class ACMTDPConfig(PreTrainedConfig):
         if self.input_features is None:
             self.input_features = self._default_input_features()
         if self.output_features is None:
-            self.output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(self.action_dim,))}
+            self.output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(8,))}
         self.validate_features()
+
+    @property
+    def global_cond_dim(self) -> int:
+        return self.obs_horizon * (4 * self.feature_dim + self.state_dim + self.tactile_dim)
 
     def _default_input_features(self) -> dict[str, PolicyFeature]:
         features: dict[str, PolicyFeature] = {
             OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(8,)),
-            DQ: PolicyFeature(type=FeatureType.STATE, shape=(7,)),
-            TAU_J: PolicyFeature(type=FeatureType.STATE, shape=(7,)),
-            FT300: PolicyFeature(type=FeatureType.STATE, shape=(6,)),
             GRIPPER_GPO: PolicyFeature(type=FeatureType.STATE, shape=(1,)),
         }
-        for camera in self.wrist_camera_keys:
+        for camera in self.camera_keys:
             features[rgb_key(camera)] = PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640))
-            features[depth_key(camera)] = PolicyFeature(type=FeatureType.VISUAL, shape=(1, 480, 640))
         if self.tactile_source == "real":
             features[XENSE0] = PolicyFeature(type=FeatureType.STATE, shape=(3, 35, 20))
             features[XENSE1] = PolicyFeature(type=FeatureType.STATE, shape=(3, 35, 20))
         if self.tactile_source == "tactigen":
-            features[O_T_EE] = PolicyFeature(type=FeatureType.STATE, shape=(4, 4))
+            for camera in self.wrist_camera_keys:
+                features[depth_key(camera)] = PolicyFeature(type=FeatureType.VISUAL, shape=(1, 480, 640))
+            features.update(
+                {
+                    DQ: PolicyFeature(type=FeatureType.STATE, shape=(7,)),
+                    TAU_J: PolicyFeature(type=FeatureType.STATE, shape=(7,)),
+                    FT300: PolicyFeature(type=FeatureType.STATE, shape=(6,)),
+                    O_T_EE: PolicyFeature(type=FeatureType.STATE, shape=(4, 4)),
+                }
+            )
         return features
 
     def validate_features(self) -> None:
-        expected_checkpoint_source = "real" if self.tactile_source == "tactigen" else self.tactile_source
-        if self.checkpoint_tactile_source != expected_checkpoint_source:
-            raise ValueError(
-                "ACMT-DP checkpoint/runtime tactile mode mismatch: "
-                f"checkpoint={self.checkpoint_tactile_source!r}, requested={self.tactile_source!r}; "
-                f"expected checkpoint source={expected_checkpoint_source!r}"
-            )
-        if self.checkpoint_task_variant != self.task_variant:
-            raise ValueError(
-                "ACMT-DP checkpoint/runtime task mismatch: "
-                f"checkpoint={self.checkpoint_task_variant!r}, requested={self.task_variant!r}"
-            )
         if self.input_features is None or self.output_features is None:
             raise ValueError("ACMT-DP input_features and output_features are required")
         expected = self._default_input_features()
         missing = sorted(set(expected) - set(self.input_features))
         if missing:
-            raise ValueError(f"ACMT-DP is missing required input features: {missing}")
+            raise ValueError(f"ACMT-DP v4 is missing required input features: {missing}")
         for key, feature in expected.items():
             actual = self.input_features[key]
-            # The policy accepts raw camera features before the processor and
-            # 128px features for direct offline calls.
-            camera_shape_ok = key.startswith("observation.images.") and (
-                actual.shape
-                in {
-                    feature.shape,
-                    (3, 128, 128) if key.endswith(".rgb") else (1, 128, 128),
-                }
-            )
-            if (not camera_shape_ok and actual.shape != feature.shape) or actual.type is not feature.type:
+            valid_shape = actual.shape == feature.shape
+            if key == OBS_STATE:
+                # FR3 adapters commonly expose q as a 7-D observation and
+                # gPO as its separate feature; v4 concatenates them to the
+                # required 8-D policy state.
+                valid_shape = actual.shape in {(7,), (8,)}
+            if key.startswith("observation.images.") and key.endswith(".rgb"):
+                valid_shape = actual.shape in {feature.shape, (3, 224, 224)}
+            if key.startswith("observation.images.") and key.endswith(".depth"):
+                valid_shape = actual.shape in {feature.shape, (1, 128, 128)}
+            if not valid_shape or actual.type is not feature.type:
                 raise ValueError(
-                    f"ACMT-DP feature {key!r} must be {feature.type.value}{feature.shape}, "
+                    f"ACMT-DP v4 feature {key!r} must be {feature.type.value}{feature.shape}, "
                     f"got {actual.type.value}{actual.shape}"
                 )
         action = self.output_features.get(ACTION)
@@ -259,14 +297,7 @@ class ACMTDPConfig(PreTrainedConfig):
         return None
 
     def get_optimizer_preset(self) -> OptimizerConfig:
-        raise NotImplementedError("Migrated ACMT-DP checkpoints are inference-only")
-
-    def _save_pretrained(self, save_directory: Path) -> None:
-        super()._save_pretrained(save_directory)
-        config_path = save_directory / "config.json"
-        serialized = json.loads(config_path.read_text(encoding="utf-8"))
-        serialized["type"] = "acmt_dp"
-        config_path.write_text(json.dumps(serialized, indent=4) + "\n", encoding="utf-8")
+        raise NotImplementedError("Native-DP v4 ACMT-DP checkpoints are inference-only")
 
     def get_scheduler_preset(self) -> LRSchedulerConfig | None:
         return None
