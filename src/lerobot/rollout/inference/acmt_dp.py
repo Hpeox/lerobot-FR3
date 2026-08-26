@@ -1,4 +1,4 @@
-"""LeRobot rollout adapter for ACMT-DP v3's 16/8 causal protocol."""
+"""LeRobot rollout adapter for Native-DP v4's 16/8 causal protocol."""
 
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ ACTION_DIM = 8
 PREDICTION_HORIZON = 16
 EXECUTION_HORIZON = 8
 CONTROL_HZ = 30.0
+DISPATCH_TOLERANCE_S = 0.005
 
 
 def _clone_tree(value: Any) -> Any:
@@ -92,17 +93,19 @@ class TimedActionQueue:
 
     def __init__(self, control_hz: float = CONTROL_HZ) -> None:
         if control_hz != CONTROL_HZ:
-            raise ValueError("ACMT-DP v3 requires control_hz=30")
+            raise ValueError("ACMT-DP requires control_hz=30")
         self.period_s = 1.0 / control_hz
         self._items: deque[TimedAction] = deque()
         self._lock = threading.RLock()
         self._expired = 0
         self._last_plan_id = -1
+        self._last_target_time: float | None = None
 
     def clear(self) -> None:
         with self._lock:
             self._items.clear()
             self._expired = 0
+            self._last_target_time = None
 
     def install(self, plan: ActionPlan) -> None:
         if abs(plan.period_s - self.period_s) > 1e-9:
@@ -111,6 +114,7 @@ class TimedActionQueue:
             self._items.clear()
             self._items.extend(plan.timed_actions())
             self._last_plan_id = plan.plan_id
+            self._last_target_time = plan.start_time + (PREDICTION_HORIZON - 1) * self.period_s
 
     install_plan = install
 
@@ -127,10 +131,10 @@ class TimedActionQueue:
     def pop_due(self, now: float | None = None) -> TimedAction | None:
         now = time.monotonic() if now is None else float(now)
         with self._lock:
-            while self._items and self._items[0].target_time < now - 0.005:
+            while self._items and self._items[0].target_time < now - DISPATCH_TOLERANCE_S:
                 self._items.popleft()
                 self._expired += 1
-            if not self._items or self._items[0].target_time > now + 0.005:
+            if not self._items or self._items[0].target_time > now + DISPATCH_TOLERANCE_S:
                 return None
             return self._items.popleft()
 
@@ -143,7 +147,45 @@ class TimedActionQueue:
             self._items.extend(kept)
             self._items.extend(plan.timed_actions())
             self._last_plan_id = plan_id
+            self._last_target_time = plan.start_time + (PREDICTION_HORIZON - 1) * self.period_s
             return removed
+
+    def replace_future_at_next_deadline(
+        self, actions: torch.Tensor, now: float, plan_id: int
+    ) -> tuple[int, float]:
+        """Replace future actions at the next valid 30 Hz deadline.
+
+        The currently due action remains owned by the old plan.  A completed
+        background plan therefore cannot overwrite an action that the sender
+        is about to dispatch, and its first action is never scheduled at an
+        arbitrary inference-completion timestamp.
+        """
+        now = float(now)
+        with self._lock:
+            while self._items and self._items[0].target_time < now - DISPATCH_TOLERANCE_S:
+                self._items.popleft()
+                self._expired += 1
+
+            if self._items:
+                first = self._items[0].target_time
+                if first <= now + DISPATCH_TOLERANCE_S:
+                    start_time = first + self.period_s
+                else:
+                    start_time = first
+            elif self._last_target_time is not None:
+                start_time = max(self._last_target_time + self.period_s, now)
+            else:
+                start_time = now
+
+            plan = ActionPlan(plan_id, actions, start_time=start_time, period_s=self.period_s)
+            kept = [item for item in self._items if item.target_time < start_time]
+            removed = len(self._items) - len(kept)
+            self._items.clear()
+            self._items.extend(kept)
+            self._items.extend(plan.timed_actions())
+            self._last_plan_id = plan_id
+            self._last_target_time = plan.start_time + (PREDICTION_HORIZON - 1) * self.period_s
+            return removed, start_time
 
     def snapshot(self) -> tuple[torch.Tensor, ...]:
         with self._lock:
@@ -207,21 +249,31 @@ class ACMTDPInferenceEngine(InferenceEngine):
         self._generation = 0
         self._last_hold_log = 0.0
         self._lock = threading.RLock()
-        self._policy_lock = threading.RLock()
+        # History mutation and model forward have different ownership.  The
+        # control thread only holds _policy_state_lock while publishing an
+        # observation/snapshot; the planner holds _plan_lock only for model
+        # forward.  Keeping these locks separate is what allows observation
+        # capture to overlap diffusion.
+        self._policy_state_lock = threading.RLock()
+        self._plan_lock = threading.RLock()
+        self._plan_started_at: float | None = None
+        self._failure: BaseException | None = None
         self._stopped = False
 
         config = getattr(policy, "config", None)
         if config is None or getattr(config, "control_hz", 30.0) != CONTROL_HZ:
-            raise ValueError("ACMT-DP v3 rollout requires control_hz=30")
+            raise ValueError("Native-DP v4 rollout requires control_hz=30")
         if getattr(config, "action_execution_horizon", 8) != EXECUTION_HORIZON:
-            raise ValueError("ACMT-DP v3 rollout requires action_execution_horizon=8")
+            raise ValueError("Native-DP v4 rollout requires action_execution_horizon=8")
         if getattr(config, "tactile_history", 4) != 4:
-            raise ValueError("ACMT-DP v3 rollout requires tactile_history=4")
+            raise ValueError("Native-DP v4 rollout requires tactile_history=4")
         if (
             getattr(config, "pred_horizon", 16) != PREDICTION_HORIZON
             or getattr(config, "action_dim", 8) != ACTION_DIM
         ):
-            raise ValueError("ACMT-DP v3 rollout requires pred_horizon=16 and action_dim=8")
+            raise ValueError("Native-DP v4 rollout requires pred_horizon=16 and action_dim=8")
+        if getattr(config, "checkpoint_schema_version", 4) != 4:
+            raise ValueError("Native-DP v4 rollout requires checkpoint_schema_version=4")
         if getattr(config, "tactile_source", None) == "tactigen":
             logger.info("ACMT-DP TactiGen uses sync 16/8 runtime; RTC is unsupported")
 
@@ -257,10 +309,12 @@ class ACMTDPInferenceEngine(InferenceEngine):
             self._tactile_future = None
             self._current_action_window = None
             self._last_hold_log = 0.0
+            self._plan_started_at = None
+            self._failure = None
             self._queue.clear()
             self._boundary_in_flight = False
             self._next_plan_id = 0
-            with self._policy_lock:
+            with self._policy_state_lock:
                 self._policy.reset()
             self._preprocessor.reset()
             self._postprocessor.reset()
@@ -275,7 +329,7 @@ class ACMTDPInferenceEngine(InferenceEngine):
     def _plan_now(self, window: dict, plan_id: int, generation: int | None = None) -> ActionPlan:
         if generation is not None and generation != self._generation:
             raise RuntimeError("ACMT-DP plan belongs to a reset episode")
-        with self._policy_lock, torch.inference_mode():
+        with self._plan_lock, torch.inference_mode():
             action = self._policy._plan(window)  # type: ignore[attr-defined]
         if tuple(action.shape) != (1, PREDICTION_HORIZON, ACTION_DIM):
             raise RuntimeError(f"ACMT-DP policy must return [1,16,8], got {tuple(action.shape)}")
@@ -287,35 +341,55 @@ class ACMTDPInferenceEngine(InferenceEngine):
             return
         try:
             plan = future.result()
-        except Exception:
-            logger.exception("ACMT-DP background plan failed; entering safe hold")
+        except Exception as exc:
+            self._failure = exc
+            logger.exception("ACMT-DP background plan failed")
             self._future = None
             self._boundary_in_flight = False
             return
-        # Keep anything strictly before the completed plan's timestamp and
-        # atomically replace only the still-future reserve.
-        self._queue.replace_future(plan.actions, plan.start_time, plan.plan_id)
+        now = time.monotonic()
+        removed, start_time = self._queue.replace_future_at_next_deadline(plan.actions, now, plan.plan_id)
+        latency_ms = None
+        if self._plan_started_at is not None:
+            latency_ms = (now - self._plan_started_at) * 1000.0
+        logger.info(
+            "ACMT-DP plan ready: id=%d latency_ms=%s queue=%d replaced=%d start_in_ms=%.1f",
+            plan.plan_id,
+            "n/a" if latency_ms is None else f"{latency_ms:.1f}",
+            len(self._queue),
+            removed,
+            max(0.0, (start_time - now) * 1000.0),
+        )
+        self._plan_started_at = None
         self._future = None
         self._boundary_in_flight = False
 
-    def _submit_from_latest(self) -> None:
+    def _submit_plan(self, window: dict | None = None) -> None:
         if self._future is not None:
             return
         plan_id = self._next_plan_id
         self._next_plan_id += 1
         generation = self._generation
         tactile_future = self._tactile_future
+        submitted_window = window
+        self._plan_started_at = time.monotonic()
 
         def wait_tactile_and_plan() -> ActionPlan:
             if tactile_future is not None:
                 tactile_future.result()
             if generation != self._generation:
                 raise RuntimeError("ACMT-DP plan belongs to a reset episode")
-            with self._policy_lock:
-                window = _clone_tree(self._policy._latest_window)  # type: ignore[attr-defined]
-            if window is None:
+            plan_window = submitted_window
+            # TactiGen mutates the causal tactile history after the accepted
+            # action.  Preserve that legacy path by taking the post-generator
+            # window only for that mode; real/none use the exact boundary
+            # snapshot passed by the sender.
+            if tactile_future is not None:
+                with self._policy_state_lock:
+                    plan_window = _clone_tree(self._policy._latest_window)  # type: ignore[attr-defined]
+            if plan_window is None:
                 raise RuntimeError("ACMT-DP planner has no observation window")
-            return self._plan_now(window, plan_id, generation=generation)
+            return self._plan_now(plan_window, plan_id, generation=generation)
 
         self._future = self._planner.submit(wait_tactile_and_plan)
 
@@ -324,10 +398,10 @@ class ACMTDPInferenceEngine(InferenceEngine):
             return None
         with self._lock, torch.inference_mode():
             observation = self._prepare(obs_frame)
-            with self._policy_lock:
+            with self._policy_state_lock:
                 self._policy.observe(observation)  # type: ignore[attr-defined]
                 if getattr(self._policy, "_observed_batch_size", 1) != 1:
-                    raise ValueError("ACMT-DP v3 online rollout requires batch size 1")
+                    raise ValueError("Native-DP v4 online rollout requires batch size 1")
                 current_window = _clone_tree(self._policy._latest_window)  # type: ignore[attr-defined]
             self._maybe_install_future()
             if len(self._queue) == 0:
@@ -354,11 +428,12 @@ class ACMTDPInferenceEngine(InferenceEngine):
                     self._next_plan_id += 1
                     self._queue.install(
                         self._plan_now(
-                            self._policy._latest_window,  # type: ignore[attr-defined]
+                            current_window,
                             plan_id,
                             generation=self._generation,
                         )
                     )
+                    logger.info("ACMT-DP initial plan ready: id=%d queue=%d", plan_id, len(self._queue))
             timed = self._queue.pop_due()
             action = None if timed is None else timed.value
             if action is None:
@@ -369,14 +444,17 @@ class ACMTDPInferenceEngine(InferenceEngine):
                     # before a feedback callback arrived, still request a
                     # replacement from the latest completed causal state.
                     self._boundary_in_flight = True
-                    self._submit_from_latest()
+                    self._submit_plan(current_window)
                 return None
             self._current_action_window = current_window
             if len(self._queue) <= EXECUTION_HORIZON:
                 self._boundary_in_flight = True
-            action_batch = action.to(self._device).unsqueeze(0)
+            # ACMT-DP's postprocessor is CPU-owned.  The queue already holds
+            # CPU actions, so avoid a per-tick CUDA round trip while the
+            # planner is using the GPU.
+            action_batch = action.unsqueeze(0)
             processed = self._postprocessor(action_batch)
-            action_tensor = processed.squeeze(0).cpu()
+            action_tensor = processed.squeeze(0)
             action_dict = make_robot_action(action_tensor, self._dataset_features)
             return torch.tensor([action_dict[key] for key in self._ordered_action_keys])
 
@@ -397,13 +475,13 @@ class ACMTDPInferenceEngine(InferenceEngine):
                     generation,
                 )
             if self._boundary_in_flight:
-                self._submit_from_latest()
+                self._submit_plan(current_window)
 
     def _notify_tactile(self, action: torch.Tensor, window: dict | None, generation: int) -> None:
         # Hold the engine lock while taking the policy lock. Reset uses the
         # same order, so an in-flight worker cannot append a stale tactile
         # frame after an episode has been reset.
-        with self._lock, self._policy_lock:
+        with self._lock, self._policy_state_lock:
             if generation != self._generation or self._stopped:
                 return
             self._policy.notify_action_executed(action, window)  # type: ignore[attr-defined]
@@ -411,6 +489,10 @@ class ACMTDPInferenceEngine(InferenceEngine):
     @property
     def ready(self) -> bool:
         return not self._stopped
+
+    @property
+    def failed(self) -> bool:
+        return self._failure is not None
 
 
 __all__ = [
