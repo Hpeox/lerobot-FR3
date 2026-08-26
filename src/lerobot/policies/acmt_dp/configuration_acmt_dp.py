@@ -203,6 +203,8 @@ class ACMTDPConfig(PreTrainedConfig):
             raise ValueError("ACMT-DP v4 fixes action/state protocol to 16/8 and dimensions 8")
         if self.control_hz != 30.0:
             raise ValueError("ACMT-DP v4 fixes control_hz=30")
+        if self.diffusion_inference_steps != 8:
+            raise ValueError("ACMT-DP v4 fixes diffusion_inference_steps=8 for the 30 Hz runtime")
         if self.feature_dim != 512 or self.tactile_dim != 160:
             raise ValueError("ACMT-DP v4 fixes ResNet feature_dim=512 and tactile_dim=160")
         if self.unet_dims != (256, 512, 1024) or self.unet_kernel_size != 5:

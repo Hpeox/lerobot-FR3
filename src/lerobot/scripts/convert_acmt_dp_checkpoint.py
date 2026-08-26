@@ -90,6 +90,8 @@ def _validate_v4_scratch(checkpoint: Mapping[str, Any], path: Path) -> None:
     ):
         if int(config.get(field, -1)) != expected:
             raise ValueError(f"v4 checkpoint config {field} must be {expected}")
+    if int(config.get("diffusion_inference_steps", -1)) != 8:
+        raise ValueError("v4 checkpoint config diffusion_inference_steps must be 8")
     if float(config.get("control_hz", -1)) != 30.0:
         raise ValueError("v4 checkpoint config control_hz must be 30")
     if tuple(config.get("camera_names", ())) != ("top", "side", "wrist_left", "wrist_right"):
@@ -280,6 +282,8 @@ def convert_one(
             "tactile_dim": 160,
             "action_execution_horizon": 8,
             "control_hz": 30.0,
+            "diffusion_train_steps": config.diffusion_train_steps,
+            "diffusion_inference_steps": config.diffusion_inference_steps,
             "vision_mode": "scratch",
             "seed": int(source.get("config", {}).get("seed", 42)),
             "source_checkpoint": source_checkpoint.name,
