@@ -20,18 +20,20 @@ ImageNet normalization. TactiGen wrist RGB-D retains the existing center480 to
 128 preprocessing on its private branch.
 
 Native v4 uses a shared scratch ResNet18, an 8-D Gaussian-normalized state,
-the shared spatial force-field CNN (160-D per frame, no GRU), and an 8-step
-diffusion sampler. Its condition is four frames of four camera features,
-state, and tactile features. `predict_action_chunk()` returns `[B,16,8]`;
-`select_action()` returns the first `[B,8]` action. Training methods are
-intentionally unavailable.
+the shared spatial force-field CNN (160-D per frame, no GRU), and a configurable
+8-step or 100-step diffusion sampler. Its condition is four frames of four
+camera features, state, and tactile features. `predict_action_chunk()` returns
+`[B,16,8]`; `select_action()` returns the first `[B,8]` action. Training methods
+are intentionally unavailable.
 
 Online rollout uses LeRobot's ordinary synchronous inference path: each control
 tick calls `select_action()`, which computes a fresh native 16-step plan and
 returns its first `[B,8]` action. The rollout layer does not maintain an
 ACMT-DP-specific rolling/action queue or background planner. The v4 policy
 contract remains `control_hz=30`, but the effective loop rate is bounded by the
-synchronous inference latency. TactiGen starts with four zero frames, and
+synchronous inference latency. For the production real-time setting use 8
+denoising steps; 100 steps are available for slower synchronous experiments
+and do not change the model weights. TactiGen starts with four zero frames, and
 `reset()` clears all visual/state/tactile causal history. RTC is unsupported
 for `tactigen`.
 

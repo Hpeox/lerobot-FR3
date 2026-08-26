@@ -26,7 +26,10 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from lerobot.policies.acmt_dp.configuration_acmt_dp import ACMTDPConfig
+from lerobot.policies.acmt_dp.configuration_acmt_dp import (
+    ACMTDPConfig,
+    SUPPORTED_DIFFUSION_INFERENCE_STEPS,
+)
 from lerobot.policies.acmt_dp.modeling_acmt_dp import ACMTDPPolicy
 from lerobot.policies.acmt_dp.processor_acmt_dp import make_acmt_dp_pre_post_processors
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
@@ -90,8 +93,10 @@ def _validate_v4_scratch(checkpoint: Mapping[str, Any], path: Path) -> None:
     ):
         if int(config.get(field, -1)) != expected:
             raise ValueError(f"v4 checkpoint config {field} must be {expected}")
-    if int(config.get("diffusion_inference_steps", -1)) != 8:
-        raise ValueError("v4 checkpoint config diffusion_inference_steps must be 8")
+    diffusion_inference_steps = int(config.get("diffusion_inference_steps", -1))
+    if diffusion_inference_steps not in SUPPORTED_DIFFUSION_INFERENCE_STEPS:
+        supported = ", ".join(str(value) for value in SUPPORTED_DIFFUSION_INFERENCE_STEPS)
+        raise ValueError(f"v4 checkpoint config diffusion_inference_steps must be one of: {supported}")
     if float(config.get("control_hz", -1)) != 30.0:
         raise ValueError("v4 checkpoint config control_hz must be 30")
     if tuple(config.get("camera_names", ())) != ("top", "side", "wrist_left", "wrist_right"):
@@ -149,7 +154,11 @@ def _generator_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _make_config(
-    task: str, mode: str, checkpoint: Mapping[str, Any], generator_config: dict[str, Any] | None
+    task: str,
+    mode: str,
+    checkpoint: Mapping[str, Any],
+    generator_config: dict[str, Any] | None,
+    diffusion_inference_steps: int | None = None,
 ) -> ACMTDPConfig:
     source_config = checkpoint["config"]
     statistics = checkpoint["statistics"]
@@ -160,6 +169,14 @@ def _make_config(
             f"checkpoint tactile_source={source_mode!r}, requested mode={mode!r}; "
             f"expected source={expected_source!r}"
         )
+    inference_steps = int(
+        source_config.get("diffusion_inference_steps", 8)
+        if diffusion_inference_steps is None
+        else diffusion_inference_steps
+    )
+    if inference_steps not in SUPPORTED_DIFFUSION_INFERENCE_STEPS:
+        supported = ", ".join(str(value) for value in SUPPORTED_DIFFUSION_INFERENCE_STEPS)
+        raise ValueError(f"diffusion_inference_steps must be one of: {supported}")
     return ACMTDPConfig(
         tactile_source=mode,
         checkpoint_tactile_source=expected_source,
@@ -170,7 +187,7 @@ def _make_config(
         vision_mode="scratch",
         visual_preprocess="resize256_center224_imagenet",
         diffusion_train_steps=int(source_config["diffusion_train_steps"]),
-        diffusion_inference_steps=int(source_config.get("diffusion_inference_steps", 8)),
+        diffusion_inference_steps=inference_steps,
         unet_dims=tuple(source_config["unet_dims"]),
         unet_kernel_size=int(source_config["unet_kernel_size"]),
         diffusion_step_embed_dim=int(source_config["diffusion_step_embed_dim"]),
@@ -219,6 +236,7 @@ def convert_one(
     source_checkpoint: Path,
     output_dir: Path,
     generator_checkpoint: Path | None = None,
+    diffusion_inference_steps: int | None = None,
 ) -> Path:
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}")
@@ -240,7 +258,13 @@ def convert_one(
         if not isinstance(generator_state, Mapping):
             raise KeyError("TactiGen checkpoint requires model_state_dict")
 
-    config = _make_config(task, mode, source, generator_config)
+    config = _make_config(
+        task,
+        mode,
+        source,
+        generator_config,
+        diffusion_inference_steps=diffusion_inference_steps,
+    )
     policy = ACMTDPPolicy(config)
     target_state = _strict_target_state(policy, policy_state, generator_state)
 
@@ -271,7 +295,7 @@ def convert_one(
             "policy_checkpoint_tactile_source": "real" if mode == "tactigen" else mode,
             "policy_weight_source": "real" if mode == "tactigen" else mode,
             "protocol": "single_frozen_inference" if mode == "tactigen" else "direct_policy",
-            "online_protocol": "16_predict_8_execute_at_30hz",
+            "online_protocol": "synchronous_select_action",
             "tactile_history": 4,
             "tactile_encoder": "frame_spatial_cnn_shared_no_gru",
             "camera_order": ["top", "side", "wrist_left", "wrist_right"],
@@ -344,6 +368,12 @@ def _parse_args() -> argparse.Namespace:
         "--policy-checkpoint", type=Path, help="Explicit v4 scratch best.pt (single task/mode)"
     )
     parser.add_argument("--generator-checkpoint", type=Path)
+    parser.add_argument(
+        "--diffusion-inference-steps",
+        type=int,
+        choices=SUPPORTED_DIFFUSION_INFERENCE_STEPS,
+        help="Override sampling steps in the output artifact (8 for real-time, 100 for slower sync inference).",
+    )
     return parser.parse_args()
 
 
@@ -368,6 +398,7 @@ def main() -> None:
                 source_checkpoint=source,
                 output_dir=output,
                 generator_checkpoint=generator if mode == "tactigen" else None,
+                diffusion_inference_steps=args.diffusion_inference_steps,
             )
             gc.collect()
 

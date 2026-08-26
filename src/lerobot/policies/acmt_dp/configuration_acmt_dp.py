@@ -19,6 +19,9 @@ FT300 = "observation.ft300s.wrench"
 GRIPPER_GPO = "observation.gripper.gPO"
 XENSE0 = "observation.xense.sensor0.force_field"
 XENSE1 = "observation.xense.sensor1.force_field"
+# Eight steps are the production real-time setting; one hundred steps are
+# retained for slower synchronous experiments using the same model weights.
+SUPPORTED_DIFFUSION_INFERENCE_STEPS = (8, 100)
 
 
 def rgb_key(camera: str) -> str:
@@ -203,8 +206,9 @@ class ACMTDPConfig(PreTrainedConfig):
             raise ValueError("ACMT-DP v4 fixes action/state protocol to 16/8 and dimensions 8")
         if self.control_hz != 30.0:
             raise ValueError("ACMT-DP v4 fixes control_hz=30")
-        if self.diffusion_inference_steps != 8:
-            raise ValueError("ACMT-DP v4 fixes diffusion_inference_steps=8 for the 30 Hz runtime")
+        if self.diffusion_inference_steps not in SUPPORTED_DIFFUSION_INFERENCE_STEPS:
+            supported = ", ".join(str(value) for value in SUPPORTED_DIFFUSION_INFERENCE_STEPS)
+            raise ValueError(f"ACMT-DP v4 diffusion_inference_steps must be one of: {supported}")
         if self.feature_dim != 512 or self.tactile_dim != 160:
             raise ValueError("ACMT-DP v4 fixes ResNet feature_dim=512 and tactile_dim=160")
         if self.unet_dims != (256, 512, 1024) or self.unet_kernel_size != 5:

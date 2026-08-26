@@ -18,13 +18,14 @@ from lerobot.policies.acmt_dp.configuration_acmt_dp import (
     XENSE0,
     XENSE1,
     ACMTDPConfig,
+    SUPPORTED_DIFFUSION_INFERENCE_STEPS,
     depth_key,
     rgb_key,
 )
 from lerobot.policies.acmt_dp.modeling_acmt_dp import ACMTDPPolicy
 from lerobot.policies.acmt_dp.processor_acmt_dp import ACMTDPNativeV4ProcessorStep
 from lerobot.policies.factory import get_policy_class, make_policy_config
-from lerobot.scripts.convert_acmt_dp_checkpoint import _validate_v4_scratch
+from lerobot.scripts.convert_acmt_dp_checkpoint import _make_config, _validate_v4_scratch
 from lerobot.utils.constants import OBS_STATE
 
 
@@ -96,11 +97,13 @@ def test_v4_rejects_old_modes_and_abis() -> None:
         ACMTDPConfig(checkpoint_schema_version=3, device="cpu")
     with pytest.raises(ValueError, match="scratch"):
         ACMTDPConfig(vision_mode="frozen", device="cpu")
-    with pytest.raises(ValueError, match="diffusion_inference_steps=8"):
-        ACMTDPConfig(diffusion_inference_steps=100, device="cpu")
+    assert 100 in SUPPORTED_DIFFUSION_INFERENCE_STEPS
+    assert ACMTDPConfig(diffusion_inference_steps=100, device="cpu").diffusion_inference_steps == 100
+    with pytest.raises(ValueError, match="must be one of"):
+        ACMTDPConfig(diffusion_inference_steps=7, device="cpu")
 
 
-def test_converter_rejects_non_realtime_inference_steps() -> None:
+def test_converter_rejects_unsupported_inference_steps() -> None:
     config = {
         "obs_horizon": 4,
         "pred_horizon": 16,
@@ -111,7 +114,7 @@ def test_converter_rejects_non_realtime_inference_steps() -> None:
         "feature_dim": 512,
         "unet_kernel_size": 5,
         "diffusion_step_embed_dim": 128,
-        "diffusion_inference_steps": 100,
+        "diffusion_inference_steps": 7,
         "control_hz": 30.0,
         "camera_names": ["top", "side", "wrist_left", "wrist_right"],
         "vision_mode": "scratch",
@@ -125,8 +128,34 @@ def test_converter_rejects_non_realtime_inference_steps() -> None:
         "model_state_dict": {},
         "ema_state_dict": {},
     }
-    with pytest.raises(ValueError, match="diffusion_inference_steps must be 8"):
+    with pytest.raises(ValueError, match="diffusion_inference_steps must be one of"):
         _validate_v4_scratch(checkpoint, Path("best.pt"))
+
+
+def test_converter_can_override_inference_steps() -> None:
+    checkpoint = {
+        "config": {
+            "tactile_source": "none",
+            "diffusion_train_steps": 100,
+            "diffusion_inference_steps": 8,
+            "unet_dims": [256, 512, 1024],
+            "unet_kernel_size": 5,
+            "diffusion_step_embed_dim": 128,
+            "cond_predict_scale": True,
+        },
+        "statistics": {
+            "state_mean": [0.0] * 8,
+            "state_std": [1.0] * 8,
+            "action_min": [-1.0] * 8,
+            "action_max": [1.0] * 8,
+            "force_mean": [0.0] * 3,
+            "force_std": [1.0] * 3,
+        },
+    }
+
+    config = _make_config("peg", "none", checkpoint, None, diffusion_inference_steps=100)
+
+    assert config.diffusion_inference_steps == 100
 
 
 def test_native_processor_preserves_raw_four_camera_rgb() -> None:
