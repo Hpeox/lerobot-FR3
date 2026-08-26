@@ -1,8 +1,14 @@
-"""LeRobot rollout adapter for Native-DP v4's 16/8 causal protocol."""
+"""Compatibility adapter for the former Native-DP v4 rolling protocol.
+
+The inference factory now routes ACMT-DP through ``SyncInferenceEngine``.
+This module remains importable for compatibility with focused queue tests and
+explicit callers that still need the former backend.
+"""
 
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from collections import deque
@@ -26,6 +32,7 @@ PREDICTION_HORIZON = 16
 EXECUTION_HORIZON = 8
 CONTROL_HZ = 30.0
 DISPATCH_TOLERANCE_S = 0.005
+JOINT_POSITION_KEYS = tuple(f"fr3_joint{index}.pos" for index in range(1, 8))
 
 
 def _clone_tree(value: Any) -> Any:
@@ -259,6 +266,7 @@ class ACMTDPInferenceEngine(InferenceEngine):
         self._plan_started_at: float | None = None
         self._failure: BaseException | None = None
         self._stopped = False
+        self._first_action_diagnostic_emitted = False
 
         config = getattr(policy, "config", None)
         if config is None or getattr(config, "control_hz", 30.0) != CONTROL_HZ:
@@ -311,6 +319,7 @@ class ACMTDPInferenceEngine(InferenceEngine):
             self._last_hold_log = 0.0
             self._plan_started_at = None
             self._failure = None
+            self._first_action_diagnostic_emitted = False
             self._queue.clear()
             self._boundary_in_flight = False
             self._next_plan_id = 0
@@ -318,6 +327,59 @@ class ACMTDPInferenceEngine(InferenceEngine):
                 self._policy.reset()
             self._preprocessor.reset()
             self._postprocessor.reset()
+
+    @staticmethod
+    def _finite_joint_vector(source: dict[str, Any] | None) -> tuple[float, ...] | None:
+        if source is None:
+            return None
+        try:
+            values = tuple(float(source[key]) for key in JOINT_POSITION_KEYS)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not all(math.isfinite(value) for value in values):
+            return None
+        return values
+
+    @staticmethod
+    def _max_abs_delta(
+        left: tuple[float, ...] | None,
+        right: tuple[float, ...] | None,
+    ) -> float | None:
+        if left is None or right is None:
+            return None
+        return max(abs(first - second) for first, second in zip(left, right, strict=True))
+
+    def record_first_action_diagnostic(
+        self,
+        observation: dict[str, Any],
+        planned_action: dict[str, Any],
+        sent_action: dict[str, Any],
+    ) -> None:
+        """Log one accepted rollout action for diagnosing target jumps.
+
+        This is intentionally an ACMT-DP-only observability hook.  It does not
+        clamp, interpolate, or otherwise modify the command that was accepted
+        by the robot transport.
+        """
+        with self._lock:
+            if self._first_action_diagnostic_emitted:
+                return
+            self._first_action_diagnostic_emitted = True
+
+            current_q = self._finite_joint_vector(observation)
+            planned_q = self._finite_joint_vector(planned_action)
+            sent_q = self._finite_joint_vector(sent_action)
+            logger.info(
+                "ACMT-DP first action diagnostic: current_q=%s planned_q=%s sent_q=%s "
+                "max_abs_delta=%s max_abs_processor_delta=%s",
+                current_q,
+                planned_q,
+                sent_q,
+                "n/a" if (delta := self._max_abs_delta(current_q, sent_q)) is None else f"{delta:.6f}",
+                "n/a"
+                if (processor_delta := self._max_abs_delta(planned_q, sent_q)) is None
+                else f"{processor_delta:.6f}",
+            )
 
     def _prepare(self, obs_frame: dict) -> dict:
         observation = copy(obs_frame)

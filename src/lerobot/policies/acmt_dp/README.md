@@ -26,10 +26,14 @@ state, and tactile features. `predict_action_chunk()` returns `[B,16,8]`;
 `select_action()` returns the first `[B,8]` action. Training methods are
 intentionally unavailable.
 
-Online rollout keeps the existing LeRobot 16/8, 30 Hz runtime: eight commands
-execute while eight remain as a replanning reserve. TactiGen starts with four
-zero frames, and `reset()` clears all visual/state/tactile causal history.
-RTC is unsupported for `tactigen`.
+Online rollout uses LeRobot's ordinary synchronous inference path: each control
+tick calls `select_action()`, which computes a fresh native 16-step plan and
+returns its first `[B,8]` action. The rollout layer does not maintain an
+ACMT-DP-specific rolling/action queue or background planner. The v4 policy
+contract remains `control_hz=30`, but the effective loop rate is bounded by the
+synchronous inference latency. TactiGen starts with four zero frames, and
+`reset()` clears all visual/state/tactile causal history. RTC is unsupported
+for `tactigen`.
 
 Example:
 

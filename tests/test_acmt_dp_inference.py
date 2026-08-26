@@ -17,6 +17,8 @@ from lerobot.rollout.inference.acmt_dp import (
     ActionPlan,
     TimedActionQueue,
 )
+from lerobot.rollout.strategies.core import send_next_action
+from lerobot.utils.action_interpolator import ActionInterpolator
 from lerobot.utils.constants import ACTION
 
 
@@ -240,3 +242,96 @@ def test_action_postprocessing_stays_on_cpu_while_planner_device_is_cuda(
         assert postprocessor.devices == [torch.device("cpu")]
     finally:
         engine.stop()
+
+
+def _joint_values(offset: float) -> dict[str, float]:
+    return {f"fr3_joint{index}.pos": offset + index - 1 for index in range(1, 8)}
+
+
+def test_first_action_diagnostic_is_once_per_reset(caplog: pytest.LogCaptureFixture) -> None:
+    engine = _make_engine(_FakePolicy("none"))
+    try:
+        with caplog.at_level("INFO", logger=acmt_dp.__name__):
+            engine.record_first_action_diagnostic(
+                _joint_values(0.0),
+                _joint_values(1.0),
+                _joint_values(1.25),
+            )
+            engine.record_first_action_diagnostic(
+                _joint_values(10.0),
+                _joint_values(11.0),
+                _joint_values(11.25),
+            )
+
+        messages = [
+            record.message
+            for record in caplog.records
+            if "ACMT-DP first action diagnostic" in record.message
+        ]
+        assert len(messages) == 1
+        assert "current_q=(0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0)" in messages[0]
+        assert "planned_q=(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0)" in messages[0]
+        assert "sent_q=(1.25, 2.25, 3.25, 4.25, 5.25, 6.25, 7.25)" in messages[0]
+        assert "max_abs_delta=1.250000" in messages[0]
+        assert "max_abs_processor_delta=0.250000" in messages[0]
+
+        caplog.clear()
+        engine.reset()
+        with caplog.at_level("INFO", logger=acmt_dp.__name__):
+            engine.record_first_action_diagnostic(
+                _joint_values(2.0),
+                _joint_values(3.0),
+                _joint_values(3.5),
+            )
+        assert sum("ACMT-DP first action diagnostic" in record.message for record in caplog.records) == 1
+    finally:
+        engine.stop()
+
+
+class _DiagnosticEngine:
+    def __init__(self) -> None:
+        self.calls: list[tuple[dict, dict, dict]] = []
+
+    def get_action(self, _obs_frame: dict) -> torch.Tensor:
+        return torch.arange(ACTION_DIM, dtype=torch.float32)
+
+    def record_first_action_diagnostic(self, observation: dict, planned: dict, sent: dict) -> None:
+        self.calls.append((observation, planned, sent))
+
+
+class _ActionRobot:
+    def __init__(self, *, fail: bool) -> None:
+        self.fail = fail
+
+    def send_action(self, action: dict) -> dict:
+        if self.fail:
+            raise RuntimeError("synthetic send failure")
+        return dict(action)
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_first_action_diagnostic_hook_runs_only_after_send(fail: bool) -> None:
+    names = [f"action_{index}" for index in range(ACTION_DIM)]
+    engine = _DiagnosticEngine()
+    robot = _ActionRobot(fail=fail)
+    ctx = SimpleNamespace(
+        policy=SimpleNamespace(inference=engine),
+        data=SimpleNamespace(
+            dataset_features={ACTION: {"names": names}},
+            ordered_action_keys=names,
+        ),
+        processors=SimpleNamespace(robot_action_processor=lambda pair: pair[0]),
+        hardware=SimpleNamespace(robot_wrapper=robot),
+    )
+    interpolator = ActionInterpolator()
+
+    if fail:
+        with pytest.raises(RuntimeError, match="synthetic send failure"):
+            send_next_action({}, {}, ctx, interpolator)
+        assert engine.calls == []
+    else:
+        sent = send_next_action({}, {}, ctx, interpolator)
+        assert sent == {key: float(index) for index, key in enumerate(names)}
+        assert len(engine.calls) == 1
+        assert engine.calls[0][1] == sent
+        assert engine.calls[0][2] == sent

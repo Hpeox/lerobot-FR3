@@ -33,7 +33,6 @@ from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.processor import PolicyProcessorPipeline
 
 from ..robot_wrapper import ThreadSafeRobot
-from .acmt_dp import ACMTDPInferenceEngine
 from .base import InferenceEngine
 from .rtc import RTCInferenceEngine
 from .sync import SyncInferenceEngine
@@ -100,17 +99,10 @@ def create_inference_engine(
     """Instantiate the appropriate inference engine from a config object."""
     logger.info("Creating inference engine: %s", config.type)
     if isinstance(config, SyncInferenceConfig):
-        if getattr(policy, "name", None) == "acmt_dp":
-            return ACMTDPInferenceEngine(
-                policy=policy,
-                preprocessor=preprocessor,
-                postprocessor=postprocessor,
-                dataset_features=dataset_features,
-                ordered_action_keys=ordered_action_keys,
-                task=task,
-                device=device,
-                robot_type=robot_wrapper.robot_type,
-            )
+        # ACMT-DP deliberately uses the ordinary inline synchronous path.
+        # The policy still produces its native v4 chunk in ``select_action``;
+        # this backend returns that call's first action without maintaining a
+        # second rolling/action queue in the rollout layer.
         return SyncInferenceEngine(
             policy=policy,
             preprocessor=preprocessor,

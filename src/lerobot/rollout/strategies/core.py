@@ -304,6 +304,14 @@ def send_next_action(
     action_dict = {k: interp[i].item() for i, k in enumerate(ordered_keys)}
     processed = ctx.processors.robot_action_processor((action_dict, obs_raw))
     sent = ctx.hardware.robot_wrapper.send_action(processed)
+    diagnostic = getattr(engine, "record_first_action_diagnostic", None)
+    if sent is not None and callable(diagnostic):
+        try:
+            diagnostic(obs_raw, action_dict, sent)
+        except Exception:
+            # Diagnostics must never change the action lifecycle or make a
+            # successful transport send fail.
+            logger.warning("Inference first-action diagnostic failed", exc_info=True)
     # Stateful policies such as ACMT-DP need the command that the transport
     # actually accepted (FR3 may clip the gripper), not the pre-processor value.
     feedback = getattr(engine, "notify_action_executed", None)
