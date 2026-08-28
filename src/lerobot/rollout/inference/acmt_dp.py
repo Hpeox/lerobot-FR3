@@ -1,4 +1,4 @@
-"""LeRobot rollout adapter for ACMT-DP v3's 16/8 causal protocol."""
+"""LeRobot rollout adapter for ACMT-DP v4/v5's 16/8 causal protocol."""
 
 from __future__ import annotations
 
@@ -88,12 +88,26 @@ class TimedAction:
 
 
 class TimedActionQueue:
-    """Thread-safe action queue with atomic future-plan replacement."""
+    """Thread-safe action queue with timestamp-aligned plan replacement.
 
-    def __init__(self, control_hz: float = CONTROL_HZ) -> None:
+    Deployment can blend the previous plan's eight-step reserve with the new
+    plan's first eight steps when their target timestamps coincide.
+    """
+
+    def __init__(
+        self,
+        control_hz: float = CONTROL_HZ,
+        *,
+        blend_overlap: bool = False,
+        blend_new_weight_start: float = 0.25,
+    ) -> None:
         if control_hz != CONTROL_HZ:
-            raise ValueError("ACMT-DP v3 requires control_hz=30")
+            raise ValueError("ACMT-DP v4/v5 requires control_hz=30")
+        if not 0.0 <= blend_new_weight_start <= 1.0:
+            raise ValueError("blend_new_weight_start must be in [0,1]")
         self.period_s = 1.0 / control_hz
+        self.blend_overlap = bool(blend_overlap)
+        self.blend_new_weight_start = float(blend_new_weight_start)
         self._items: deque[TimedAction] = deque()
         self._lock = threading.RLock()
         self._expired = 0
@@ -134,11 +148,52 @@ class TimedActionQueue:
                 return None
             return self._items.popleft()
 
-    def replace_future(self, actions: torch.Tensor, start_time: float, plan_id: int) -> int:
-        plan = ActionPlan(plan_id, actions, start_time=start_time, period_s=self.period_s)
+    def replace_future(
+        self,
+        actions: torch.Tensor,
+        start_time: float,
+        plan_id: int,
+        *,
+        blend_overlap: bool | None = None,
+        blend_new_weight_start: float | None = None,
+    ) -> int:
+        use_blend = self.blend_overlap if blend_overlap is None else bool(blend_overlap)
+        blend_start = (
+            self.blend_new_weight_start
+            if blend_new_weight_start is None
+            else float(blend_new_weight_start)
+        )
+        if not 0.0 <= blend_start <= 1.0:
+            raise ValueError("blend_new_weight_start must be in [0,1]")
+        values = actions.detach().float()
+        if tuple(values.shape) != (PREDICTION_HORIZON, ACTION_DIM):
+            raise ValueError("ACMT-DP replacement requires [16,8]")
         with self._lock:
             kept = [item for item in self._items if item.target_time < start_time]
             removed = len(self._items) - len(kept)
+            if use_blend:
+                # Fuse only values that describe the same wall-clock command.
+                # If planning finishes late, already-expired reserve entries are
+                # absent and therefore cannot be used to leak future actions.
+                old_by_offset: dict[int, TimedAction] = {}
+                tolerance = max(1e-6, self.period_s * 1e-4)
+                for item in self._items:
+                    offset = int(round((item.target_time - float(start_time)) / self.period_s))
+                    if 0 <= offset < EXECUTION_HORIZON:
+                        expected_time = float(start_time) + offset * self.period_s
+                        if abs(item.target_time - expected_time) <= tolerance:
+                            old_by_offset[offset] = item
+                if old_by_offset:
+                    blended = values.clone()
+                    denominator = max(1, EXECUTION_HORIZON - 1)
+                    for offset, old_item in old_by_offset.items():
+                        new_weight = blend_start + (1.0 - blend_start) * offset / denominator
+                        blended[offset] = (
+                            (1.0 - new_weight) * old_item.value.to(values.device)
+                            + new_weight * values[offset]
+                        )
+                    values = blended
+            plan = ActionPlan(plan_id, values, start_time=start_time, period_s=self.period_s)
             self._items.clear()
             self._items.extend(kept)
             self._items.extend(plan.timed_actions())
@@ -148,6 +203,10 @@ class TimedActionQueue:
     def snapshot(self) -> tuple[torch.Tensor, ...]:
         with self._lock:
             return tuple(item.value.clone() for item in self._items)
+
+    def next_target_time(self) -> float | None:
+        with self._lock:
+            return None if not self._items else self._items[0].target_time
 
     def __len__(self) -> int:
         with self._lock:
@@ -196,13 +255,18 @@ class ACMTDPInferenceEngine(InferenceEngine):
         self._ordered_action_keys = ordered_action_keys
         self._task = task
         self._device = torch.device(device or "cpu")
-        self._queue = TimedActionQueue()
+        # The eight reserve commands of the previous plan and the first eight
+        # commands of the replacement plan share timestamps at each 8-step
+        # boundary.  Blend those overlapping samples in the queue; this is an
+        # inference-only change and does not alter the checkpoint.
+        self._queue = TimedActionQueue(blend_overlap=True, blend_new_weight_start=0.25)
         self._planner = ThreadPoolExecutor(max_workers=1, thread_name_prefix="acmt-dp-planner")
         self._tactile_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="acmt-tactile")
         self._future: Future[ActionPlan] | None = None
         self._tactile_future: Future[None] | None = None
         self._next_plan_id = 0
         self._boundary_in_flight = False
+        self._boundary_start_time: float | None = None
         self._current_action_window: dict | None = None
         self._generation = 0
         self._last_hold_log = 0.0
@@ -212,16 +276,16 @@ class ACMTDPInferenceEngine(InferenceEngine):
 
         config = getattr(policy, "config", None)
         if config is None or getattr(config, "control_hz", 30.0) != CONTROL_HZ:
-            raise ValueError("ACMT-DP v3 rollout requires control_hz=30")
+            raise ValueError("ACMT-DP v4/v5 rollout requires control_hz=30")
         if getattr(config, "action_execution_horizon", 8) != EXECUTION_HORIZON:
-            raise ValueError("ACMT-DP v3 rollout requires action_execution_horizon=8")
+            raise ValueError("ACMT-DP v4/v5 rollout requires action_execution_horizon=8")
         if getattr(config, "tactile_history", 4) != 4:
-            raise ValueError("ACMT-DP v3 rollout requires tactile_history=4")
+            raise ValueError("ACMT-DP v4/v5 rollout requires tactile_history=4")
         if (
             getattr(config, "pred_horizon", 16) != PREDICTION_HORIZON
             or getattr(config, "action_dim", 8) != ACTION_DIM
         ):
-            raise ValueError("ACMT-DP v3 rollout requires pred_horizon=16 and action_dim=8")
+            raise ValueError("ACMT-DP v4/v5 rollout requires pred_horizon=16 and action_dim=8")
         if getattr(config, "tactile_source", None) == "tactigen":
             logger.info("ACMT-DP TactiGen uses sync 16/8 runtime; RTC is unsupported")
 
@@ -259,6 +323,7 @@ class ACMTDPInferenceEngine(InferenceEngine):
             self._last_hold_log = 0.0
             self._queue.clear()
             self._boundary_in_flight = False
+            self._boundary_start_time = None
             self._next_plan_id = 0
             with self._policy_lock:
                 self._policy.reset()
@@ -272,14 +337,20 @@ class ACMTDPInferenceEngine(InferenceEngine):
         )
         return self._preprocessor(observation)
 
-    def _plan_now(self, window: dict, plan_id: int, generation: int | None = None) -> ActionPlan:
+    def _plan_now(
+        self,
+        window: dict,
+        plan_id: int,
+        generation: int | None = None,
+        start_time: float | None = None,
+    ) -> ActionPlan:
         if generation is not None and generation != self._generation:
             raise RuntimeError("ACMT-DP plan belongs to a reset episode")
         with self._policy_lock, torch.inference_mode():
             action = self._policy._plan(window)  # type: ignore[attr-defined]
         if tuple(action.shape) != (1, PREDICTION_HORIZON, ACTION_DIM):
             raise RuntimeError(f"ACMT-DP policy must return [1,16,8], got {tuple(action.shape)}")
-        return ActionPlan(plan_id, action[0].cpu())
+        return ActionPlan(plan_id, action[0].cpu(), start_time=start_time)
 
     def _maybe_install_future(self) -> None:
         future = self._future
@@ -291,20 +362,23 @@ class ACMTDPInferenceEngine(InferenceEngine):
             logger.exception("ACMT-DP background plan failed; entering safe hold")
             self._future = None
             self._boundary_in_flight = False
+            self._boundary_start_time = None
             return
         # Keep anything strictly before the completed plan's timestamp and
         # atomically replace only the still-future reserve.
         self._queue.replace_future(plan.actions, plan.start_time, plan.plan_id)
         self._future = None
         self._boundary_in_flight = False
+        self._boundary_start_time = None
 
-    def _submit_from_latest(self) -> None:
+    def _submit_from_latest(self, start_time: float | None = None) -> None:
         if self._future is not None:
             return
         plan_id = self._next_plan_id
         self._next_plan_id += 1
         generation = self._generation
         tactile_future = self._tactile_future
+        plan_start_time = start_time if start_time is not None else self._boundary_start_time
 
         def wait_tactile_and_plan() -> ActionPlan:
             if tactile_future is not None:
@@ -315,7 +389,12 @@ class ACMTDPInferenceEngine(InferenceEngine):
                 window = _clone_tree(self._policy._latest_window)  # type: ignore[attr-defined]
             if window is None:
                 raise RuntimeError("ACMT-DP planner has no observation window")
-            return self._plan_now(window, plan_id, generation=generation)
+            return self._plan_now(
+                window,
+                plan_id,
+                generation=generation,
+                start_time=plan_start_time,
+            )
 
         self._future = self._planner.submit(wait_tactile_and_plan)
 
@@ -327,7 +406,7 @@ class ACMTDPInferenceEngine(InferenceEngine):
             with self._policy_lock:
                 self._policy.observe(observation)  # type: ignore[attr-defined]
                 if getattr(self._policy, "_observed_batch_size", 1) != 1:
-                    raise ValueError("ACMT-DP v3 online rollout requires batch size 1")
+                    raise ValueError("ACMT-DP v4/v5 online rollout requires batch size 1")
                 current_window = _clone_tree(self._policy._latest_window)  # type: ignore[attr-defined]
             self._maybe_install_future()
             if len(self._queue) == 0:
@@ -369,11 +448,17 @@ class ACMTDPInferenceEngine(InferenceEngine):
                     # before a feedback callback arrived, still request a
                     # replacement from the latest completed causal state.
                     self._boundary_in_flight = True
-                    self._submit_from_latest()
+                    if self._boundary_start_time is None:
+                        self._boundary_start_time = self._queue.next_target_time()
+                    self._submit_from_latest(start_time=self._boundary_start_time)
                 return None
             self._current_action_window = current_window
             if len(self._queue) <= EXECUTION_HORIZON:
                 self._boundary_in_flight = True
+                if self._boundary_start_time is None:
+                    # After the eighth action is popped, this is exactly the
+                    # timestamp of the old plan's first reserve action.
+                    self._boundary_start_time = self._queue.next_target_time()
             action_batch = action.to(self._device).unsqueeze(0)
             processed = self._postprocessor(action_batch)
             action_tensor = processed.squeeze(0).cpu()
@@ -397,7 +482,9 @@ class ACMTDPInferenceEngine(InferenceEngine):
                     generation,
                 )
             if self._boundary_in_flight:
-                self._submit_from_latest()
+                if self._boundary_start_time is None:
+                    self._boundary_start_time = self._queue.next_target_time()
+                self._submit_from_latest(start_time=self._boundary_start_time)
 
     def _notify_tactile(self, action: torch.Tensor, window: dict | None, generation: int) -> None:
         # Hold the engine lock while taking the policy lock. Reset uses the

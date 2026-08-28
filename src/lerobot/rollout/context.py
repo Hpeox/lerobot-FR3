@@ -199,13 +199,13 @@ def build_rollout_context(
     is_rtc = isinstance(cfg.inference, RTCInferenceConfig)
     policy_config = cfg.policy
 
-    if policy_config is not None and policy_config.type == "acmt_dp":
+    if policy_config is not None and policy_config.type in {"acmt_dp", "acmt_dp_v5"}:
         if cfg.fps != 30.0:
-            raise ValueError("ACMT-DP v3 rollout requires fps=30")
+            raise ValueError("ACMT-DP v4/v5 rollout requires fps=30")
         if cfg.interpolation_multiplier != 1:
-            raise ValueError("ACMT-DP v3 rollout requires interpolation_multiplier=1")
+            raise ValueError("ACMT-DP v4/v5 rollout requires interpolation_multiplier=1")
         if is_rtc:
-            raise ValueError("ACMT-DP v3 supports only --inference.type=sync; RTC is unsupported")
+            raise ValueError("ACMT-DP v4/v5 supports only --inference.type=sync; RTC is unsupported")
 
     # --- 1. Policy (heavy I/O, but no hardware yet) -------------------
     logger.info("Loading policy from '%s'...", cfg.policy.pretrained_path)

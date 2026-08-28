@@ -20,6 +20,9 @@ from .acmt_dp import (
     ACMTDPPolicy as ACMTDPPolicy,
     make_acmt_dp_pre_post_processors as make_acmt_dp_pre_post_processors,
 )
+from .acmt_dp.configuration_acmt_dp_v5 import ACMTDPV5Config as ACMTDPV5Config
+from .acmt_dp.modeling_acmt_dp_v5 import ACMTDPV5Policy as ACMTDPV5Policy
+from .acmt_dp.processor_acmt_dp_v5 import make_acmt_dp_v5_pre_post_processors as make_acmt_dp_v5_pre_post_processors
 from .act.configuration_act import ACTConfig as ACTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
 from .eo1.configuration_eo1 import EO1Config as EO1Config
@@ -53,6 +56,9 @@ __all__ = [
     "ACMTDPPolicy",
     "ACMTDPCenter480ProcessorStep",
     "make_acmt_dp_pre_post_processors",
+    "ACMTDPV5Config",
+    "ACMTDPV5Policy",
+    "make_acmt_dp_v5_pre_post_processors",
     "ACTConfig",
     "DiffusionConfig",
     "EO1Config",
