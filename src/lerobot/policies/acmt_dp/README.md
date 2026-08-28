@@ -63,3 +63,40 @@ lerobot-convert-acmt-dp-checkpoint \
   --policy-checkpoint /path/to/native_dp_v4/none/scratch/seed42/best.pt \
   --output-root outputs/acmt_dp
 ```
+
+## Native-DP v5
+
+The v5 implementation follows upstream commit `f6306c9` and is selected with
+`--policy.type=acmt_dp_v5`. It supports `none`, `real`, and `tactigen` tactile
+modes; `tactigen` reuses a task-matched real policy checkpoint and embeds one
+frozen TactiGen generator.
+
+The independent policy type `acmt_dp_v5` loads only checkpoints with schema
+`acmt_dp.native_dp_v5_hybrid`. It keeps the raw four-camera 4:3 input and
+performs resize `240x320`, center crop `216x288`, and `[0,1] -> [-1,1]`
+normalization online. Each camera has its own scratch ResNet18Conv with
+GroupNorm and a 32-point SpatialSoftmax, producing 64 values; no BatchNorm is
+present. The observation history is four frames with official first-frame
+padding. The internal 19-step prediction is exposed as
+`prediction_raw[:,3:19]` (`[B,16,8]`), and the runtime queue executes its first
+eight actions.
+
+Convert v5 checkpoints with the separate converter; it never accepts v3/v4
+artifacts:
+
+```bash
+python -m lerobot.scripts.convert_acmt_dp_v5_checkpoint \
+  --task peg --mode real \
+  --policy-checkpoint /data2/cym/16mm_peg_in_hole/native_dp_v5/real/scratch/seed42/best.pt \
+  --output-root outputs/acmt_dp_v5
+```
+
+Launch with `--policy.type=acmt_dp_v5` and choose
+`--policy.tactile_source=none|real|tactigen`. A real v5 policy can run with
+`real`, while `tactigen` additionally requires the task-matched frozen ACMT
+generator inputs. Memmap files are training-only and are not read by this
+runtime. DDIM uses `eta=0`; the policy keeps one initial noise tensor per
+episode and clears it on `reset()`, so replanning does not randomly switch
+between action modes. The 16/8 rollout keeps eight reserve commands and
+blends timestamp-overlapping reserve/execution commands from `0.25` new-plan
+weight at the boundary.
