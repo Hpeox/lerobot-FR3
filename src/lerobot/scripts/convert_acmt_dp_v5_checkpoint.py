@@ -151,8 +151,8 @@ def _make_config(
         if diffusion_inference_steps is None
         else diffusion_inference_steps
     )
-    if inference_steps not in (8, 100):
-        raise ValueError("v5 diffusion_inference_steps must be 8 or 100")
+    if inference_steps != 8:
+        raise ValueError("v5 diffusion_inference_steps must be 8")
     return ACMTDPV5Config(
         tactile_source=mode,
         checkpoint_tactile_source=expected_source,
@@ -181,6 +181,7 @@ def _make_config(
         spatial_num_keypoints=32,
         diffusion_train_steps=int(source_config["diffusion_train_steps"]),
         diffusion_inference_steps=inference_steps,
+        inference_noise_seed=42,
         unet_dims=tuple(source_config["unet_dims"]),
         unet_kernel_size=int(source_config["unet_kernel_size"]),
         diffusion_step_embed_dim=int(source_config["diffusion_step_embed_dim"]),
@@ -282,8 +283,8 @@ def convert_one(
             "task_variant": task,
             "tactile_source": mode,
             "policy_checkpoint_tactile_source": "real" if mode == "tactigen" else mode,
-            "protocol": "synchronous_select_action",
-            "online_protocol": "synchronous_select_action",
+            "protocol": "rolling_16_8",
+            "online_protocol": "rolling_16_8",
             "action_alignment": "raw_internal_19_slice_3_19_public_16",
             "diffusion_train_steps": int(config.diffusion_train_steps),
             "diffusion_inference_steps": int(config.diffusion_inference_steps),
@@ -292,8 +293,9 @@ def convert_one(
                 "inference_steps": int(config.diffusion_inference_steps),
                 "ddim_eta": 0.0,
                 "initial_noise": "fixed_per_episode",
+                "inference_noise_seed": 42,
             },
-            "runtime": {"reserve_horizon": 0, "overlap_blending": False},
+            "runtime": {"reserve_horizon": 8, "overlap_blending": False},
             "tactile_history": 4,
             "camera_order": ["top", "side", "wrist_left", "wrist_right"],
             "camera_keys": list(config.camera_keys),
@@ -303,6 +305,7 @@ def convert_one(
             "feature_dim": 64,
             "tactile_dim": 160,
             "action_execution_horizon": 8,
+            "inference_noise_seed": 42,
             "control_hz": 30.0,
             "source_checkpoint": str(source_checkpoint),
             "source_checkpoint_sha256": source_sha,
@@ -357,8 +360,8 @@ def main() -> None:
     parser.add_argument(
         "--diffusion-inference-steps",
         type=int,
-        choices=(8, 100),
-        help="Override the checkpoint's online DDIM step count (default: checkpoint value).",
+        choices=(8,),
+        help="Native-DP v5 uses the checkpoint's fixed 8-step online DDIM configuration.",
     )
     args = parser.parse_args()
     tasks = TASKS if args.task == "all" else (args.task,)

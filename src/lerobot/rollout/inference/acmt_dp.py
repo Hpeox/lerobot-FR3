@@ -1,9 +1,4 @@
-"""Compatibility adapter for the former Native-DP v4 rolling protocol.
-
-The inference factory now routes ACMT-DP through ``SyncInferenceEngine``.
-This module remains importable for compatibility with focused queue tests and
-explicit callers that still need the former backend.
-"""
+"""Native-DP 16/8 rolling inference adapter for ACMT-DP v4/v5."""
 
 from __future__ import annotations
 
@@ -249,6 +244,7 @@ class ACMTDPInferenceEngine(InferenceEngine):
         self._planner = ThreadPoolExecutor(max_workers=1, thread_name_prefix="acmt-dp-planner")
         self._tactile_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="acmt-tactile")
         self._future: Future[ActionPlan] | None = None
+        self._future_generation: int | None = None
         self._tactile_future: Future[None] | None = None
         self._next_plan_id = 0
         self._boundary_in_flight = False
@@ -270,20 +266,21 @@ class ACMTDPInferenceEngine(InferenceEngine):
 
         config = getattr(policy, "config", None)
         if config is None or getattr(config, "control_hz", 30.0) != CONTROL_HZ:
-            raise ValueError("Native-DP v4 rollout requires control_hz=30")
+            raise ValueError("Native-DP v4/v5 rollout requires control_hz=30")
         if getattr(config, "action_execution_horizon", 8) != EXECUTION_HORIZON:
-            raise ValueError("Native-DP v4 rollout requires action_execution_horizon=8")
+            raise ValueError("Native-DP v4/v5 rollout requires action_execution_horizon=8")
         if getattr(config, "tactile_history", 4) != 4:
-            raise ValueError("Native-DP v4 rollout requires tactile_history=4")
+            raise ValueError("Native-DP v4/v5 rollout requires tactile_history=4")
         if (
             getattr(config, "pred_horizon", 16) != PREDICTION_HORIZON
             or getattr(config, "action_dim", 8) != ACTION_DIM
         ):
-            raise ValueError("Native-DP v4 rollout requires pred_horizon=16 and action_dim=8")
-        if getattr(config, "checkpoint_schema_version", 4) != 4:
-            raise ValueError("Native-DP v4 rollout requires checkpoint_schema_version=4")
+            raise ValueError("Native-DP v4/v5 rollout requires pred_horizon=16 and action_dim=8")
+        schema_version = getattr(config, "checkpoint_schema_version", 4)
+        if schema_version not in (4, 5):
+            raise ValueError("Native-DP v4/v5 rollout requires checkpoint_schema_version=4 or 5")
         if getattr(config, "tactile_source", None) == "tactigen":
-            logger.info("ACMT-DP TactiGen uses sync 16/8 runtime; RTC is unsupported")
+            logger.info("ACMT-DP TactiGen uses rolling 16/8 runtime; RTC is unsupported")
 
     def start(self) -> None:
         self._stopped = False
@@ -296,6 +293,7 @@ class ACMTDPInferenceEngine(InferenceEngine):
             if future is not None:
                 future.cancel()
             self._future = None
+            self._future_generation = None
             if self._tactile_future is not None:
                 self._tactile_future.cancel()
             self._tactile_future = None
@@ -312,6 +310,7 @@ class ACMTDPInferenceEngine(InferenceEngine):
             if self._future is not None:
                 self._future.cancel()
             self._future = None
+            self._future_generation = None
             if self._tactile_future is not None:
                 self._tactile_future.cancel()
             self._tactile_future = None
@@ -323,8 +322,9 @@ class ACMTDPInferenceEngine(InferenceEngine):
             self._queue.clear()
             self._boundary_in_flight = False
             self._next_plan_id = 0
-            with self._policy_state_lock:
-                self._policy.reset()
+            with self._plan_lock:
+                with self._policy_state_lock:
+                    self._policy.reset()
             self._preprocessor.reset()
             self._postprocessor.reset()
 
@@ -389,10 +389,12 @@ class ACMTDPInferenceEngine(InferenceEngine):
         return self._preprocessor(observation)
 
     def _plan_now(self, window: dict, plan_id: int, generation: int | None = None) -> ActionPlan:
-        if generation is not None and generation != self._generation:
-            raise RuntimeError("ACMT-DP plan belongs to a reset episode")
         with self._plan_lock, torch.inference_mode():
+            if generation is not None and generation != self._generation:
+                raise RuntimeError("ACMT-DP plan belongs to a reset episode")
             action = self._policy._plan(window)  # type: ignore[attr-defined]
+            if generation is not None and generation != self._generation:
+                raise RuntimeError("ACMT-DP plan belongs to a reset episode")
         if tuple(action.shape) != (1, PREDICTION_HORIZON, ACTION_DIM):
             raise RuntimeError(f"ACMT-DP policy must return [1,16,8], got {tuple(action.shape)}")
         return ActionPlan(plan_id, action[0].cpu())
@@ -401,12 +403,18 @@ class ACMTDPInferenceEngine(InferenceEngine):
         future = self._future
         if future is None or not future.done():
             return
+        if self._future_generation != self._generation:
+            self._future = None
+            self._future_generation = None
+            self._boundary_in_flight = False
+            return
         try:
             plan = future.result()
         except Exception as exc:
             self._failure = exc
             logger.exception("ACMT-DP background plan failed")
             self._future = None
+            self._future_generation = None
             self._boundary_in_flight = False
             return
         now = time.monotonic()
@@ -424,6 +432,7 @@ class ACMTDPInferenceEngine(InferenceEngine):
         )
         self._plan_started_at = None
         self._future = None
+        self._future_generation = None
         self._boundary_in_flight = False
 
     def _submit_plan(self, window: dict | None = None) -> None:
@@ -454,6 +463,7 @@ class ACMTDPInferenceEngine(InferenceEngine):
             return self._plan_now(plan_window, plan_id, generation=generation)
 
         self._future = self._planner.submit(wait_tactile_and_plan)
+        self._future_generation = generation
 
     def get_action(self, obs_frame: dict | None) -> torch.Tensor | None:
         if obs_frame is None:

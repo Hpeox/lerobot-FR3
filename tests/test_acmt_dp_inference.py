@@ -40,14 +40,14 @@ class _RecordingProcessor(_IdentityProcessor):
 
 
 class _FakePolicy:
-    def __init__(self, mode: str, *, block_background: bool = False, fail_background: bool = False) -> None:
+    def __init__(self, mode: str, *, block_background: bool = False, fail_background: bool = False, schema_version: int = 4) -> None:
         self.config = SimpleNamespace(
             control_hz=CONTROL_HZ,
             action_execution_horizon=EXECUTION_HORIZON,
             tactile_history=4,
             pred_horizon=PREDICTION_HORIZON,
             action_dim=ACTION_DIM,
-            checkpoint_schema_version=4,
+            checkpoint_schema_version=schema_version,
             tactile_source=mode,
         )
         self.robot_type = "fr3"
@@ -105,6 +105,16 @@ def _make_engine(policy: _FakePolicy) -> ACMTDPInferenceEngine:
     engine.reset()
     engine.start()
     return engine
+
+
+def test_v5_policy_uses_the_same_rolling_engine_protocol() -> None:
+    engine = _make_engine(_FakePolicy("none", schema_version=5))
+    try:
+        assert engine.ready
+        assert engine.get_action(_observation(0)) is not None
+        assert len(engine._queue) == PREDICTION_HORIZON - 1
+    finally:
+        engine.stop()
 
 
 def _observation(sequence: int) -> dict[str, torch.Tensor]:

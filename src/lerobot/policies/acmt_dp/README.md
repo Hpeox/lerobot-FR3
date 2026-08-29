@@ -80,7 +80,7 @@ normalization online. Each camera has its own scratch ResNet18Conv with
 GroupNorm and a 32-point SpatialSoftmax, producing 64 values; no BatchNorm is
 present. The observation history is four frames with official first-frame
 padding. The internal 19-step prediction is exposed as
-`prediction_raw[:,3:19]` (`[B,16,8]`), and synchronous select_action returns its first `[B,8]` action.
+`prediction_raw[:,3:19]` (`[B,16,8]`); the rolling v5 engine consumes one action per 30 Hz deadline.
 
 Convert v5 checkpoints with the separate converter; it never accepts v3/v4
 artifacts:
@@ -96,6 +96,9 @@ Launch with `--policy.type=acmt_dp_v5` and choose
 `--policy.tactile_source=none|real|tactigen`. A real v5 policy can run with
 `real`, while `tactigen` additionally requires the task-matched frozen ACMT
 generator inputs. Memmap files are training-only and are not read by this
-runtime. DDIM uses `eta=0`; the policy keeps one initial noise tensor per
-episode and clears it on `reset()`, so replanning does not randomly switch
-between action modes. The local deployment uses LeRobot synchronous select_action; it does not maintain reserve commands, overlap blending, or a background ACMT-DP planner.
+runtime. DDIM uses `eta=0`; the policy creates initial noise with private seed
+`42`, reuses it for all replans in an episode, and clears it on `reset()`. The
+rolling 16/8 engine consumes one action at each 30 Hz deadline, starts a
+background refill when eight actions remain, replaces only future deadlines,
+skips expired actions, and clips/logs outputs to checkpoint action bounds.
+Overlap blending is disabled.

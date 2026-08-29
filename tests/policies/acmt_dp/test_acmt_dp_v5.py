@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from types import MethodType
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -68,6 +68,7 @@ def _bare_policy(mode: str, generator: object | None = None) -> ACMTDPV5Policy:
     policy = object.__new__(ACMTDPV5Policy)
     nn.Module.__init__(policy)
     policy.config = _config(mode)
+    policy.model_horizon = ((policy.config.internal_horizon + 7) // 8) * 8
     policy.tactile_generator = generator
     policy.reset()
     return policy
@@ -102,8 +103,9 @@ def test_v5_rejects_legacy_schema_modes_and_networks() -> None:
 def test_v5_fixes_the_native_diffusion_step_budget() -> None:
     assert _config().diffusion_train_steps == 100
     assert _config().diffusion_inference_steps == 8
-    assert ACMTDPV5Config(diffusion_inference_steps=100, device="cpu").diffusion_inference_steps == 100
-    with pytest.raises(ValueError, match="one of"):
+    with pytest.raises(ValueError, match="diffusion_inference_steps=8"):
+        ACMTDPV5Config(diffusion_inference_steps=100, device="cpu")
+    with pytest.raises(ValueError, match="diffusion_inference_steps=8"):
         ACMTDPV5Config(diffusion_inference_steps=7, device="cpu")
 
 
@@ -250,6 +252,36 @@ def test_v5_tactigen_consumes_only_successful_action_and_resets() -> None:
     assert generator.reset_count == 2
     policy.predict_action_chunk(batch)
     assert torch.count_nonzero(tactile_seen[-1]) == 0
+
+
+def _stubbed_plan_policy(unnormalize) -> ACMTDPV5Policy:
+    policy = _bare_policy("none")
+    policy.encode_observation = lambda _observation: torch.zeros(1, policy.config.global_cond_dim)
+    policy.noise_scheduler = SimpleNamespace(
+        timesteps=(),
+        set_timesteps=lambda _steps, device=None: None,
+    )
+    policy.normalizer = {"action": SimpleNamespace(unnormalize=unnormalize)}
+    return policy
+
+
+def test_v5_seed42_noise_is_reused_within_and_across_episodes() -> None:
+    policy = _stubbed_plan_policy(lambda value: value)
+    first = policy._plan({})
+    second = policy._plan({})
+    torch.testing.assert_close(first, second)
+    policy.reset()
+    third = policy._plan({})
+    torch.testing.assert_close(first, third)
+
+
+def test_v5_plan_clips_every_action_dimension_to_checkpoint_bounds(caplog) -> None:
+    policy = _stubbed_plan_policy(lambda value: torch.full_like(value, 2.0))
+    with caplog.at_level("WARNING", logger="lerobot.policies.acmt_dp.modeling_acmt_dp_v5"):
+        action = policy._plan({})
+    assert torch.all(action == 1.0)
+    assert "action clipped to training bounds" in caplog.text
+    assert "dimensions=[0, 1, 2, 3, 4, 5, 6, 7]" in caplog.text
 
 
 def test_v5_action_public_and_execution_shapes() -> None:

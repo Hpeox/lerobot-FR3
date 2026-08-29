@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,8 @@ from .modeling_native_v5 import FrameTactileEncoder, NativeV5LinearNormalizer, N
 from .modeling_tactile_generator import TactiGenForceFieldModel
 from .modeling_unet import ConditionalUnet1D
 from .visual_preprocess import prepare_for_frozen_encoder
+
+logger = logging.getLogger(__name__)
 
 
 def _force_side(key: str, value: Tensor) -> Tensor:
@@ -170,6 +173,7 @@ class ACMTDPV5Policy(PreTrainedPolicy):
         self._latest_window: dict[str, Tensor] | None = None
         self._previous_action_chunk: Tensor | None = None
         self._fixed_initial_noise: Tensor | None = None
+        self._noise_generator: torch.Generator | None = None
         self._observed_batch_size: int | None = None
 
     @staticmethod
@@ -310,6 +314,26 @@ class ACMTDPV5Policy(PreTrainedPolicy):
         self._latest_window = self._append_history(current)
         return self._latest_window
 
+    def _clip_action_bounds(self, action: Tensor) -> Tensor:
+        if not torch.isfinite(action).all():
+            raise RuntimeError("ACMT-DP v5 policy produced non-finite actions")
+        minimum = torch.as_tensor(self.config.action_min, device=action.device, dtype=action.dtype)
+        maximum = torch.as_tensor(self.config.action_max, device=action.device, dtype=action.dtype)
+        clipped = torch.maximum(torch.minimum(action, maximum), minimum)
+        clipped_mask = clipped != action
+        if clipped_mask.any():
+            by_dimension = clipped_mask.reshape(-1, self.config.action_dim)
+            raw_minimum = action.reshape(-1, self.config.action_dim).amin(dim=0)
+            raw_maximum = action.reshape(-1, self.config.action_dim).amax(dim=0)
+            logger.warning(
+                "ACMT-DP v5 action clipped to training bounds: dimensions=%s counts=%s raw_min=%s raw_max=%s",
+                [index for index, value in enumerate(by_dimension.any(dim=0).tolist()) if value],
+                by_dimension.sum(dim=0).to(device="cpu").tolist(),
+                raw_minimum.to(device="cpu").tolist(),
+                raw_maximum.to(device="cpu").tolist(),
+            )
+        return clipped
+
     @torch.no_grad()
     def _generate_tactile(self, previous: dict[str, Tensor], executed_action: Tensor) -> Tensor:
         if self.tactile_generator is None:
@@ -379,11 +403,19 @@ class ACMTDPV5Policy(PreTrainedPolicy):
         condition = self.encode_observation(observation)
         expected = (condition.shape[0], self.config.internal_horizon, self.config.action_dim)
         if noise is None:
-            if self._fixed_initial_noise is None or tuple(self._fixed_initial_noise.shape) != expected:
+            if (
+                self._fixed_initial_noise is None
+                or tuple(self._fixed_initial_noise.shape) != expected
+                or self._fixed_initial_noise.device != condition.device
+                or self._fixed_initial_noise.dtype != condition.dtype
+            ):
+                self._noise_generator = torch.Generator(device=condition.device)
+                self._noise_generator.manual_seed(int(self.config.inference_noise_seed))
                 self._fixed_initial_noise = torch.randn(
                     expected,
                     device=condition.device,
                     dtype=condition.dtype,
+                    generator=self._noise_generator,
                 )
             noise = self._fixed_initial_noise
         elif tuple(noise.shape) != expected:
@@ -394,6 +426,7 @@ class ACMTDPV5Policy(PreTrainedPolicy):
             self._fixed_initial_noise = (
                 noise.detach().to(device=condition.device, dtype=condition.dtype).clone()
             )
+            self._noise_generator = None
         sample = F.pad(
             noise.to(device=condition.device, dtype=condition.dtype),
             (0, 0, 0, self.model_horizon - self.config.internal_horizon),
@@ -407,6 +440,7 @@ class ACMTDPV5Policy(PreTrainedPolicy):
             predicted = self.noise_predictor(sample, timestep, global_cond=condition)
             sample = self.noise_scheduler.step(predicted, timestep, sample, eta=0.0).prev_sample
         raw = self.normalizer["action"].unnormalize(sample[..., : self.config.internal_horizon, :])
+        raw = self._clip_action_bounds(raw)
         return raw[..., self.config.pad_before : self.config.pad_before + self.config.public_pred_horizon, :]
 
     @torch.no_grad()

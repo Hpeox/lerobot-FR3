@@ -453,13 +453,16 @@ def test_visual_feature_coverage_requires_every_policy_camera_but_allows_robot_s
         _validate_visual_feature_coverage(cam1 | cam2, cam1)
 
 
-def test_create_inference_engine_acmt_dp_v5_uses_inline_sync_backend():
-    from lerobot.rollout import SyncInferenceConfig, SyncInferenceEngine, create_inference_engine
+def test_create_inference_engine_acmt_dp_v5_uses_rolling_engine():
+    from lerobot.rollout import ACMTDPInferenceEngine, SyncInferenceConfig, create_inference_engine
 
     policy = SimpleNamespace(
         name="acmt_dp_v5",
+        config=SimpleNamespace(
+            use_amp=False, control_hz=30.0, action_execution_horizon=8, tactile_history=4,
+            pred_horizon=16, action_dim=8, checkpoint_schema_version=5, tactile_source="none",
+        ),
         robot_type="fr3",
-        config=SimpleNamespace(use_amp=False),
     )
     engine = create_inference_engine(
         SyncInferenceConfig(),
@@ -474,8 +477,8 @@ def test_create_inference_engine_acmt_dp_v5_uses_inline_sync_backend():
         fps=30.0,
         device="cpu",
     )
-    assert type(engine) is SyncInferenceEngine
-    assert not hasattr(engine, "_queue")
+    assert isinstance(engine, ACMTDPInferenceEngine)
+    assert hasattr(engine, "_queue")
 
 def test_sync_engine_forwards_acmt_dp_v5_action_feedback():
     from lerobot.rollout import SyncInferenceEngine

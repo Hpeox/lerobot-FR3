@@ -78,6 +78,7 @@ class ACMTDPV5Config(PreTrainedConfig):
 
     diffusion_train_steps: int = 100
     diffusion_inference_steps: int = 8
+    inference_noise_seed: int = 42
     unet_dims: tuple[int, ...] = (256, 512, 1024)
     unet_kernel_size: int = 5
     diffusion_step_embed_dim: int = 128
@@ -174,8 +175,14 @@ class ACMTDPV5Config(PreTrainedConfig):
             raise ValueError("v5 requires diffusion step embedding dim 128")
         if not self.cond_predict_scale:
             raise ValueError("v5 requires cond_predict_scale=true")
-        if self.diffusion_train_steps != 100 or self.diffusion_inference_steps not in (8, 100):
-            raise ValueError("v5 requires diffusion_train_steps=100 and diffusion_inference_steps to be one of: 8, 100")
+        if self.diffusion_train_steps != 100 or self.diffusion_inference_steps != 8:
+            raise ValueError("v5 requires diffusion_train_steps=100 and diffusion_inference_steps=8")
+        if (
+            isinstance(self.inference_noise_seed, bool)
+            or not isinstance(self.inference_noise_seed, int)
+            or self.inference_noise_seed < 0
+        ):
+            raise ValueError("v5 inference_noise_seed must be a non-negative integer")
         if self.control_hz != 30.0:
             raise ValueError("v5 fixes control_hz=30")
         for name, value, size in (
