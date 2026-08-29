@@ -476,3 +476,26 @@ def test_create_inference_engine_acmt_dp_v5_uses_inline_sync_backend():
     )
     assert type(engine) is SyncInferenceEngine
     assert not hasattr(engine, "_queue")
+
+def test_sync_engine_forwards_acmt_dp_v5_action_feedback():
+    from lerobot.rollout import SyncInferenceEngine
+
+    policy = MagicMock(name="policy")
+    policy.name = "acmt_dp_v5"
+    policy.config.use_amp = False
+    engine = SyncInferenceEngine(
+        policy=policy,
+        preprocessor=MagicMock(),
+        postprocessor=MagicMock(),
+        dataset_features={},
+        ordered_action_keys=[],
+        task="gear_insert_big2small",
+        device="cpu",
+        robot_type="fr3",
+    )
+    action = torch.ones(1, 8)
+    observation = {"observation": 1}
+
+    engine.notify_action_executed(action, observation)
+
+    policy.notify_action_executed.assert_called_once_with(action, observation)

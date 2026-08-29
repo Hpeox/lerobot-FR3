@@ -131,7 +131,7 @@ class SyncInferenceEngine(InferenceEngine):
         sent_action: dict[str, Any],
     ) -> None:
         """Log one accepted ACMT-DP action for diagnosing target jumps."""
-        if getattr(self._policy, "name", None) != "acmt_dp":
+        if getattr(self._policy, "name", None) not in {"acmt_dp", "acmt_dp_v5"}:
             return
         with self._diagnostic_lock:
             if self._first_action_diagnostic_emitted:
@@ -161,7 +161,7 @@ class SyncInferenceEngine(InferenceEngine):
         ``tactigen`` mode, so preserve that hook without changing other
         synchronous policies.
         """
-        if getattr(self._policy, "name", None) != "acmt_dp":
+        if getattr(self._policy, "name", None) not in {"acmt_dp", "acmt_dp_v5"}:
             return
         feedback = getattr(self._policy, "notify_action_executed", None)
         if callable(feedback):
