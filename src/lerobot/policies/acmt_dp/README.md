@@ -19,6 +19,15 @@ resize to 256, center crop to 224, clamp/round to uint8, divide by 255, and
 ImageNet normalization. TactiGen wrist RGB-D retains the existing center480 to
 128 preprocessing on its private branch.
 
+FR3 runtime observations retain the physical RealSense IDs `camera.cam1` through
+`camera.cam4`. The v4 processor adapts the current deployment to the semantic
+policy views by reading them in the order `camera.cam3`, `camera.cam4`,
+`camera.cam1`, `camera.cam2` and writing those values into the policy slots
+`top`, `side`, `wrist_left`, and `wrist_right`. This is a policy-side input
+permutation; RealSense topics, SensorHub ordering, and the checkpoint weights
+are unchanged. The mapping assumes the current mounting contract and must be
+updated with the processor configuration if the cameras are remounted.
+
 Native v4 uses a shared scratch ResNet18, an 8-D Gaussian-normalized state,
 the shared spatial force-field CNN (160-D per frame, no GRU), and a configurable
 8-step or 100-step diffusion sampler. Its condition is four frames of four

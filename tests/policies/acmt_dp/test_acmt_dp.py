@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import MethodType
 
@@ -23,7 +24,11 @@ from lerobot.policies.acmt_dp.configuration_acmt_dp import (
     rgb_key,
 )
 from lerobot.policies.acmt_dp.modeling_acmt_dp import ACMTDPPolicy
-from lerobot.policies.acmt_dp.processor_acmt_dp import ACMTDPNativeV4ProcessorStep
+from lerobot.processor import PolicyProcessorPipeline
+from lerobot.policies.acmt_dp.processor_acmt_dp import (
+    ACMT_DP_DEFAULT_SOURCE_CAMERA_KEYS,
+    ACMTDPNativeV4ProcessorStep,
+)
 from lerobot.policies.factory import get_policy_class, make_policy_config
 from lerobot.scripts.convert_acmt_dp_checkpoint import _make_config, _validate_v4_scratch
 from lerobot.utils.constants import OBS_STATE
@@ -158,15 +163,90 @@ def test_converter_can_override_inference_steps() -> None:
     assert config.diffusion_inference_steps == 100
 
 
-def test_native_processor_preserves_raw_four_camera_rgb() -> None:
+def test_native_processor_maps_runtime_camera_order_to_v4_semantic_order() -> None:
     config = _config()
     step = ACMTDPNativeV4ProcessorStep(camera_keys=config.camera_keys)
+    runtime_cameras = ("camera.cam1", "camera.cam2", "camera.cam3", "camera.cam4")
     observation = {
-        rgb_key(camera): torch.zeros(480, 640, 3, dtype=torch.uint8) for camera in config.camera_keys
+        rgb_key(camera): torch.full((224, 224, 3), value, dtype=torch.uint8)
+        for value, camera in enumerate(runtime_cameras, start=1)
     }
+    original = {key: value.clone() for key, value in observation.items()}
+
     processed = step.observation(observation)
-    assert processed[rgb_key("camera.cam1")].shape == (1, 3, 480, 640)
-    assert processed[rgb_key("camera.cam1")].dtype is torch.uint8
+
+    expected_values = {
+        "camera.cam1": 3,
+        "camera.cam2": 4,
+        "camera.cam3": 1,
+        "camera.cam4": 2,
+    }
+    assert step.source_camera_keys == ACMT_DP_DEFAULT_SOURCE_CAMERA_KEYS
+    for camera, expected in expected_values.items():
+        value = processed[rgb_key(camera)]
+        assert value.shape == (1, 3, 224, 224)
+        assert value.dtype is torch.uint8
+        assert torch.all(value == expected)
+    for key, value in original.items():
+        assert torch.equal(observation[key], value)
+
+
+def test_native_processor_validates_source_camera_mapping() -> None:
+    with pytest.raises(ValueError, match="source_camera_keys"):
+        ACMTDPNativeV4ProcessorStep(
+            camera_keys=("camera.cam1", "camera.cam2", "camera.cam3", "camera.cam4"),
+            source_camera_keys=("camera.cam1",) * 4,
+        )
+
+
+def test_native_processor_serializes_and_defaults_source_camera_mapping() -> None:
+    step = ACMTDPNativeV4ProcessorStep(
+        camera_keys=("camera.cam1", "camera.cam2", "camera.cam3", "camera.cam4"),
+    )
+    saved = step.get_config()
+    assert saved["source_camera_keys"] == list(ACMT_DP_DEFAULT_SOURCE_CAMERA_KEYS)
+
+    legacy = dict(saved)
+    legacy.pop("source_camera_keys")
+    restored = ACMTDPNativeV4ProcessorStep(**legacy)
+    assert restored.source_camera_keys == ACMT_DP_DEFAULT_SOURCE_CAMERA_KEYS
+
+
+def test_legacy_processor_json_loads_without_source_camera_mapping(tmp_path) -> None:
+    pipeline = PolicyProcessorPipeline(
+        steps=[ACMTDPNativeV4ProcessorStep(camera_keys=_config().camera_keys)],
+        name="policy_preprocessor",
+    )
+    pipeline.save_pretrained(tmp_path, config_filename="policy_preprocessor.json")
+    config_path = tmp_path / "policy_preprocessor.json"
+    payload = json.loads(config_path.read_text())
+    payload["steps"][0]["config"].pop("source_camera_keys")
+    config_path.write_text(json.dumps(payload))
+
+    loaded = PolicyProcessorPipeline.from_pretrained(
+        tmp_path,
+        config_filename="policy_preprocessor.json",
+    )
+
+    assert loaded.steps[0].source_camera_keys == ACMT_DP_DEFAULT_SOURCE_CAMERA_KEYS
+
+
+def test_tactigen_processor_maps_wrist_depth_sources() -> None:
+    step = ACMTDPNativeV4ProcessorStep(
+        camera_keys=("camera.cam1", "camera.cam2", "camera.cam3", "camera.cam4"),
+        tactile_source="tactigen",
+    )
+    observation = {
+        rgb_key(camera): torch.zeros(224, 224, 3, dtype=torch.uint8)
+        for camera in ("camera.cam1", "camera.cam2", "camera.cam3", "camera.cam4")
+    }
+    observation[depth_key("camera.cam1")] = torch.full((128, 128, 1), 1.0)
+    observation[depth_key("camera.cam2")] = torch.full((128, 128, 1), 2.0)
+
+    processed = step.observation(observation)
+
+    assert torch.all(processed[depth_key("camera.cam3")] == 1.0)
+    assert torch.all(processed[depth_key("camera.cam4")] == 2.0)
 
 
 def test_real_tactile_layout_and_v4_inputs() -> None:

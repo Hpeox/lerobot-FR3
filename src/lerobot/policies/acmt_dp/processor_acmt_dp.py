@@ -31,6 +31,14 @@ from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PR
 from .configuration_acmt_dp import ACMTDPConfig, depth_key, rgb_key
 
 
+ACMT_DP_DEFAULT_SOURCE_CAMERA_KEYS = (
+    "camera.cam3",
+    "camera.cam4",
+    "camera.cam1",
+    "camera.cam2",
+)
+
+
 def _as_bchw(value: Any, channels: int, key: str) -> torch.Tensor:
     tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
     if tensor.ndim == 3:
@@ -57,29 +65,50 @@ def _as_bchw(value: Any, channels: int, key: str) -> torch.Tensor:
 @ProcessorStepRegistry.register(name="acmt_dp_native_v4_processor")
 class ACMTDPNativeV4ProcessorStep(ObservationProcessorStep):
     camera_keys: tuple[str, ...]
+    source_camera_keys: tuple[str, ...] = ACMT_DP_DEFAULT_SOURCE_CAMERA_KEYS
     wrist_camera_keys: tuple[str, str] = ("camera.cam3", "camera.cam4")
     tactile_source: str = "none"
     visual_preprocess: str = "resize256_center224_imagenet"
 
+    def __post_init__(self) -> None:
+        self.camera_keys = tuple(self.camera_keys)
+        self.source_camera_keys = tuple(self.source_camera_keys)
+        self.wrist_camera_keys = tuple(self.wrist_camera_keys)
+        if len(self.camera_keys) != 4 or len(set(self.camera_keys)) != 4:
+            raise ValueError("ACMT-DP v4 camera_keys must contain four distinct cameras")
+        if len(self.source_camera_keys) != 4 or len(set(self.source_camera_keys)) != 4:
+            raise ValueError("ACMT-DP v4 source_camera_keys must contain four distinct cameras")
+        if set(self.source_camera_keys) != set(self.camera_keys):
+            raise ValueError("ACMT-DP v4 source_camera_keys must match camera_keys")
+        if len(self.wrist_camera_keys) != 2 or len(set(self.wrist_camera_keys)) != 2:
+            raise ValueError("ACMT-DP v4 wrist_camera_keys must contain two distinct cameras")
+        if not set(self.wrist_camera_keys).issubset(self.camera_keys):
+            raise ValueError("ACMT-DP v4 wrist_camera_keys must be included in camera_keys")
+
     def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
+        source = dict(observation)
         result = dict(observation)
-        expected_cameras = self.camera_keys
-        for camera in expected_cameras:
-            key = rgb_key(camera)
-            if key not in result:
-                raise KeyError(f"ACMT-DP v4 observation is missing {key}")
-            result[key] = _as_bchw(result[key], 3, key)
+        for target_camera, source_camera in zip(self.camera_keys, self.source_camera_keys):
+            source_key = rgb_key(source_camera)
+            target_key = rgb_key(target_camera)
+            if source_key not in source:
+                raise KeyError(f"ACMT-DP v4 observation is missing {source_key}")
+            result[target_key] = _as_bchw(source[source_key], 3, source_key)
         if self.tactile_source == "tactigen":
-            for camera in self.wrist_camera_keys:
-                key = depth_key(camera)
-                if key not in result:
-                    raise KeyError(f"tactigen observation is missing generator depth {key}")
-                result[key] = _as_bchw(result[key], 1, key)
+            source_by_target = dict(zip(self.camera_keys, self.source_camera_keys))
+            for target_camera in self.wrist_camera_keys:
+                source_camera = source_by_target[target_camera]
+                source_key = depth_key(source_camera)
+                target_key = depth_key(target_camera)
+                if source_key not in source:
+                    raise KeyError(f"tactigen observation is missing generator depth {source_key}")
+                result[target_key] = _as_bchw(source[source_key], 1, source_key)
         return result
 
     def get_config(self) -> dict[str, Any]:
         return {
             "camera_keys": list(self.camera_keys),
+            "source_camera_keys": list(self.source_camera_keys),
             "wrist_camera_keys": list(self.wrist_camera_keys),
             "tactile_source": self.tactile_source,
             "visual_preprocess": self.visual_preprocess,
@@ -115,6 +144,7 @@ def make_acmt_dp_pre_post_processors(
             AddBatchDimensionProcessorStep(),
             ACMTDPNativeV4ProcessorStep(
                 camera_keys=config.camera_keys,
+                source_camera_keys=ACMT_DP_DEFAULT_SOURCE_CAMERA_KEYS,
                 wrist_camera_keys=config.wrist_camera_keys,
                 tactile_source=config.tactile_source,
                 visual_preprocess=config.visual_preprocess,
