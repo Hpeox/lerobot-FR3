@@ -13,7 +13,7 @@ The policy type remains `acmt_dp` and the three runtime modes remain:
   generator. The generator receives only each successfully sent 8-D action,
   never an unexecuted predicted action.
 
-The fixed camera order is `camera.cam1` (top), `camera.cam2` (side),
+The policy semantic slots are `camera.cam1` (top), `camera.cam2` (side),
 `camera.cam3` (wrist left), and `camera.cam4` (wrist right). Policy RGB is
 provided as raw `480x640` frames. The model applies the native transform:
 resize to 256, center crop to 224, clamp/round to uint8, divide by 255, and
@@ -22,7 +22,7 @@ ImageNet normalization. TactiGen wrist RGB-D retains the existing center480 to
 
 FR3 runtime observations retain the physical RealSense IDs `camera.cam1` through
 `camera.cam4`. The v4 processor adapts the current deployment to the semantic
-policy views by reading them in the order `camera.cam3`, `camera.cam4`,
+policy views by reading them in the order `camera.cam4`, `camera.cam3`,
 `camera.cam1`, `camera.cam2` and writing those values into the policy slots
 `top`, `side`, `wrist_left`, and `wrist_right`. This is a policy-side input
 permutation; RealSense topics, SensorHub ordering, and the checkpoint weights
@@ -74,7 +74,7 @@ frozen TactiGen generator.
 
 The independent policy type `acmt_dp_v5` loads only checkpoints with schema
 `acmt_dp.native_dp_v5_hybrid`. It keeps the raw four-camera 4:3 input.
-The processor preserves the deployment camera contract by reading runtime `camera.cam3`, `camera.cam4`, `camera.cam1`, `camera.cam2` into policy semantic slots `top`, `side`, `wrist_left`, `wrist_right`; the serialized `source_camera_keys` field makes this permutation explicit. The policy postprocessor maps the opening action from `[0,1]` to the existing normalized gPO wire range `[255,3]`.
+The processor preserves the deployment camera contract by reading runtime `camera.cam4`, `camera.cam3`, `camera.cam1`, `camera.cam2` into policy semantic slots `top`, `side`, `wrist_left`, `wrist_right`; the serialized `source_camera_keys` field makes this permutation explicit. The policy postprocessor maps the opening action from `[0,1]` to the existing normalized gPO wire range `[255,3]`.
 The model performs resize `240x320`, center crop `216x288`, and `[0,1] -> [-1,1]`
 normalization online. Each camera has its own scratch ResNet18Conv with
 GroupNorm and a 32-point SpatialSoftmax, producing 64 values; no BatchNorm is

@@ -32,8 +32,8 @@ from .configuration_acmt_dp import ACMTDPConfig, depth_key, rgb_key
 
 
 ACMT_DP_DEFAULT_SOURCE_CAMERA_KEYS = (
-    "camera.cam3",
     "camera.cam4",
+    "camera.cam3",
     "camera.cam1",
     "camera.cam2",
 )

@@ -176,8 +176,8 @@ def test_native_processor_maps_runtime_camera_order_to_v4_semantic_order() -> No
     processed = step.observation(observation)
 
     expected_values = {
-        "camera.cam1": 3,
-        "camera.cam2": 4,
+        "camera.cam1": 4,
+        "camera.cam2": 3,
         "camera.cam3": 1,
         "camera.cam4": 2,
     }
