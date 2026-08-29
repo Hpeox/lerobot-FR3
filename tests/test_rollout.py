@@ -451,3 +451,28 @@ def test_visual_feature_coverage_requires_every_policy_camera_but_allows_robot_s
     _validate_visual_feature_coverage(cam1, cam1 | cam2)
     with pytest.raises(ValueError, match="camera.cam2"):
         _validate_visual_feature_coverage(cam1 | cam2, cam1)
+
+
+def test_create_inference_engine_acmt_dp_v5_uses_inline_sync_backend():
+    from lerobot.rollout import SyncInferenceConfig, SyncInferenceEngine, create_inference_engine
+
+    policy = SimpleNamespace(
+        name="acmt_dp_v5",
+        robot_type="fr3",
+        config=SimpleNamespace(use_amp=False),
+    )
+    engine = create_inference_engine(
+        SyncInferenceConfig(),
+        policy=policy,
+        preprocessor=MagicMock(),
+        postprocessor=MagicMock(),
+        robot_wrapper=MagicMock(robot_type="fr3"),
+        hw_features={},
+        dataset_features={},
+        ordered_action_keys=["k"],
+        task="gear_insert_big2small",
+        fps=30.0,
+        device="cpu",
+    )
+    assert type(engine) is SyncInferenceEngine
+    assert not hasattr(engine, "_queue")

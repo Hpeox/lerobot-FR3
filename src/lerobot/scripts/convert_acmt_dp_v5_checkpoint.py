@@ -20,6 +20,7 @@ from torch import Tensor
 from lerobot.policies.acmt_dp.configuration_acmt_dp_v5 import ACMTDPV5Config
 from lerobot.policies.acmt_dp.modeling_acmt_dp_v5 import ACMTDPV5Policy
 from lerobot.policies.acmt_dp.processor_acmt_dp_v5 import make_acmt_dp_v5_pre_post_processors
+from lerobot.policies.acmt_dp.processor_acmt_dp import ACMT_DP_DEFAULT_SOURCE_CAMERA_KEYS
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 MODES = ("none", "real", "tactigen")
@@ -80,6 +81,8 @@ def _validate_v5_scratch(checkpoint: Mapping[str, Any], path: Path) -> None:
         ("spatial_num_keypoints", 32),
         ("unet_kernel_size", 5),
         ("diffusion_step_embed_dim", 128),
+        ("diffusion_train_steps", 100),
+        ("diffusion_inference_steps", 8),
     ):
         if int(config.get(field, -1)) != expected:
             raise ValueError(f"v5 checkpoint config {field} must be {expected}")
@@ -264,17 +267,20 @@ def convert_one(
             "task_variant": task,
             "tactile_source": mode,
             "policy_checkpoint_tactile_source": "real" if mode == "tactigen" else mode,
-            "protocol": "16_predict_8_execute_at_30hz",
+            "protocol": "synchronous_select_action",
+            "online_protocol": "synchronous_select_action",
             "action_alignment": "raw_internal_19_slice_3_19_public_16",
             "diffusion": {
                 "inference_steps": int(config.diffusion_inference_steps),
                 "ddim_eta": 0.0,
                 "initial_noise": "fixed_per_episode",
             },
-            "runtime": {"reserve_horizon": 8, "overlap_blending": True, "blend_new_weight_start": 0.25},
+            "runtime": {"reserve_horizon": 0, "overlap_blending": False},
             "tactile_history": 4,
             "camera_order": ["top", "side", "wrist_left", "wrist_right"],
             "camera_keys": list(config.camera_keys),
+            "source_camera_keys": list(ACMT_DP_DEFAULT_SOURCE_CAMERA_KEYS),
+            "gripper_mapping": "policy_[0,1]_to_gpo_[255,3]",
             "visual_preprocess": "resize240_center216_range",
             "feature_dim": 64,
             "tactile_dim": 160,

@@ -26,6 +26,8 @@ from lerobot.policies.acmt_dp.modeling_native_v5 import (
     NativeV5VisionEncoder,
 )
 from lerobot.policies.acmt_dp.processor_acmt_dp_v5 import ACMTDPV5ProcessorStep
+from lerobot.policies.acmt_dp.processor_acmt_dp import ACMT_DP_DEFAULT_SOURCE_CAMERA_KEYS
+from lerobot.policies.acmt_dp.processor_acmt_dp_v5 import make_acmt_dp_v5_pre_post_processors
 from lerobot.policies.factory import get_policy_class, make_policy_config
 from lerobot.utils.constants import OBS_STATE
 
@@ -97,6 +99,14 @@ def test_v5_rejects_legacy_schema_modes_and_networks() -> None:
         ACMTDPV5Config(unet_dims=(32, 64), device="cpu")
 
 
+def test_v5_fixes_the_native_diffusion_step_budget() -> None:
+    assert _config().diffusion_train_steps == 100
+    assert _config().diffusion_inference_steps == 8
+    with pytest.raises(ValueError, match="diffusion_train_steps=100"):
+        ACMTDPV5Config(diffusion_inference_steps=100, device="cpu")
+
+
+
 def test_v5_loader_rejects_legacy_config_before_model_construction(tmp_path) -> None:
     (tmp_path / "config.json").write_text(
         json.dumps({"checkpoint_schema": "acmt_dp.native_dp_v4", "checkpoint_schema_version": 4}),
@@ -126,16 +136,59 @@ def test_v5_visual_and_tactile_component_shapes() -> None:
     assert output.shape == (2, 4, 160)
 
 
-def test_v5_processor_preserves_four_camera_layouts() -> None:
+def test_v5_processor_maps_runtime_camera_order_to_semantic_slots() -> None:
     step = ACMTDPV5ProcessorStep(camera_keys=CAMERAS)
-    observation = {rgb_key(camera): torch.zeros(480, 640, 3, dtype=torch.uint8) for camera in CAMERAS}
+    observation = {
+        rgb_key(camera): torch.full((480, 640, 3), value, dtype=torch.uint8)
+        for value, camera in enumerate(CAMERAS, start=1)
+    }
+    original = {key: value.clone() for key, value in observation.items()}
     processed = step.observation(observation)
-    assert processed[rgb_key("camera.cam1")].shape == (1, 3, 480, 640)
-    assert processed[rgb_key("camera.cam1")].dtype is torch.uint8
+    expected_values = {
+        "camera.cam1": 3,
+        "camera.cam2": 4,
+        "camera.cam3": 1,
+        "camera.cam4": 2,
+    }
+    assert step.source_camera_keys == ACMT_DP_DEFAULT_SOURCE_CAMERA_KEYS
+    for camera, expected in expected_values.items():
+        value = processed[rgb_key(camera)]
+        assert value.shape == (1, 3, 480, 640)
+        assert value.dtype is torch.uint8
+        assert torch.all(value == expected)
+    for key, value in original.items():
+        assert torch.equal(observation[key], value)
 
-    tactigen = ACMTDPV5ProcessorStep(camera_keys=CAMERAS, tactile_source="tactigen")
-    with pytest.raises(KeyError, match="depth"):
-        tactigen.observation(observation)
+
+def test_v5_processor_validates_and_serializes_source_camera_order() -> None:
+    with pytest.raises(ValueError, match="source_camera_keys"):
+        ACMTDPV5ProcessorStep(camera_keys=CAMERAS, source_camera_keys=(CAMERAS[0],) * 4)
+    step = ACMTDPV5ProcessorStep(camera_keys=CAMERAS)
+    saved = step.get_config()
+    assert saved["source_camera_keys"] == list(ACMT_DP_DEFAULT_SOURCE_CAMERA_KEYS)
+    legacy = dict(saved)
+    legacy.pop("source_camera_keys")
+    restored = ACMTDPV5ProcessorStep(**legacy)
+    assert restored.source_camera_keys == ACMT_DP_DEFAULT_SOURCE_CAMERA_KEYS
+
+
+def test_v5_postprocessor_maps_gripper_to_wire_gpo() -> None:
+    _, postprocessor = make_acmt_dp_v5_pre_post_processors(_config("none"))
+    processed = postprocessor.process_action(torch.tensor([[0.0] * 8]))
+    assert processed[0, 7].item() == 1.0
+
+
+def test_v5_tactigen_depth_uses_the_same_camera_permutation() -> None:
+    step = ACMTDPV5ProcessorStep(camera_keys=CAMERAS, tactile_source="tactigen")
+    observation = {
+        rgb_key(camera): torch.zeros(480, 640, 3, dtype=torch.uint8)
+        for camera in CAMERAS
+    }
+    for value, camera in enumerate(CAMERAS, start=1):
+        observation[depth_key(camera)] = torch.full((1, 480, 640), value, dtype=torch.uint16)
+    processed = step.observation(observation)
+    assert torch.all(processed[depth_key("camera.cam3")] == 1)
+    assert torch.all(processed[depth_key("camera.cam4")] == 2)
 
 
 def test_v5_none_and_real_keep_four_frame_tactile_history() -> None:

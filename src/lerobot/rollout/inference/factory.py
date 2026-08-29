@@ -114,8 +114,8 @@ def create_inference_engine(
             robot_type=robot_wrapper.robot_type,
         )
     if isinstance(config, RTCInferenceConfig):
-        if getattr(policy, "name", None) == "acmt_dp":
-            raise ValueError("Native-DP v4 supports only --inference.type=sync; RTC is unsupported")
+        if getattr(policy, "name", None) in {"acmt_dp", "acmt_dp_v5"}:
+            raise ValueError("ACMT-DP v4/v5 supports only --inference.type=sync; RTC is unsupported")
         return RTCInferenceEngine(
             policy=policy,
             preprocessor=preprocessor,
