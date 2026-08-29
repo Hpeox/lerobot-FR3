@@ -174,8 +174,8 @@ class ACMTDPV5Config(PreTrainedConfig):
             raise ValueError("v5 requires diffusion step embedding dim 128")
         if not self.cond_predict_scale:
             raise ValueError("v5 requires cond_predict_scale=true")
-        if self.diffusion_train_steps != 100 or self.diffusion_inference_steps != 8:
-            raise ValueError("v5 fixes diffusion_train_steps=100 and diffusion_inference_steps=8")
+        if self.diffusion_train_steps != 100 or self.diffusion_inference_steps not in (8, 100):
+            raise ValueError("v5 requires diffusion_train_steps=100 and diffusion_inference_steps to be one of: 8, 100")
         if self.control_hz != 30.0:
             raise ValueError("v5 fixes control_hz=30")
         for name, value, size in (

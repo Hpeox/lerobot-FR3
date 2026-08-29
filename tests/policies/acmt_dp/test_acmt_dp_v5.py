@@ -102,8 +102,9 @@ def test_v5_rejects_legacy_schema_modes_and_networks() -> None:
 def test_v5_fixes_the_native_diffusion_step_budget() -> None:
     assert _config().diffusion_train_steps == 100
     assert _config().diffusion_inference_steps == 8
-    with pytest.raises(ValueError, match="diffusion_train_steps=100"):
-        ACMTDPV5Config(diffusion_inference_steps=100, device="cpu")
+    assert ACMTDPV5Config(diffusion_inference_steps=100, device="cpu").diffusion_inference_steps == 100
+    with pytest.raises(ValueError, match="one of"):
+        ACMTDPV5Config(diffusion_inference_steps=7, device="cpu")
 
 
 

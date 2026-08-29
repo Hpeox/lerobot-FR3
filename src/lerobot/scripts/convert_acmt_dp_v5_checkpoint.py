@@ -137,7 +137,8 @@ def _generator_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _make_config(
-    task: str, mode: str, source: Mapping[str, Any], generator_config: dict[str, Any] | None
+    task: str, mode: str, source: Mapping[str, Any], generator_config: dict[str, Any] | None,
+    diffusion_inference_steps: int | None = None,
 ) -> ACMTDPV5Config:
     source_config, statistics = source["config"], source["statistics"]
     expected_source = "real" if mode == "tactigen" else mode
@@ -145,6 +146,13 @@ def _make_config(
         raise ValueError(
             f"checkpoint tactile_source={source_config.get('tactile_source')!r} does not match mode={mode!r}"
         )
+    inference_steps = int(
+        source_config.get("diffusion_inference_steps", 8)
+        if diffusion_inference_steps is None
+        else diffusion_inference_steps
+    )
+    if inference_steps not in (8, 100):
+        raise ValueError("v5 diffusion_inference_steps must be 8 or 100")
     return ACMTDPV5Config(
         tactile_source=mode,
         checkpoint_tactile_source=expected_source,
@@ -172,7 +180,7 @@ def _make_config(
         crop_width=288,
         spatial_num_keypoints=32,
         diffusion_train_steps=int(source_config["diffusion_train_steps"]),
-        diffusion_inference_steps=int(source_config.get("diffusion_inference_steps", 8)),
+        diffusion_inference_steps=inference_steps,
         unet_dims=tuple(source_config["unet_dims"]),
         unet_kernel_size=int(source_config["unet_kernel_size"]),
         diffusion_step_embed_dim=int(source_config["diffusion_step_embed_dim"]),
@@ -218,6 +226,7 @@ def convert_one(
     source_checkpoint: Path,
     output_dir: Path,
     generator_checkpoint: Path | None = None,
+    diffusion_inference_steps: int | None = None,
 ) -> Path:
     source_checkpoint = source_checkpoint.resolve()
     source = _load_checkpoint(source_checkpoint)
@@ -233,7 +242,13 @@ def convert_one(
         generator_state = generator.get("model_state_dict")
         if not isinstance(generator_state, Mapping):
             raise KeyError("TactiGen checkpoint requires model_state_dict")
-    config = _make_config(task, mode, source, generator_config)
+    config = _make_config(
+        task,
+        mode,
+        source,
+        generator_config,
+        diffusion_inference_steps=diffusion_inference_steps,
+    )
     policy = ACMTDPV5Policy(config)
     target_state = _strict_target_state(policy, policy_state, generator_state)
     output_dir = output_dir.resolve()
@@ -339,6 +354,12 @@ def main() -> None:
     parser.add_argument("--policy-source-root", type=Path)
     parser.add_argument("--policy-checkpoint", type=Path)
     parser.add_argument("--generator-checkpoint", type=Path)
+    parser.add_argument(
+        "--diffusion-inference-steps",
+        type=int,
+        choices=(8, 100),
+        help="Override the checkpoint's online DDIM step count (default: checkpoint value).",
+    )
     args = parser.parse_args()
     tasks = TASKS if args.task == "all" else (args.task,)
     modes = MODES if args.mode == "all" else (args.mode,)
@@ -357,6 +378,7 @@ def main() -> None:
                 source_checkpoint=source,
                 output_dir=output,
                 generator_checkpoint=generator if mode == "tactigen" else None,
+                diffusion_inference_steps=args.diffusion_inference_steps,
             )
             gc.collect()
 
