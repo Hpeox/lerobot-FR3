@@ -20,6 +20,12 @@ from .acmt_dp import (
     ACMTDPPolicy as ACMTDPPolicy,
     make_acmt_dp_pre_post_processors as make_acmt_dp_pre_post_processors,
 )
+from .acmt_dp.configuration_acmt_dp_v3 import ACMTDPV3Config as ACMTDPV3Config
+from .acmt_dp.modeling_acmt_dp_v3 import ACMTDPV3Policy as ACMTDPV3Policy
+from .acmt_dp.processor_acmt_dp_v3 import (
+    ACMTDPV3Center480ProcessorStep as ACMTDPV3Center480ProcessorStep,
+    make_acmt_dp_v3_pre_post_processors as make_acmt_dp_v3_pre_post_processors,
+)
 from .acmt_dp.configuration_acmt_dp_v5 import ACMTDPV5Config as ACMTDPV5Config
 from .acmt_dp.modeling_acmt_dp_v5 import ACMTDPV5Policy as ACMTDPV5Policy
 from .acmt_dp.processor_acmt_dp_v5 import make_acmt_dp_v5_pre_post_processors as make_acmt_dp_v5_pre_post_processors
@@ -56,6 +62,10 @@ __all__ = [
     "ACMTDPPolicy",
     "ACMTDPCenter480ProcessorStep",
     "make_acmt_dp_pre_post_processors",
+    "ACMTDPV3Config",
+    "ACMTDPV3Policy",
+    "ACMTDPV3Center480ProcessorStep",
+    "make_acmt_dp_v3_pre_post_processors",
     "ACMTDPV5Config",
     "ACMTDPV5Policy",
     "make_acmt_dp_v5_pre_post_processors",

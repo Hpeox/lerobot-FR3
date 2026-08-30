@@ -266,19 +266,19 @@ class ACMTDPInferenceEngine(InferenceEngine):
 
         config = getattr(policy, "config", None)
         if config is None or getattr(config, "control_hz", 30.0) != CONTROL_HZ:
-            raise ValueError("Native-DP v4/v5 rollout requires control_hz=30")
+            raise ValueError("ACMT-DP v3/v4/v5 rollout requires control_hz=30")
         if getattr(config, "action_execution_horizon", 8) != EXECUTION_HORIZON:
-            raise ValueError("Native-DP v4/v5 rollout requires action_execution_horizon=8")
+            raise ValueError("ACMT-DP v3/v4/v5 rollout requires action_execution_horizon=8")
         if getattr(config, "tactile_history", 4) != 4:
-            raise ValueError("Native-DP v4/v5 rollout requires tactile_history=4")
+            raise ValueError("ACMT-DP v3/v4/v5 rollout requires tactile_history=4")
         if (
             getattr(config, "pred_horizon", 16) != PREDICTION_HORIZON
             or getattr(config, "action_dim", 8) != ACTION_DIM
         ):
-            raise ValueError("Native-DP v4/v5 rollout requires pred_horizon=16 and action_dim=8")
+            raise ValueError("ACMT-DP v3/v4/v5 rollout requires pred_horizon=16 and action_dim=8")
         schema_version = getattr(config, "checkpoint_schema_version", 4)
-        if schema_version not in (4, 5):
-            raise ValueError("Native-DP v4/v5 rollout requires checkpoint_schema_version=4 or 5")
+        if schema_version not in (3, 4, 5):
+            raise ValueError("ACMT-DP rollout requires checkpoint_schema_version=3, 4 or 5")
         if getattr(config, "tactile_source", None) == "tactigen":
             logger.info("ACMT-DP TactiGen uses rolling 16/8 runtime; RTC is unsupported")
 

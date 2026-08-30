@@ -45,6 +45,7 @@ from lerobot.utils.constants import (
 from lerobot.utils.feature_utils import dataset_to_policy_features
 
 from .acmt_dp.configuration_acmt_dp import ACMTDPConfig
+from .acmt_dp.configuration_acmt_dp_v3 import ACMTDPV3Config
 from .acmt_dp.configuration_acmt_dp_v5 import ACMTDPV5Config
 from .act.configuration_act import ACTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig
@@ -111,6 +112,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .acmt_dp.modeling_acmt_dp import ACMTDPPolicy
 
         return ACMTDPPolicy
+    elif name == "acmt_dp_v3":
+        from .acmt_dp.modeling_acmt_dp_v3 import ACMTDPV3Policy
+
+        return ACMTDPV3Policy
     elif name == "acmt_dp_v5":
         from .acmt_dp.modeling_acmt_dp_v5 import ACMTDPV5Policy
 
@@ -217,6 +222,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return TDMPCConfig(**kwargs)
     elif policy_type == "acmt_dp":
         return ACMTDPConfig(**kwargs)
+    elif policy_type == "acmt_dp_v3":
+        return ACMTDPV3Config(**kwargs)
     elif policy_type == "acmt_dp_v5":
         return ACMTDPV5Config(**kwargs)
     elif policy_type == "diffusion":
@@ -378,6 +385,14 @@ def make_pre_post_processors(
         from .acmt_dp.processor_acmt_dp import make_acmt_dp_pre_post_processors
 
         processors = make_acmt_dp_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, ACMTDPV3Config):
+        from .acmt_dp.processor_acmt_dp_v3 import make_acmt_dp_v3_pre_post_processors
+
+        processors = make_acmt_dp_v3_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

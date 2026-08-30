@@ -1,11 +1,11 @@
-# ACMT-DP Native-DP v4/v5
+# ACMT-DP Native-DP v3/v4/v5
 
-This directory contains the inference-only LeRobot ports of ACMT-DP v4 and v5.
-The v4 policy follows upstream commit `770a30f`; v3 center480/DFormer and
-28-dimensional state checkpoints are rejected. The v5 policy uses the
-independent `acmt_dp_v5` type and schema; both policy families reject the old
+This directory contains the inference-only LeRobot ports of ACMT-DP v3, v4 and
+v5. The v4 policy follows upstream commit `770a30f`; v3 center480/DFormer
+checkpoints use the independent `acmt_dp_v3` type. The v5 policy uses the
+independent `acmt_dp_v5` type and schema; all policy families reject the old
 `generated` mode.
-The policy type remains `acmt_dp` and the three runtime modes remain:
+The v4 policy type remains `acmt_dp` and the three runtime modes remain:
 
 - `none`: four RGB views and four zero tactile frames;
 - `real`: four RGB views and the two real Xense force fields;
@@ -63,6 +63,36 @@ lerobot-convert-acmt-dp-checkpoint \
   --task peg --mode none \
   --policy-checkpoint /path/to/native_dp_v4/none/scratch/seed42/best.pt \
   --output-root outputs/acmt_dp
+```
+
+## ACMT-DP v3
+
+The legacy temporal checkpoint is loaded with `--policy.type=acmt_dp_v3` and
+the `v3_temporal_center480` schema. It uses only `camera.cam1` and
+`camera.cam2` as the left and right wrist RGB-D views. Raw `480x640` frames are
+center-cropped to `480x480` and resized to `128x128` (antialiased bilinear RGB
+and nearest-neighbour depth). Four-frame history is used for visual and
+low-dimensional inputs; the low-dimensional vector is
+`q(7)+dq(7)+tau_J(7)+FT300(6)+gPO/255(1)`.
+
+The `none` mode supplies four zero tactile frames. The temporal tactile encoder
+remains part of the checkpoint ABI, so a v3 artifact must be converted from a
+v3 `best.pt` rather than loaded as a v4/v5 artifact. The model uses the frozen
+DFormerv2-S dual RGB-D encoder and 100-step stochastic DDPM to produce a
+`[16,8]` action chunk. The rolling inference backend executes the first eight
+actions and keeps eight actions as reserve at a nominal 30 Hz. Planning latency
+must be measured before hardware rollout; 100-step inference can exhaust the
+reserve on slower systems.
+
+The v3 processor maps policy gripper opening `[0,1]` to the existing FR3 wire
+direction `[255,3]`; model weights are unchanged. Convert a v3 checkpoint with:
+
+```bash
+python -m lerobot.scripts.convert_acmt_dp_v3_checkpoint \
+  --task peg --mode none \
+  --policy-source-root /data/internal/checkpoint/16mm-peg-in-hole \
+  --output-root outputs/acmt_dp_v3 \
+  --device cuda
 ```
 
 ## Native-DP v5

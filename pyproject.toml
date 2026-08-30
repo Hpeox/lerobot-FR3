@@ -362,6 +362,7 @@ lerobot-annotate="lerobot.scripts.lerobot_annotate:main"
 lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
 lerobot-fr3-sensorhub="lerobot.robots.fr3.sensorhub.__main__:main"
 lerobot-convert-acmt-dp-checkpoint="lerobot.scripts.convert_acmt_dp_checkpoint:main"
+lerobot-convert-acmt-dp-v3-checkpoint="lerobot.scripts.convert_acmt_dp_v3_checkpoint:main"
 lerobot-convert-acmt-dp-v5-checkpoint="lerobot.scripts.convert_acmt_dp_v5_checkpoint:main"
 
 # ---------------- Tool Configurations ----------------
