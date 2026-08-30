@@ -178,8 +178,8 @@ def test_native_processor_maps_runtime_camera_order_to_v4_semantic_order() -> No
     expected_values = {
         "camera.cam1": 4,
         "camera.cam2": 3,
-        "camera.cam3": 1,
-        "camera.cam4": 2,
+        "camera.cam3": 2,
+        "camera.cam4": 1,
     }
     assert step.source_camera_keys == ACMT_DP_DEFAULT_SOURCE_CAMERA_KEYS
     for camera, expected in expected_values.items():
@@ -245,8 +245,8 @@ def test_tactigen_processor_maps_wrist_depth_sources() -> None:
 
     processed = step.observation(observation)
 
-    assert torch.all(processed[depth_key("camera.cam3")] == 1.0)
-    assert torch.all(processed[depth_key("camera.cam4")] == 2.0)
+    assert torch.all(processed[depth_key("camera.cam3")] == 2.0)
+    assert torch.all(processed[depth_key("camera.cam4")] == 1.0)
 
 
 def test_real_tactile_layout_and_v4_inputs() -> None:
