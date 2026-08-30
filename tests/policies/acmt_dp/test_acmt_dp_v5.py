@@ -150,8 +150,8 @@ def test_v5_processor_maps_runtime_camera_order_to_semantic_slots() -> None:
     expected_values = {
         "camera.cam1": 4,
         "camera.cam2": 3,
-        "camera.cam3": 2,
-        "camera.cam4": 1,
+        "camera.cam3": 1,
+        "camera.cam4": 2,
     }
     assert step.source_camera_keys == ACMT_DP_DEFAULT_SOURCE_CAMERA_KEYS
     for camera, expected in expected_values.items():
@@ -190,8 +190,8 @@ def test_v5_tactigen_depth_uses_the_same_camera_permutation() -> None:
     for value, camera in enumerate(CAMERAS, start=1):
         observation[depth_key(camera)] = torch.full((1, 480, 640), value, dtype=torch.uint16)
     processed = step.observation(observation)
-    assert torch.all(processed[depth_key("camera.cam3")] == 2)
-    assert torch.all(processed[depth_key("camera.cam4")] == 1)
+    assert torch.all(processed[depth_key("camera.cam3")] == 1)
+    assert torch.all(processed[depth_key("camera.cam4")] == 2)
 
 
 def test_v5_none_and_real_keep_four_frame_tactile_history() -> None:
