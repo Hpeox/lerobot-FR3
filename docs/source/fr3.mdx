@@ -137,7 +137,11 @@ or invariant failures remain fatal. Parent disappearance terminates SensorHub wi
 
 The aligned SHM is a session-level stream. Its `latest_sequence` remains monotonic across rollout
 boundaries and source outages; it stops advancing while no valid aligned sample exists and resumes
-in the same mapping afterward.
+in the same mapping afterward. The SensorHub alignment publisher emits at most one snapshot every
+`33.333 ms` (30 Hz), schedules the next publication from the completion of the previous one, and
+does not catch up with a burst after scheduler delay. The reader copies each selected slot once
+through a `memoryview` into an owned `bytearray`, then performs the existing seqlock validation;
+the returned arrays remain independent of later SensorHub publications.
 
 ## Future external controller contract
 

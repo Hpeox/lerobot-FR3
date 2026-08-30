@@ -402,6 +402,16 @@ class AlignedObservationClient:
         raw = bytes(self._mapping[72:320]).split(b"\0", 1)[0]
         return f"SensorHub fatal ({status}): {raw.decode('utf-8', errors='replace')}"
 
+    def _copy_owned_slot(self, slot_base: int) -> bytearray:
+        """Copy one slot into writable memory owned independently of the SHM mapping."""
+        slot_view = memoryview(self._mapping)[
+            slot_base : slot_base + self.layout.slot_stride
+        ]
+        try:
+            return bytearray(slot_view)
+        finally:
+            slot_view.release()
+
     def read(self, timeout_ms: int = 20, max_age_ms: int = 100) -> tuple[dict, SnapshotMetadata]:
         deadline = time.monotonic() + timeout_ms / 1000.0
         attempts = 0
@@ -424,9 +434,7 @@ class AlignedObservationClient:
                 seq1 = struct.unpack_from("<Q", self._mapping, slot_base)[0]
                 if seq1 == 2 * latest:
                     copy_started_ns = time.monotonic_ns()
-                    owned = bytearray(
-                        self._mapping[slot_base : slot_base + self.layout.slot_stride]
-                    )
+                    owned = self._copy_owned_slot(slot_base)
                     slot_copy_duration_ns = time.monotonic_ns() - copy_started_ns
                     seq2 = struct.unpack_from("<Q", self._mapping, slot_base)[0]
                     header = self.layout.slot_header.unpack_from(owned, 0)

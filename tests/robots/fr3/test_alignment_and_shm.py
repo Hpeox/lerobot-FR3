@@ -379,7 +379,7 @@ def _aligned_sample(sequence=1, camera_count=2):
     )
 
 
-@pytest.mark.parametrize("camera_count", [1, 2, 5])
+@pytest.mark.parametrize("camera_count", [1, 2, 4, 5])
 def test_aligned_shm_roundtrip_and_owned_buffer(camera_count):
     name = f"fr3_test_{uuid.uuid4().hex}"
     writer = AlignedObservationWriter(name, camera_count=camera_count)
@@ -418,6 +418,9 @@ def test_aligned_shm_roundtrip_and_owned_buffer(camera_count):
         assert first["gripper.pos"] == pytest.approx(128 / 255)
         assert first["fr3.O_T_EE"].dtype == np.float32
         np.testing.assert_array_equal(first["fr3.O_T_EE"], transform())
+        first_rgb = first["camera.cam1.rgb"]
+        assert first_rgb.flags.writeable
+        first_rgb[0, 0, 0] = 123
 
         header = writer.layout.slot_header.unpack_from(
             writer._shm.buf,
@@ -427,11 +430,43 @@ def test_aligned_shm_roundtrip_and_owned_buffer(camera_count):
         assert source_sequences == (*range(1, camera_count + 1), 5, 6, 7, 8)
 
         writer.publish(_aligned_sample(sequence=2, camera_count=camera_count))
-        assert first[f"camera.cam{camera_count}.rgb"][0, 0, 0] == camera_count
+        assert first_rgb[0, 0, 0] == 123
         writer.publish(_aligned_sample(sequence=3, camera_count=camera_count))
         assert writer.timing_diagnostics.sequence == 3
         assert writer.timing_diagnostics.publish_interval_ns is not None
         assert writer.timing_diagnostics.same_slot_rewrite_interval_ns is not None
+    finally:
+        if client is not None:
+            client.close()
+        writer.close()
+
+
+def test_aligned_shm_reader_retries_when_writer_reuses_slot_during_copy(monkeypatch):
+    name = f"fr3_racing_reader_{uuid.uuid4().hex}"
+    writer = AlignedObservationWriter(name, camera_count=2)
+    client = None
+    try:
+        writer.publish(_aligned_sample(sequence=1, camera_count=2))
+        client = AlignedObservationClient(name)
+        original_copy = client._copy_owned_slot
+        calls = 0
+
+        def publish_during_first_copy(slot_base):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                writer.publish(_aligned_sample(sequence=2, camera_count=2))
+                writer.publish(_aligned_sample(sequence=3, camera_count=2))
+            return original_copy(slot_base)
+
+        monkeypatch.setattr(client, "_copy_owned_slot", publish_during_first_copy)
+        _observation, metadata = client.read(timeout_ms=100, max_age_ms=1000)
+
+        assert metadata.sequence == 3
+        assert client.last_read_diagnostics.attempts >= 2
+        assert client.last_read_diagnostics.retry_counts == {
+            "sequence_changed_during_copy": 1
+        }
     finally:
         if client is not None:
             client.close()

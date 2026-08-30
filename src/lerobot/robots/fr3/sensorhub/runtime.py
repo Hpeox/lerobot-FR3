@@ -10,6 +10,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from threading import Event, Lock, Thread
+from typing import Final
 
 from ..config_fr3 import normalize_realsense_shm_names
 from .aligned_shm import AlignedObservationWriter
@@ -19,6 +20,11 @@ from .samples import CameraSample, FTSample, GripperSample, RobotSample, XenseSa
 from .uds import UDSControlServer
 
 logger = logging.getLogger(__name__)
+
+# RealSense and the FR3 rollout contract are both 30 Hz.  Keeping this gate
+# local to the alignment publisher prevents scheduler delays from turning into
+# catch-up bursts that can overwrite the other SHM slot during a reader copy.
+ALIGNED_PUBLISH_PERIOD_NS: Final = round(1_000_000_000 / 30)
 
 
 class _ParentExited(RuntimeError):
@@ -234,9 +240,18 @@ class SensorHubRuntime:
         self._start_thread("FR3TelemetryReader", loop)
 
     def _alignment_loop(self) -> None:
+        next_publish_not_before_ns = 0
         while not self.stop_event.is_set():
             try:
                 now_ns = time.monotonic_ns()
+                if now_ns < next_publish_not_before_ns:
+                    time.sleep(
+                        min(
+                            (next_publish_not_before_ns - now_ns) / 1_000_000_000,
+                            0.001,
+                        )
+                    )
+                    continue
                 sample = self.aligner.select(time.time_ns(), now_ns)
                 self._log_new_camera_bundle()
                 if sample is None:
@@ -247,6 +262,11 @@ class SensorHubRuntime:
                 assert self.writer is not None
                 self.writer.publish(sample)
                 self.first_publish_event.set()
+                # Schedule from completion so a delayed iteration does not
+                # immediately publish several queued camera bundles.
+                next_publish_not_before_ns = (
+                    time.monotonic_ns() + ALIGNED_PUBLISH_PERIOD_NS
+                )
             except Exception as exc:
                 self._fatal(f"AlignmentPublisher failed: {exc}")
                 return

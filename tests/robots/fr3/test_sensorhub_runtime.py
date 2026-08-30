@@ -317,6 +317,75 @@ def test_alignment_pending_logs_stop_after_first_publish(caplog):
     assert not any("alignment pending before READY" in record.message for record in caplog.records)
 
 
+def test_alignment_loop_paces_publications_without_catchup(monkeypatch):
+    class FakeClock:
+        def __init__(self):
+            self.now_ns = 10_000_000_000
+
+        def monotonic_ns(self):
+            return self.now_ns
+
+        def monotonic(self):
+            return self.now_ns / 1_000_000_000
+
+        def time_ns(self):
+            return self.now_ns
+
+        def sleep(self, seconds):
+            self.now_ns += round(seconds * 1_000_000_000)
+
+    clock = FakeClock()
+    monkeypatch.setattr(runtime_module, "time", clock)
+
+    runtime = object.__new__(SensorHubRuntime)
+    runtime.stop_event = Event()
+    runtime.first_publish_event = Event()
+    runtime._alignment_pending_reason = None
+    runtime._alignment_pending_log_monotonic = 0.0
+    runtime._log_new_camera_bundle = lambda: None
+    runtime._fatal = lambda message: pytest.fail(message)
+
+    published_at = []
+
+    class Writer:
+        def publish(self, sample):
+            published_at.append(clock.monotonic_ns())
+            if len(published_at) == 2:
+                clock.now_ns += 100_000_000
+
+    runtime.writer = Writer()
+
+    class Aligner:
+        last_rejection_reason = ""
+
+        def __init__(self):
+            self.samples = iter(("first", "second", "third"))
+            self.select_at = []
+
+        def select(self, realtime_ns, monotonic_ns):
+            self.select_at.append(monotonic_ns)
+            try:
+                return next(self.samples)
+            except StopIteration:
+                runtime.stop_event.set()
+                return None
+
+    aligner = Aligner()
+    runtime.aligner = aligner
+
+    start_ns = clock.monotonic_ns()
+    runtime._alignment_loop()
+
+    assert published_at[0] == start_ns
+    assert len(published_at) == 3
+    assert all(
+        later - earlier >= runtime_module.ALIGNED_PUBLISH_PERIOD_NS
+        for earlier, later in zip(published_at, published_at[1:])
+    )
+    assert published_at[2] - published_at[1] >= 100_000_000 + runtime_module.ALIGNED_PUBLISH_PERIOD_NS
+    assert aligner.select_at[:3] == published_at
+
+
 def test_ready_timeout_reports_each_source_progress():
     runtime = object.__new__(SensorHubRuntime)
     runtime.config = SimpleNamespace(startup_timeout_s=0.001)
