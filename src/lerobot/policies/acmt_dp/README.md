@@ -103,23 +103,40 @@ modes; `tactigen` reuses a task-matched real policy checkpoint and embeds one
 frozen TactiGen generator.
 
 The independent policy type `acmt_dp_v5` loads only checkpoints with schema
-`acmt_dp.native_dp_v5_hybrid`. It keeps the raw four-camera 4:3 input.
-The processor preserves the deployment camera contract by reading runtime `camera.cam4`, `camera.cam3`, `camera.cam1`, `camera.cam2` into policy semantic slots `top`, `side`, `wrist_left`, `wrist_right`; the serialized `source_camera_keys` field makes this permutation explicit. The policy postprocessor maps the opening action from `[0,1]` to the existing normalized gPO wire range `[255,3]`.
-The model performs resize `240x320`, center crop `216x288`, and `[0,1] -> [-1,1]`
-normalization online. Each camera has its own scratch ResNet18Conv with
-GroupNorm and a 32-point SpatialSoftmax, producing 64 values; no BatchNorm is
-present. The observation history is four frames with official first-frame
-padding. The internal 19-step prediction is exposed as
-`prediction_raw[:,3:19]` (`[B,16,8]`); the rolling v5 engine consumes one action per 30 Hz deadline.
+`acmt_dp.native_dp_v5_robomimic_hybrid`. It constructs the official Robomimic
+0.2.0 `ObservationEncoder`: four independent scratch ResNet18Conv keys,
+GroupNorm, per-key CropRandomizer, ReLU feature activation, and a 32-point
+SpatialSoftmax producing 64 values per camera. It keeps the raw four-camera
+4:3 input and performs resize `240x320`, center crop `216x288`, and
+`[0,1] -> [-1,1]` normalization online; no BatchNorm is present. The
+processor preserves the deployment camera contract by reading runtime
+`camera.cam4`, `camera.cam3`, `camera.cam1`, `camera.cam2` into policy semantic
+slots `top`, `side`, `wrist_left`, `wrist_right`; serialized
+`source_camera_keys` makes this permutation explicit. The policy postprocessor
+maps opening action `[0,1]` to normalized gPO wire `[255,3]`.
+The observation history is four frames with official first-frame padding. The
+internal 19-step prediction is exposed as
+`prediction_raw[:,3:19]` (`[B,16,8]`), and the rolling runtime executes its first
+eight actions at 30 Hz.
+
+Install the optional dependency before constructing a v5 policy:
+
+```bash
+pip install 'lerobot[acmt-dp]'
+```
+
+This pins `robomimic==0.2.0`; v5 imports remain available without the extra,
+but model construction reports the installation command when the encoder is
+needed.
 
 Convert v5 checkpoints with the separate converter; it never accepts v3/v4
 artifacts:
 
 ```bash
 python -m lerobot.scripts.convert_acmt_dp_v5_checkpoint \
-  --task gear --mode none \
-  --policy-checkpoint /data/internal/ACMT-DP-gear-runs/gear_insert_big2small/native_dp_v5/none/scratch/seed42/best.pt \
-  --output-root outputs/acmt_dp
+  --task peg --mode none \
+  --policy-checkpoint /data/internal/ACMT-DP-peg-runs/16mm_peg_in_hole/native_dp_v5/none/robomimic_official/seed42/best.pt \
+  --output-root outputs/acmt_dp_v5
 ```
 
 Launch with `--policy.type=acmt_dp_v5` and choose

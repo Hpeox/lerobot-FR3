@@ -25,7 +25,7 @@ from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PR
 
 MODES = ("none", "real", "tactigen")
 TASKS = ("peg", "gear")
-UPSTREAM_COMMIT = "f6306c91d59ddac077be026da60e5b1ebeaa2533"
+UPSTREAM_COMMIT = "500641fe723871d6dbf0e7d9008ef3a0406107f9"
 DEFAULT_POLICY_ROOTS = {
     "peg": Path("/data2/cym/16mm_peg_in_hole/native_dp_v5"),
     "gear": Path("/data2/cym/gear_insert_big2small/native_dp_v5"),
@@ -56,8 +56,10 @@ def _load_checkpoint(path: Path) -> dict[str, Any]:
 
 
 def _validate_v5_scratch(checkpoint: Mapping[str, Any], path: Path) -> None:
-    if checkpoint.get("schema") != "acmt_dp.native_dp_v5_hybrid":
-        raise ValueError(f"{path} is not a Native-DP v5 checkpoint; v3/v4 artifacts are rejected")
+    if checkpoint.get("schema") != "acmt_dp.native_dp_v5_robomimic_hybrid":
+        raise ValueError(
+            f"{path} is not a Native-DP v5 Robomimic checkpoint; local-copy v5 and v3/v4 artifacts are rejected"
+        )
     config = checkpoint.get("config")
     if not isinstance(config, Mapping):
         raise KeyError("v5 checkpoint requires config")
@@ -90,6 +92,10 @@ def _validate_v5_scratch(checkpoint: Mapping[str, Any], path: Path) -> None:
         raise ValueError("v5 checkpoint camera order is invalid")
     if config.get("use_group_norm") is not True:
         raise ValueError("v5 checkpoint must use GroupNorm visual encoders")
+    if config.get("observation_encoder_impl") != "robomimic_0.2.0_official":
+        raise ValueError("v5 checkpoint must use the official Robomimic 0.2.0 observation encoder")
+    if config.get("vision_mode", "scratch") != "scratch":
+        raise ValueError("v5 conversion only accepts scratch checkpoints")
     if config.get("random_crop") is not True:
         raise ValueError("v5 checkpoint must be trained with random_crop=true")
     if config.get("cond_predict_scale") is not True:
@@ -99,6 +105,19 @@ def _validate_v5_scratch(checkpoint: Mapping[str, Any], path: Path) -> None:
             raise KeyError(f"v5 checkpoint requires {key}")
     if checkpoint.get("statistics", {}).get("state_min") is None:
         raise KeyError("v5 checkpoint statistics require state_min/state_max")
+    provenance = checkpoint.get("provenance")
+    if not isinstance(provenance, Mapping):
+        raise KeyError("v5 checkpoint requires provenance for the official encoder")
+    for field, expected in (
+        ("observation_encoder_impl", "robomimic_0.2.0_official"),
+        ("robomimic_version", "0.2.0"),
+    ):
+        if provenance.get(field) != expected:
+            raise ValueError(f"v5 checkpoint provenance {field} must be {expected!r}")
+    for field in ("native_v5_source_sha256", "visual_encoder_sha256"):
+        value = provenance.get(field)
+        if not isinstance(value, str) or len(value) != 64:
+            raise ValueError(f"v5 checkpoint provenance requires a SHA256 {field}")
 
 
 def _ema_policy_state(checkpoint: Mapping[str, Any]) -> tuple[dict[str, Tensor], float]:
@@ -106,6 +125,9 @@ def _ema_policy_state(checkpoint: Mapping[str, Any]) -> tuple[dict[str, Tensor],
     shadow = ema.get("shadow")
     if not isinstance(raw, Mapping) or not isinstance(shadow, Mapping):
         raise KeyError("v5 checkpoint requires ema_state_dict.shadow")
+    missing_ema = sorted(set(raw) - set(shadow))
+    if missing_ema:
+        raise ValueError(f"EMA shadow is incomplete; missing {missing_ema[:10]}")
     state = dict(raw)
     for name, value in shadow.items():
         if name not in state:
@@ -114,8 +136,8 @@ def _ema_policy_state(checkpoint: Mapping[str, Any]) -> tuple[dict[str, Tensor],
             raise TypeError(f"EMA shadow {name!r} must be floating point")
         state[name] = value
     required = {
-        "visual_encoder.camera_encoders.0.backbone.0.weight",
-        "visual_encoder.camera_encoders.0.spatial.keypoint_conv.weight",
+        "visual_encoder.encoder.obs_nets.top.backbone.nets.0.weight",
+        "visual_encoder.encoder.obs_nets.top.pool.nets.weight",
         "tactile_encoder.spatial.0.weight",
         "normalizer.params_dict.state.offset",
         "noise_predictor.final_conv.1.weight",
@@ -159,8 +181,9 @@ def _make_config(
         task_variant=task,
         checkpoint_task_variant=task,
         checkpoint_schema_version=5,
-        checkpoint_schema="acmt_dp.native_dp_v5_hybrid",
-        visual_preprocess="resize240_center216_range",
+        checkpoint_schema="acmt_dp.native_dp_v5_robomimic_hybrid",
+        visual_preprocess="robomimic_0.2.0_resize240_center216_range",
+        observation_encoder_impl="robomimic_0.2.0_official",
         obs_horizon=4,
         n_obs_steps=4,
         pad_before=3,
@@ -233,6 +256,7 @@ def convert_one(
     source = _load_checkpoint(source_checkpoint)
     _validate_v5_scratch(source, source_checkpoint)
     policy_state, ema_decay = _ema_policy_state(source)
+    source_provenance = source["provenance"]
     generator_config = generator_state = generator = None
     if mode == "tactigen":
         if generator_checkpoint is None:
@@ -263,7 +287,7 @@ def convert_one(
         serialized.update(
             {
                 "type": "acmt_dp_v5",
-                "checkpoint_schema": "acmt_dp.native_dp_v5_hybrid",
+                "checkpoint_schema": "acmt_dp.native_dp_v5_robomimic_hybrid",
                 "checkpoint_schema_version": 5,
             }
         )
@@ -277,7 +301,7 @@ def convert_one(
         )
         manifest = {
             "schema_version": 5,
-            "checkpoint_schema": "acmt_dp.native_dp_v5_hybrid",
+            "checkpoint_schema": "acmt_dp.native_dp_v5_robomimic_hybrid",
             "upstream_commit": UPSTREAM_COMMIT,
             "policy_type": "acmt_dp_v5",
             "task_variant": task,
@@ -301,7 +325,14 @@ def convert_one(
             "camera_keys": list(config.camera_keys),
             "source_camera_keys": list(ACMT_DP_DEFAULT_SOURCE_CAMERA_KEYS),
             "gripper_mapping": "policy_[0,1]_to_gpo_[255,3]",
-            "visual_preprocess": "resize240_center216_range",
+            "visual_preprocess": "robomimic_0.2.0_resize240_center216_range",
+            "observation_encoder_impl": "robomimic_0.2.0_official",
+            "source_provenance": {
+                "native_v5_source_sha256": source_provenance["native_v5_source_sha256"],
+                "visual_encoder_sha256": source_provenance["visual_encoder_sha256"],
+                "observation_encoder_impl": source_provenance["observation_encoder_impl"],
+                "robomimic_version": source_provenance["robomimic_version"],
+            },
             "feature_dim": 64,
             "tactile_dim": 160,
             "action_execution_horizon": 8,
@@ -339,8 +370,10 @@ def _resolve_source(root: Path, task: str, mode: str) -> Path:
     if root.is_file():
         return root
     candidates = (
+        root / source_mode / "robomimic_official" / "seed42" / "best.pt",
         root / source_mode / "scratch" / "seed42" / "best.pt",
         root / source_mode / "seed42" / "best.pt",
+        root / task / source_mode / "robomimic_official" / "seed42" / "best.pt",
         root / task / source_mode / "scratch" / "seed42" / "best.pt",
     )
     for candidate in candidates:

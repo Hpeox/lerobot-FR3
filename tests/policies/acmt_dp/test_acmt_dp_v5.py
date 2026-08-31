@@ -82,7 +82,7 @@ def test_v5_registration_and_serialization(tmp_path) -> None:
     config.save_pretrained(tmp_path)
     restored = PreTrainedConfig.from_pretrained(tmp_path)
     assert isinstance(restored, ACMTDPV5Config)
-    assert restored.checkpoint_schema == "acmt_dp.native_dp_v5_hybrid"
+    assert restored.checkpoint_schema == "acmt_dp.native_dp_v5_robomimic_hybrid"
     assert restored.camera_keys == CAMERAS
     assert restored.random_crop is True
 
@@ -118,6 +118,13 @@ def test_v5_loader_rejects_legacy_config_before_model_construction(tmp_path) -> 
     with pytest.raises(ValueError, match="v3/v4"):
         ACMTDPV5Policy.from_pretrained(tmp_path)
 
+    (tmp_path / "config.json").write_text(
+        json.dumps({"checkpoint_schema": "acmt_dp.native_dp_v5_hybrid", "checkpoint_schema_version": 5}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="local-copy"):
+        ACMTDPV5Policy.from_pretrained(tmp_path)
+
 
 def test_v5_visual_preprocess_matches_resize_crop_and_range() -> None:
     value = torch.zeros(1, 4, 3, 480, 640, dtype=torch.uint8)
@@ -133,7 +140,11 @@ def test_v5_visual_preprocess_matches_resize_crop_and_range() -> None:
 def test_v5_visual_and_tactile_component_shapes() -> None:
     vision = NativeV5VisionEncoder()
     assert not any(isinstance(module, nn.modules.batchnorm._BatchNorm) for module in vision.modules())
-    assert all(camera.spatial.num_kp == 32 for camera in vision.camera_encoders)
+    assert vision.encoder.output_shape() == [264]
+    assert all(
+        vision.encoder.obs_nets[name].pool._num_kp == 32
+        for name in ("top", "side", "wrist_left", "wrist_right")
+    )
     tactile = FrameTactileEncoder((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
     output = tactile(torch.zeros(2, 4, 2, 35, 20, 3))
     assert output.shape == (2, 4, 160)

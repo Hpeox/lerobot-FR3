@@ -53,6 +53,7 @@ class ACMTDPV5Policy(PreTrainedPolicy):
 
     def __init__(self, config: ACMTDPV5Config, **_: Any) -> None:
         require_package("diffusers", extra="acmt-dp")
+        require_package("robomimic", extra="acmt-dp")
         super().__init__(config)
         config.validate_features()
         self.config = config
@@ -111,14 +112,19 @@ class ACMTDPV5Policy(PreTrainedPolicy):
                     "generated checkpoints are obsolete; reconvert as v5 tactigen from a real checkpoint"
                 )
             if (
-                raw.get("checkpoint_schema") != "acmt_dp.native_dp_v5_hybrid"
+                raw.get("checkpoint_schema") != "acmt_dp.native_dp_v5_robomimic_hybrid"
                 or raw.get("checkpoint_schema_version") != 5
             ):
                 raise ValueError(
-                    "checkpoint is not Native-DP v5; v3/v4 artifacts cannot be loaded by acmt_dp_v5"
+                    "checkpoint is not Native-DP v5 Robomimic; local-copy v5 and v3/v4 artifacts "
+                    "cannot be loaded by acmt_dp_v5"
                 )
-            if raw.get("visual_preprocess") != "resize240_center216_range":
-                raise ValueError("Native-DP v5 requires resize240_center216_range preprocessing")
+            if raw.get("visual_preprocess") != "robomimic_0.2.0_resize240_center216_range":
+                raise ValueError(
+                    "Native-DP v5 requires Robomimic 0.2.0 resize240_center216_range preprocessing"
+                )
+            if raw.get("observation_encoder_impl") != "robomimic_0.2.0_official":
+                raise ValueError("Native-DP v5 requires the official Robomimic 0.2.0 observation encoder")
         return super().from_pretrained(pretrained_name_or_path, *args, **kwargs)
 
     @classmethod
@@ -134,13 +140,17 @@ class ACMTDPV5Policy(PreTrainedPolicy):
         with safe_open(model_file, framework="pt", device="cpu") as archive:
             keys = set(archive.keys())
         required = {
-            "visual_encoder.camera_encoders.0.backbone.0.weight",
-            "visual_encoder.camera_encoders.0.spatial.keypoint_conv.weight",
+            "visual_encoder.encoder.obs_nets.top.backbone.nets.0.weight",
             "tactile_encoder.spatial.0.weight",
             "normalizer.params_dict.state.offset",
             "noise_predictor.final_conv.1.weight",
         }
         missing = sorted(required - keys)
+        if not (
+            "visual_encoder.encoder.obs_nets.top.pool.nets.weight" in keys
+            or "visual_encoder.encoder.obs_nets.top.nets.1.nets.weight" in keys
+        ):
+            missing.append("visual_encoder.encoder.obs_nets.top.pool.nets.weight")
         if missing:
             raise ValueError(f"Native-DP v5 checkpoint is missing required weights: {missing}")
         return super()._load_as_safetensor(model, model_file, map_location, strict)
@@ -374,17 +384,17 @@ class ACMTDPV5Policy(PreTrainedPolicy):
         self._latest_window = self._window()
 
     def encode_observation(self, observation: dict[str, Tensor]) -> Tensor:
-        visual = self.visual_encoder(observation["rgb"])
         state = observation["state"]
         tactile = observation["tactile"]
         if tuple(state.shape[1:]) != (4, 8) or tuple(tactile.shape[1:]) != (4, 2, 35, 20, 3):
             raise ValueError("v5 observation history has invalid state/tactile shape")
+        normalized_state = self.normalizer["state"].normalize(state.float())
+        visual_state = self.visual_encoder(observation["rgb"], normalized_state)
         if self.config.tactile_source == "none":
             tactile = torch.zeros_like(tactile)
         features = torch.cat(
             [
-                visual.reshape(visual.shape[0], 4, -1),
-                self.normalizer["state"].normalize(state.float()),
+                visual_state,
                 self.tactile_encoder(tactile),
             ],
             dim=-1,

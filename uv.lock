@@ -2852,6 +2852,7 @@ accelerate-dep = [
 ]
 acmt-dp = [
     { name = "diffusers" },
+    { name = "robomimic" },
 ]
 all = [
     { name = "accelerate" },
@@ -3496,6 +3497,7 @@ requires-dist = [
     { name = "qwen-vl-utils", marker = "extra == 'qwen-vl-utils-dep'", specifier = ">=0.0.11,<0.1.0" },
     { name = "reachy2-sdk", marker = "extra == 'reachy2'", specifier = ">=1.0.15,<1.1.0" },
     { name = "requests", specifier = ">=2.32.0,<3.0.0" },
+    { name = "robomimic", marker = "extra == 'acmt-dp'", specifier = "==0.2.0" },
     { name = "rerun-sdk", marker = "extra == 'viz'", specifier = ">=0.24.0,<0.34.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.14.1" },
     { name = "safetensors", specifier = ">=0.4.3,<1.0.0" },

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import importlib.metadata
+from collections import OrderedDict
 from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
-from torchvision.models import resnet18
 
 
 def replace_batchnorm_with_groupnorm(module: nn.Module) -> nn.Module:
@@ -24,94 +25,192 @@ def replace_batchnorm_with_groupnorm(module: nn.Module) -> nn.Module:
     return module
 
 
-class SpatialSoftmax(nn.Module):
-    def __init__(self, input_shape: tuple[int, int, int], num_kp: int = 32, temperature: float = 1.0) -> None:
+class NativeV5CenterCropRandomizer(nn.Module):
+    """Robomimic randomizer with the official DP eval-center behavior."""
+
+    def __init__(self, input_shape, crop_height, crop_width, num_crops=1, pos_enc=False):
         super().__init__()
-        channels, height, width = (int(value) for value in input_shape)
-        self.input_shape = (channels, height, width)
-        self.num_kp = int(num_kp)
-        self.keypoint_conv = nn.Conv2d(channels, self.num_kp, kernel_size=1)
-        self.register_buffer(
-            "pos_x", torch.linspace(-1.0, 1.0, width).repeat(height, 1).reshape(1, height * width)
-        )
-        self.register_buffer(
-            "pos_y",
-            torch.linspace(-1.0, 1.0, height).reshape(height, 1).repeat(1, width).reshape(1, height * width),
-        )
-        self.register_buffer("temperature", torch.tensor(float(temperature)))
+        self.input_shape = tuple(input_shape)
+        self.crop_height = int(crop_height)
+        self.crop_width = int(crop_width)
+        self.num_crops = int(num_crops)
+        self.pos_enc = bool(pos_enc)
 
-    def forward(self, value: torch.Tensor) -> torch.Tensor:
-        if tuple(value.shape[-3:]) != self.input_shape:
-            raise ValueError(f"SpatialSoftmax expects [...,{self.input_shape}], got {tuple(value.shape)}")
-        logits = self.keypoint_conv(value).reshape(value.shape[0], self.num_kp, -1)
-        attention = F.softmax(logits / self.temperature.clamp_min(1e-6), dim=-1)
-        x = (attention * self.pos_x.unsqueeze(1)).sum(dim=-1)
-        y = (attention * self.pos_y.unsqueeze(1)).sum(dim=-1)
-        return torch.cat([x, y], dim=-1)
+    def output_shape_in(self, input_shape=None):
+        return [self.input_shape[0] + (2 if self.pos_enc else 0), self.crop_height, self.crop_width]
+
+    def output_shape_out(self, input_shape=None):
+        return list(input_shape)
+
+    def forward_in(self, inputs):
+        if self.training:
+            from robomimic.utils import obs_utils
+
+            crops, _ = obs_utils.sample_random_image_crops(
+                images=inputs,
+                crop_height=self.crop_height,
+                crop_width=self.crop_width,
+                num_crops=self.num_crops,
+                pos_enc=self.pos_enc,
+            )
+            return torch.cat([crops[:, index] for index in range(self.num_crops)], dim=0)
+        top = (inputs.shape[-2] - self.crop_height) // 2
+        left = (inputs.shape[-1] - self.crop_width) // 2
+        cropped = inputs[..., top : top + self.crop_height, left : left + self.crop_width]
+        if self.num_crops > 1:
+            cropped = cropped.unsqueeze(1).expand(-1, self.num_crops, -1, -1, -1)
+            cropped = cropped.reshape(-1, *cropped.shape[2:])
+        return cropped
+
+    def forward_out(self, inputs):
+        if self.num_crops <= 1:
+            return inputs
+        batch = inputs.shape[0] // self.num_crops
+        return inputs.reshape(batch, self.num_crops, *inputs.shape[1:]).mean(dim=1)
 
 
-class RobomimicResNet18Spatial(nn.Module):
-    output_dim = 64
+def _official_encoder() -> nn.Module:
+    """Construct the Robomimic 0.2.0 encoder without a DP source checkout."""
 
-    def __init__(self, *, num_keypoints: int = 32) -> None:
-        super().__init__()
-        backbone = resnet18(weights=None)
-        self.backbone = nn.Sequential(*list(backbone.children())[:-2])
-        replace_batchnorm_with_groupnorm(self.backbone)
-        self.spatial = SpatialSoftmax((512, 7, 9), num_kp=num_keypoints)
+    try:
+        version = importlib.metadata.version("robomimic")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise RuntimeError("Native-DP v5 requires robomimic==0.2.0") from exc
+    if version != "0.2.0":
+        raise RuntimeError(f"Native-DP v5 requires robomimic==0.2.0, found {version}")
+    import robomimic.models.base_nets as rmbn
+    from robomimic.models.obs_nets import obs_encoder_factory
+    from robomimic.utils import obs_utils
 
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        return self.spatial(self.backbone(images))
+    camera_names = ("top", "side", "wrist_left", "wrist_right")
+    obs_utils.initialize_obs_modality_mapping_from_dict(
+        {"low_dim": ["state"], "rgb": list(camera_names), "depth": [], "scan": []}
+    )
+    encoder_kwargs = {
+        "low_dim": {
+            "core_class": None,
+            "core_kwargs": {},
+            "obs_randomizer_class": None,
+            "obs_randomizer_kwargs": {},
+        },
+        "rgb": {
+            "core_class": "VisualCore",
+            "core_kwargs": {
+                "feature_dimension": 64,
+                "flatten": True,
+                "backbone_class": "ResNet18Conv",
+                "backbone_kwargs": {"pretrained": False, "input_coord_conv": False},
+                "pool_class": "SpatialSoftmax",
+                "pool_kwargs": {
+                    "num_kp": 32,
+                    "learnable_temperature": False,
+                    "temperature": 1.0,
+                    "noise_std": 0.0,
+                    "output_variance": False,
+                },
+            },
+            "obs_randomizer_class": "CropRandomizer",
+            "obs_randomizer_kwargs": {
+                "crop_height": 216,
+                "crop_width": 288,
+                "num_crops": 1,
+                "pos_enc": False,
+            },
+        },
+    }
+    shape_meta = OrderedDict([(name, [3, 240, 320]) for name in camera_names] + [("state", [8])])
+    encoder = obs_encoder_factory(
+        shape_meta,
+        feature_activation=nn.ReLU,
+        encoder_kwargs=encoder_kwargs,
+    )
+    replace_batchnorm_with_groupnorm(encoder)
+    for name, randomizer in list(encoder.obs_randomizers.items()):
+        if isinstance(randomizer, rmbn.CropRandomizer):
+            replacement = NativeV5CenterCropRandomizer(
+                input_shape=randomizer.input_shape,
+                crop_height=randomizer.crop_height,
+                crop_width=randomizer.crop_width,
+                num_crops=randomizer.num_crops,
+                pos_enc=randomizer.pos_enc,
+            )
+            encoder.obs_randomizers[name] = replacement
+    if int(encoder.output_shape()[0]) != 264:
+        raise RuntimeError("official Robomimic encoder must output 264 values")
+    return encoder
+
+
+def _preprocess_rgb(images: torch.Tensor) -> torch.Tensor:
+    squeezed_history = images.ndim == 5
+    if squeezed_history:
+        images = images.unsqueeze(1)
+    if images.ndim != 6 or tuple(images.shape[2:4]) != (4, 3):
+        raise ValueError(f"images must be [B,T,4,3,H,W] or [B,4,3,H,W], got {tuple(images.shape)}")
+    if tuple(images.shape[-2:]) not in {(480, 640), (240, 320)}:
+        raise ValueError("native_dp_v5 RGB must be 480x640 or 240x320")
+    values = images.float()
+    if not torch.is_floating_point(images) or (values.numel() and float(values.detach().amax()) > 1.0):
+        values = values / 255.0
+    flat = values.reshape(-1, 3, values.shape[-2], values.shape[-1])
+    if tuple(flat.shape[-2:]) == (480, 640):
+        flat = F.interpolate(flat, size=(240, 320), mode="bilinear", align_corners=False, antialias=True)
+        flat = flat.mul(255.0).clamp(0.0, 255.0).round().div(255.0)
+    result = flat.reshape(images.shape[0], images.shape[1], 4, 3, 240, 320)
+    # Keep deployment numerically identical to the training ABI:
+    # [0,255] -> [0,1] -> [-1,1].
+    result = result.mul(2.0).sub(1.0)
+    return result[:, 0] if squeezed_history else result
 
 
 class NativeV5VisionEncoder(nn.Module):
+    """Official Robomimic RGB+state encoder, matching training checkpoints."""
+
     feature_dim = 64
-    camera_count = 4
+    output_dim = 264
 
     def __init__(self, *, use_group_norm: bool = True, num_keypoints: int = 32) -> None:
         super().__init__()
-        if not use_group_norm:
-            raise ValueError("native_dp_v5 requires GroupNorm visual encoders")
-        if num_keypoints != 32:
-            raise ValueError("native_dp_v5 uses 32 SpatialSoftmax keypoints")
-        self.camera_encoders = nn.ModuleList(
-            RobomimicResNet18Spatial(num_keypoints=num_keypoints) for _ in range(4)
-        )
+        if not use_group_norm or num_keypoints != 32:
+            raise ValueError("native_dp_v5 requires GroupNorm and 32 SpatialSoftmax keypoints")
+        self.encoder = _official_encoder()
         self.random_crop = False
 
     @staticmethod
     def preprocess(images: torch.Tensor) -> torch.Tensor:
-        if images.ndim != 5 or tuple(images.shape[1:3]) != (4, 3):
-            raise ValueError(f"images must be [N,4,3,H,W], got {tuple(images.shape)}")
-        if tuple(images.shape[-2:]) not in {(480, 640), (240, 320)}:
-            raise ValueError(
-                f"native_dp_v5 RGB must be raw 480x640 or resized 240x320 (4:3), got {tuple(images.shape[-2:])}"
-            )
-        source_integer = not torch.is_floating_point(images)
-        values = images.float()
-        if source_integer or (values.numel() and float(values.detach().amax()) > 1.0):
-            values = values / 255.0
-        flat = values.reshape(-1, 3, values.shape[-2], values.shape[-1])
-        if tuple(flat.shape[-2:]) != (240, 320):
-            flat = F.interpolate(flat, size=(240, 320), mode="bilinear", align_corners=False, antialias=True)
-            flat = flat.mul(255.0).clamp(0.0, 255.0).round().div(255.0)
-        cropped = flat[..., 12:228, 16:304]
-        return cropped.mul(2.0).sub(1.0).reshape(images.shape[0], 4, 3, 216, 288)
+        values = _preprocess_rgb(images)
+        if images.ndim == 5:
+            flat = values.reshape(-1, 3, 240, 320)
+            return flat[..., 12:228, 16:304].reshape(images.shape[0], 4, 3, 216, 288)
+        flat = values.reshape(-1, 3, 240, 320)
+        return flat[..., 12:228, 16:304].reshape(images.shape[0], images.shape[1], 4, 3, 216, 288)
 
-    def encode_frames(self, images: torch.Tensor) -> torch.Tensor:
-        processed = self.preprocess(images)
-        return torch.stack(
-            [encoder(processed[:, index]) for index, encoder in enumerate(self.camera_encoders)], dim=1
+    def forward(self, images: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+        if state.ndim != 3 or state.shape[:2] != images.shape[:2] or state.shape[-1] != 8:
+            raise ValueError(f"state must be [B,T,8], got {tuple(state.shape)}")
+        # _official_encoder's CropRandomizer accepts [B*T,C,H,W] values.  It
+        # is intentionally fed the same [-1,1] representation as training.
+        values = _preprocess_rgb(images)
+        batch, history = values.shape[:2]
+        frames = values.reshape(batch * history, 4, 3, 240, 320)
+        state = state.float().reshape(batch * history, 8)
+        obs = OrderedDict(
+            (name, frames[:, index])
+            for index, name in enumerate(("top", "side", "wrist_left", "wrist_right"))
         )
-
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        if images.ndim == 6:
-            batch, history, cameras = images.shape[:3]
-            if cameras != 4:
-                raise ValueError("native_dp_v5 requires four camera views")
-            features = self.encode_frames(images.reshape(batch * history, cameras, *images.shape[3:]))
-            return features.reshape(batch, history, cameras, self.feature_dim)
-        return self.encode_frames(images)
+        obs["state"] = state
+        # Deployment is always eval: the replacement randomizer therefore
+        # uses the center crop.  Explicitly avoid accidental random crops if a
+        # caller toggles this module to train mode for a smoke test.
+        previous = [value.training for value in self.encoder.obs_randomizers.values() if value is not None]
+        randomizers = [value for value in self.encoder.obs_randomizers.values() if value is not None]
+        for value in randomizers:
+            value.eval()
+        try:
+            result = self.encoder(obs)
+        finally:
+            for value, mode in zip(randomizers, previous, strict=True):
+                value.train(mode)
+        return result.reshape(batch, history, self.output_dim)
 
 
 class FrameTactileEncoder(nn.Module):
