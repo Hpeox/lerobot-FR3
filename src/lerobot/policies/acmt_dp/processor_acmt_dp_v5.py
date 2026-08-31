@@ -48,7 +48,7 @@ class ACMTDPV5ProcessorStep(ObservationProcessorStep):
     camera_keys: tuple[str, ...]
     wrist_camera_keys: tuple[str, str] = ("camera.cam3", "camera.cam4")
     tactile_source: str = "none"
-    visual_preprocess: str = "resize240_center216_range"
+    visual_preprocess: str = "robomimic_0.2.0_resize240_center216_range"
 
     def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
         result = dict(observation)

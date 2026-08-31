@@ -44,8 +44,9 @@ class ACMTDPV5Config(PreTrainedConfig):
     task_variant: str = "peg"
     checkpoint_task_variant: str | None = None
     checkpoint_schema_version: int = 5
-    checkpoint_schema: str = "acmt_dp.native_dp_v5_hybrid"
-    visual_preprocess: str = "resize240_center216_range"
+    checkpoint_schema: str = "acmt_dp.native_dp_v5_robomimic_hybrid"
+    visual_preprocess: str = "robomimic_0.2.0_resize240_center216_range"
+    observation_encoder_impl: str = "robomimic_0.2.0_official"
     vision_mode: str = "scratch"
     resize_height: int = 240
     resize_width: int = 320
@@ -134,10 +135,18 @@ class ACMTDPV5Config(PreTrainedConfig):
             self.checkpoint_task_variant = self.task_variant
         if self.checkpoint_task_variant != self.task_variant:
             raise ValueError("v5 checkpoints are task-specific")
-        if self.checkpoint_schema_version != 5 or self.checkpoint_schema != "acmt_dp.native_dp_v5_hybrid":
-            raise ValueError("checkpoint schema is not Native-DP v5")
-        if self.visual_preprocess != "resize240_center216_range":
-            raise ValueError("v5 requires resize240_center216_range preprocessing")
+        if (
+            self.checkpoint_schema_version != 5
+            or self.checkpoint_schema != "acmt_dp.native_dp_v5_robomimic_hybrid"
+        ):
+            raise ValueError(
+                "checkpoint schema is not Native-DP v5 Robomimic; v3/v4 and local-copy v5 checkpoints "
+                "must be reconverted"
+            )
+        if self.visual_preprocess != "robomimic_0.2.0_resize240_center216_range":
+            raise ValueError("v5 requires Robomimic 0.2.0 resize240_center216_range preprocessing")
+        if self.observation_encoder_impl != "robomimic_0.2.0_official":
+            raise ValueError("v5 requires the official Robomimic 0.2.0 observation encoder")
         if self.vision_mode != "scratch":
             raise ValueError("v5 deployment only supports scratch ResNet18 checkpoints")
         if (self.resize_height, self.resize_width) != (240, 320):

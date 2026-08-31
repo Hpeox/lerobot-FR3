@@ -205,7 +205,7 @@ intelrealsense = [
 phone = ["hebi-py>=2.8.0,<2.12.0", "teleop>=0.1.0,<0.2.0", "fastapi<1.0", "lerobot[scipy-dep]"]
 
 # Policies
-acmt-dp = ["lerobot[diffusers-dep]"]
+acmt-dp = ["lerobot[diffusers-dep]", "robomimic==0.2.0"]
 diffusion = ["lerobot[diffusers-dep]"]
 wallx = [
     "lerobot[transformers-dep]",

@@ -57,14 +57,26 @@ modes; `tactigen` reuses a task-matched real policy checkpoint and embeds one
 frozen TactiGen generator.
 
 The independent policy type `acmt_dp_v5` loads only checkpoints with schema
-`acmt_dp.native_dp_v5_hybrid`. It keeps the raw four-camera 4:3 input and
-performs resize `240x320`, center crop `216x288`, and `[0,1] -> [-1,1]`
-normalization online. Each camera has its own scratch ResNet18Conv with
-GroupNorm and a 32-point SpatialSoftmax, producing 64 values; no BatchNorm is
-present. The observation history is four frames with official first-frame
-padding. The internal 19-step prediction is exposed as
+`acmt_dp.native_dp_v5_robomimic_hybrid`. It constructs the official Robomimic
+0.2.0 `ObservationEncoder`: four independent scratch ResNet18Conv keys,
+GroupNorm, per-key CropRandomizer, ReLU feature activation, and a 32-point
+SpatialSoftmax producing 64 values per camera. It keeps the raw four-camera
+4:3 input and performs resize `240x320`, center crop `216x288`, and
+`[0,1] -> [-1,1]` normalization online; no BatchNorm is present. The
+observation history is four frames with official first-frame padding. The
+internal 19-step prediction is exposed as
 `prediction_raw[:,3:19]` (`[B,16,8]`), and the runtime queue executes its first
 eight actions.
+
+Install the optional dependency before constructing a v5 policy:
+
+```bash
+pip install 'lerobot[acmt-dp]'
+```
+
+This pins `robomimic==0.2.0`; v5 imports remain available without the extra,
+but model construction reports the installation command when the encoder is
+needed.
 
 Convert v5 checkpoints with the separate converter; it never accepts v3/v4
 artifacts:
@@ -72,7 +84,7 @@ artifacts:
 ```bash
 python -m lerobot.scripts.convert_acmt_dp_v5_checkpoint \
   --task peg --mode real \
-  --policy-checkpoint /data2/cym/16mm_peg_in_hole/native_dp_v5/real/scratch/seed42/best.pt \
+  --policy-checkpoint /data2/cym/16mm_peg_in_hole/native_dp_v5/real/robomimic_official/seed42/best.pt \
   --output-root outputs/acmt_dp_v5
 ```
 
