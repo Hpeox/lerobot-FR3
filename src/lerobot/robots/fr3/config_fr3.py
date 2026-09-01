@@ -76,13 +76,13 @@ class FR3Config(RobotConfig):
     # zmq_franka_gello/test_artifacts/reverse_startup_drift_20260812_194933/
     # cycle_01/robot_fgt1.jsonl.
     rollout_home_joint_positions: tuple[float, ...] = (
-        0.1416057646,
-        0.3408541381,
-        -0.0186031274,
-        -1.5938080549,
-        0.0486696586,
-        1.8890386820,
-        0.0432172865,
+        0.01913,
+        0.35567,
+        0.03481,
+        -1.61949,
+        0.02400,
+        1.91325,
+        -0.02815,
     )
     rollout_init_delta_lower: tuple[float, ...] = (-0.01,) * 7
     rollout_init_delta_upper: tuple[float, ...] = (0.01,) * 7
