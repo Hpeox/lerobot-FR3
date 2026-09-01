@@ -14,6 +14,21 @@
 
 from lerobot.utils.action_interpolator import ActionInterpolator as ActionInterpolator
 
+from .acmt_dp import (
+    ACMTDPCenter480ProcessorStep as ACMTDPCenter480ProcessorStep,
+    ACMTDPConfig as ACMTDPConfig,
+    ACMTDPPolicy as ACMTDPPolicy,
+    make_acmt_dp_pre_post_processors as make_acmt_dp_pre_post_processors,
+)
+from .acmt_dp.configuration_acmt_dp_v3 import ACMTDPV3Config as ACMTDPV3Config
+from .acmt_dp.modeling_acmt_dp_v3 import ACMTDPV3Policy as ACMTDPV3Policy
+from .acmt_dp.processor_acmt_dp_v3 import (
+    ACMTDPV3Center480ProcessorStep as ACMTDPV3Center480ProcessorStep,
+    make_acmt_dp_v3_pre_post_processors as make_acmt_dp_v3_pre_post_processors,
+)
+from .acmt_dp.configuration_acmt_dp_v5 import ACMTDPV5Config as ACMTDPV5Config
+from .acmt_dp.modeling_acmt_dp_v5 import ACMTDPV5Policy as ACMTDPV5Policy
+from .acmt_dp.processor_acmt_dp_v5 import make_acmt_dp_v5_pre_post_processors as make_acmt_dp_v5_pre_post_processors
 from .act.configuration_act import ACTConfig as ACTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
 from .eo1.configuration_eo1 import EO1Config as EO1Config
@@ -36,12 +51,24 @@ from .vqbet.configuration_vqbet import VQBeTConfig as VQBeTConfig
 from .wall_x.configuration_wall_x import WallXConfig as WallXConfig
 from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
 
-# NOTE: Policy modeling classes (e.g., GaussianActorPolicy) are intentionally NOT re-exported here.
-# They have heavy optional dependencies and are loaded lazily via get_policy_class().
-# Import directly: ``from lerobot.policies.gaussian_actor.modeling_gaussian_actor import GaussianActorPolicy``
+# NOTE: Most policy modeling classes (e.g., GaussianActorPolicy) are intentionally
+# NOT re-exported here. They have heavy optional dependencies and are loaded lazily
+# via get_policy_class(). ACMT-DP is the lightweight inference-only exception so
+# its native policy/processor contract is available from the top-level package.
 
 __all__ = [
     # Configuration classes
+    "ACMTDPConfig",
+    "ACMTDPPolicy",
+    "ACMTDPCenter480ProcessorStep",
+    "make_acmt_dp_pre_post_processors",
+    "ACMTDPV3Config",
+    "ACMTDPV3Policy",
+    "ACMTDPV3Center480ProcessorStep",
+    "make_acmt_dp_v3_pre_post_processors",
+    "ACMTDPV5Config",
+    "ACMTDPV5Policy",
+    "make_acmt_dp_v5_pre_post_processors",
     "ACTConfig",
     "DiffusionConfig",
     "EO1Config",

@@ -129,9 +129,29 @@ def build_dataset_frame(
         if key in DEFAULT_FEATURES or not key.startswith(prefix):
             continue
         elif ft["dtype"] == "float32" and len(ft["shape"]) == 1:
-            frame[key] = np.array([values[name] for name in ft["names"]], dtype=np.float32)
+            names = ft.get("names")
+            if names:
+                frame[key] = np.array([values[name] for name in names], dtype=np.float32)
+            else:
+                raw_key = key.removeprefix(f"{prefix}.")
+                array = np.asarray(values[raw_key], dtype=np.float32)
+                expected_shape = tuple(ft["shape"])
+                if array.shape == () and expected_shape == (1,):
+                    array = array.reshape(1)
+                if array.shape != expected_shape:
+                    raise ValueError(f"Feature '{key}' has shape {array.shape}, expected {expected_shape}")
+                frame[key] = array
         elif ft["dtype"] in ["image", "video"]:
             frame[key] = values[key.removeprefix(f"{prefix}.images.")]
+        elif ft["dtype"] not in ["string"]:
+            raw_key = key.removeprefix(f"{prefix}.")
+            array = np.asarray(values[raw_key], dtype=np.dtype(ft["dtype"]))
+            expected_shape = tuple(ft["shape"])
+            if array.shape == () and expected_shape == (1,):
+                array = array.reshape(1)
+            if array.shape != expected_shape:
+                raise ValueError(f"Feature '{key}' has shape {array.shape}, expected {expected_shape}")
+            frame[key] = array
 
     return frame
 
@@ -185,7 +205,7 @@ def dataset_to_policy_features(features: dict[str, dict]) -> dict[str, PolicyFea
 def combine_feature_dicts(*dicts: dict) -> dict:
     """Merge LeRobot grouped feature dicts.
 
-    - For 1D numeric specs (dtype not image/video/string) with "names": we merge the names and recompute the shape.
+    - For 1D numeric specs (dtype not image/video/string) with non-None "names": we merge the names and recompute the shape.
     - For others (e.g. `observation.images.*`), the last one wins (if they are identical).
 
     Args:
@@ -210,7 +230,7 @@ def combine_feature_dicts(*dicts: dict) -> dict:
                 dtype not in ("image", "video", "string")
                 and isinstance(shape, tuple)
                 and len(shape) == 1
-                and "names" in value
+                and value.get("names") is not None
             )
 
             if is_vector:

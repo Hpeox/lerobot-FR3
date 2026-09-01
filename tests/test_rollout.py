@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import dataclasses
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -58,6 +59,7 @@ def test_strategies_submodule_imports():
 def test_strategy_config_types():
     from lerobot.rollout import (
         BaseStrategyConfig,
+        ControlledStrategyConfig,
         DAggerStrategyConfig,
         EpisodicStrategyConfig,
         HighlightStrategyConfig,
@@ -65,6 +67,7 @@ def test_strategy_config_types():
     )
 
     assert BaseStrategyConfig().type == "base"
+    assert ControlledStrategyConfig().type == "controlled"
     assert SentryStrategyConfig().type == "sentry"
     assert HighlightStrategyConfig().type == "highlight"
     assert DAggerStrategyConfig().type == "dagger"
@@ -203,6 +206,8 @@ def test_create_strategy_dispatches():
     from lerobot.rollout import (
         BaseStrategy,
         BaseStrategyConfig,
+        ControlledStrategy,
+        ControlledStrategyConfig,
         DAggerStrategy,
         DAggerStrategyConfig,
         EpisodicStrategy,
@@ -213,6 +218,7 @@ def test_create_strategy_dispatches():
     )
 
     assert isinstance(create_strategy(BaseStrategyConfig()), BaseStrategy)
+    assert isinstance(create_strategy(ControlledStrategyConfig()), ControlledStrategy)
     assert isinstance(create_strategy(SentryStrategyConfig()), SentryStrategy)
     assert isinstance(create_strategy(DAggerStrategyConfig()), DAggerStrategy)
     assert isinstance(create_strategy(EpisodicStrategyConfig()), EpisodicStrategy)
@@ -249,6 +255,87 @@ def test_create_inference_engine_sync():
         device="cpu",
     )
     assert isinstance(engine, SyncInferenceEngine)
+
+
+def test_create_inference_engine_acmt_dp_uses_inline_sync_backend():
+    from lerobot.rollout import SyncInferenceConfig, SyncInferenceEngine, create_inference_engine
+
+    policy = SimpleNamespace(
+        name="acmt_dp",
+        robot_type="fr3",
+        config=SimpleNamespace(use_amp=False),
+    )
+    engine = create_inference_engine(
+        SyncInferenceConfig(),
+        policy=policy,
+        preprocessor=MagicMock(),
+        postprocessor=MagicMock(),
+        robot_wrapper=MagicMock(robot_type="fr3"),
+        hw_features={},
+        dataset_features={},
+        ordered_action_keys=["k"],
+        task="test",
+        fps=30.0,
+        device="cpu",
+    )
+    assert type(engine) is SyncInferenceEngine
+    assert not hasattr(engine, "_queue")
+
+
+def test_sync_engine_forwards_acmt_action_feedback():
+    from lerobot.rollout import SyncInferenceEngine
+
+    policy = MagicMock(name="policy")
+    policy.name = "acmt_dp"
+    policy.config.use_amp = False
+    engine = SyncInferenceEngine(
+        policy=policy,
+        preprocessor=MagicMock(),
+        postprocessor=MagicMock(),
+        dataset_features={},
+        ordered_action_keys=[],
+        task="test",
+        device="cpu",
+        robot_type="fr3",
+    )
+    action = torch.ones(1, 8)
+    observation = {"observation": 1}
+
+    engine.notify_action_executed(action, observation)
+
+    policy.notify_action_executed.assert_called_once_with(action, observation)
+
+
+def test_sync_engine_acmt_action_diagnostic_is_once_per_reset(caplog):
+    from lerobot.rollout import SyncInferenceEngine
+
+    policy = SimpleNamespace(
+        name="acmt_dp",
+        config=SimpleNamespace(use_amp=False),
+        reset=MagicMock(),
+    )
+    engine = SyncInferenceEngine(
+        policy=policy,
+        preprocessor=MagicMock(),
+        postprocessor=MagicMock(),
+        dataset_features={},
+        ordered_action_keys=[],
+        task="test",
+        device="cpu",
+        robot_type="fr3",
+    )
+    q = {f"fr3_joint{index}.pos": float(index) for index in range(1, 8)}
+
+    with caplog.at_level("INFO", logger="lerobot.rollout.inference.sync"):
+        engine.record_first_action_diagnostic(q, q, q)
+        engine.record_first_action_diagnostic(q, q, q)
+
+    assert sum("ACMT-DP first action diagnostic" in record.message for record in caplog.records) == 1
+
+    engine.reset()
+    with caplog.at_level("INFO", logger="lerobot.rollout.inference.sync"):
+        engine.record_first_action_diagnostic(q, q, q)
+    assert sum("ACMT-DP first action diagnostic" in record.message for record in caplog.records) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -348,3 +435,70 @@ def test_rollout_context_fields():
 
     field_names = {f.name for f in dataclasses.fields(RolloutContext)}
     assert field_names == {"runtime", "hardware", "policy", "processors", "data"}
+
+
+def test_visual_feature_coverage_requires_every_policy_camera_but_allows_robot_superset():
+    from lerobot.rollout.context import _validate_visual_feature_coverage
+
+    cam1 = {
+        "observation.images.camera.cam1.rgb",
+        "observation.images.camera.cam1.depth",
+    }
+    cam2 = {
+        "observation.images.camera.cam2.rgb",
+        "observation.images.camera.cam2.depth",
+    }
+    _validate_visual_feature_coverage(cam1, cam1 | cam2)
+    with pytest.raises(ValueError, match="camera.cam2"):
+        _validate_visual_feature_coverage(cam1 | cam2, cam1)
+
+
+def test_create_inference_engine_acmt_dp_v5_uses_rolling_engine():
+    from lerobot.rollout import ACMTDPInferenceEngine, SyncInferenceConfig, create_inference_engine
+
+    policy = SimpleNamespace(
+        name="acmt_dp_v5",
+        config=SimpleNamespace(
+            use_amp=False, control_hz=30.0, action_execution_horizon=8, tactile_history=4,
+            pred_horizon=16, action_dim=8, checkpoint_schema_version=5, tactile_source="none",
+        ),
+        robot_type="fr3",
+    )
+    engine = create_inference_engine(
+        SyncInferenceConfig(),
+        policy=policy,
+        preprocessor=MagicMock(),
+        postprocessor=MagicMock(),
+        robot_wrapper=MagicMock(robot_type="fr3"),
+        hw_features={},
+        dataset_features={},
+        ordered_action_keys=["k"],
+        task="gear_insert_big2small",
+        fps=30.0,
+        device="cpu",
+    )
+    assert isinstance(engine, ACMTDPInferenceEngine)
+    assert hasattr(engine, "_queue")
+
+def test_sync_engine_forwards_acmt_dp_v5_action_feedback():
+    from lerobot.rollout import SyncInferenceEngine
+
+    policy = MagicMock(name="policy")
+    policy.name = "acmt_dp_v5"
+    policy.config.use_amp = False
+    engine = SyncInferenceEngine(
+        policy=policy,
+        preprocessor=MagicMock(),
+        postprocessor=MagicMock(),
+        dataset_features={},
+        ordered_action_keys=[],
+        task="gear_insert_big2small",
+        device="cpu",
+        robot_type="fr3",
+    )
+    action = torch.ones(1, 8)
+    observation = {"observation": 1}
+
+    engine.notify_action_executed(action, observation)
+
+    policy.notify_action_executed.assert_called_once_with(action, observation)

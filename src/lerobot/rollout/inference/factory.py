@@ -34,6 +34,7 @@ from lerobot.processor import PolicyProcessorPipeline
 
 from ..robot_wrapper import ThreadSafeRobot
 from .base import InferenceEngine
+from .acmt_dp import ACMTDPInferenceEngine
 from .rtc import RTCInferenceEngine
 from .sync import SyncInferenceEngine
 
@@ -99,6 +100,21 @@ def create_inference_engine(
     """Instantiate the appropriate inference engine from a config object."""
     logger.info("Creating inference engine: %s", config.type)
     if isinstance(config, SyncInferenceConfig):
+        if getattr(policy, "name", None) in {"acmt_dp_v3", "acmt_dp_v5"}:
+            return ACMTDPInferenceEngine(
+                policy=policy,
+                preprocessor=preprocessor,
+                postprocessor=postprocessor,
+                dataset_features=dataset_features,
+                ordered_action_keys=ordered_action_keys,
+                task=task,
+                device=device,
+                robot_type=robot_wrapper.robot_type,
+            )
+        # Native-DP v4 and other policies retain the ordinary inline synchronous path.
+        # v4 still produces its native chunk in ``select_action``;
+        # this backend returns that call's first action without maintaining a
+        # second rolling/action queue in the rollout layer.
         return SyncInferenceEngine(
             policy=policy,
             preprocessor=preprocessor,
@@ -110,6 +126,8 @@ def create_inference_engine(
             robot_type=robot_wrapper.robot_type,
         )
     if isinstance(config, RTCInferenceConfig):
+        if getattr(policy, "name", None) in {"acmt_dp", "acmt_dp_v3", "acmt_dp_v5"}:
+            raise ValueError("ACMT-DP v3/v4/v5 supports only --inference.type=sync; RTC is unsupported")
         return RTCInferenceEngine(
             policy=policy,
             preprocessor=preprocessor,

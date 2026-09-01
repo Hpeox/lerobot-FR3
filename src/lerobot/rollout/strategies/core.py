@@ -21,6 +21,8 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
+import torch
+
 from lerobot.datasets.utils import DEFAULT_VIDEO_FILE_SIZE_IN_MB
 from lerobot.utils.action_interpolator import ActionInterpolator
 from lerobot.utils.constants import OBS_STR
@@ -301,5 +303,25 @@ def send_next_action(
         raise ValueError(f"Interpolated tensor length ({len(interp)}) != action keys ({len(ordered_keys)})")
     action_dict = {k: interp[i].item() for i, k in enumerate(ordered_keys)}
     processed = ctx.processors.robot_action_processor((action_dict, obs_raw))
-    ctx.hardware.robot_wrapper.send_action(processed)
+    sent = ctx.hardware.robot_wrapper.send_action(processed)
+    diagnostic = getattr(engine, "record_first_action_diagnostic", None)
+    if sent is not None and callable(diagnostic):
+        try:
+            diagnostic(obs_raw, action_dict, sent)
+        except Exception:
+            # Diagnostics must never change the action lifecycle or make a
+            # successful transport send fail.
+            logger.warning("Inference first-action diagnostic failed", exc_info=True)
+    # Stateful policies such as ACMT-DP need the command that the transport
+    # actually accepted (FR3 may clip the gripper), not the pre-processor value.
+    feedback = getattr(engine, "notify_action_executed", None)
+    if sent is not None and callable(feedback):
+        sent_values = sent if isinstance(sent, dict) else processed
+        try:
+            executed = torch.tensor(
+                [float(sent_values[key]) for key in ordered_keys], dtype=torch.float32
+            ).unsqueeze(0)
+            feedback(executed, obs_processed)
+        except (KeyError, TypeError, ValueError):
+            logger.debug("Inference engine did not accept action feedback", exc_info=True)
     return action_dict

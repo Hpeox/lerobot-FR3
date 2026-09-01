@@ -534,6 +534,33 @@ def test_cleanup_interrupted_episode_removes_image_temp_dirs(tmp_path, empty_ler
     assert not vid_img_dir.exists(), "video temp dir leaked after cleanup_interrupted_episode"
 
 
+def test_clear_episode_buffer_removes_image_and_video_temp_dirs(tmp_path, empty_lerobot_dataset_factory):
+    features = {
+        "image": {"dtype": "image", "shape": DUMMY_CHW, "names": ["channels", "height", "width"]},
+        "video": {"dtype": "video", "shape": DUMMY_HWC, "names": ["height", "width", "channels"]},
+    }
+    dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "cleared", features=features, streaming_encoding=False
+    )
+    dataset.add_frame(
+        {
+            "image": np.random.rand(*DUMMY_CHW),
+            "video": np.random.rand(*DUMMY_HWC),
+            "task": "Dummy task",
+        }
+    )
+    image_dir = dataset.writer._get_image_file_dir(0, "image")
+    video_dir = dataset.writer._get_image_file_dir(0, "video")
+    assert image_dir.exists()
+    assert video_dir.exists()
+
+    dataset.clear_episode_buffer()
+
+    assert not image_dir.exists()
+    assert not video_dir.exists()
+    assert not dataset.has_pending_frames()
+
+
 def test_tmp_mixed_deletion(tmp_path, empty_lerobot_dataset_factory):
     """Verify temporary image directories are removed appropriately when both image and video features are present."""
     image_key = "image"

@@ -48,7 +48,7 @@ from lerobot.robots import make_robot_from_config
 from lerobot.teleoperators import Teleoperator, make_teleoperator_from_config
 from lerobot.utils.feature_utils import combine_feature_dicts, hw_to_dataset_features
 
-from .configs import BaseStrategyConfig, DAggerStrategyConfig, RolloutConfig
+from .configs import BaseStrategyConfig, ControlledStrategyConfig, DAggerStrategyConfig, RolloutConfig
 from .inference import (
     InferenceEngine,
     RTCInferenceConfig,
@@ -58,6 +58,18 @@ from .inference import (
 from .robot_wrapper import ThreadSafeRobot
 
 logger = logging.getLogger(__name__)
+
+
+def _require_controlled_capabilities(robot) -> None:
+    """Fail before connect when a robot lacks the FR3-style Controlled hooks."""
+
+    required_capabilities = ("initialize_rollout", "return_to_home")
+    missing = [name for name in required_capabilities if not callable(getattr(robot, name, None))]
+    if missing:
+        raise NotImplementedError(
+            f"Controlled rollout requires robot capabilities {required_capabilities}; "
+            f"{type(robot).__name__} is missing {missing}"
+        )
 
 
 def _resolve_action_key_order(
@@ -159,6 +171,19 @@ class RolloutContext:
 # ---------------------------------------------------------------------------
 
 
+def _validate_visual_feature_coverage(expected: set[str], provided: set[str]) -> None:
+    missing = expected - provided
+    if missing:
+        raise ValueError(
+            f"Visual feature mismatch between policy and robot hardware.\n"
+            f"Policy expects: {expected}\n"
+            f"Robot provides: {provided}\n"
+            f"Missing from robot: {missing}\n"
+            f"Use --rename_map to map camera names, e.g. "
+            f"""--rename_map='{{"observation.images.top": "observation.images.cam0"}}'"""
+        )
+
+
 def build_rollout_context(
     cfg: RolloutConfig,
     shutdown_event: Event,
@@ -172,10 +197,18 @@ def build_rollout_context(
     fails fast without touching the robot.
     """
     is_rtc = isinstance(cfg.inference, RTCInferenceConfig)
+    policy_config = cfg.policy
+
+    if policy_config is not None and policy_config.type in {"acmt_dp", "acmt_dp_v3", "acmt_dp_v5"}:
+        if cfg.fps != 30.0:
+            raise ValueError("ACMT-DP v3/v4/v5 rollout requires fps=30")
+        if cfg.interpolation_multiplier != 1:
+            raise ValueError("ACMT-DP v3/v4/v5 rollout requires interpolation_multiplier=1")
+        if is_rtc:
+            raise ValueError("ACMT-DP v3/v4/v5 supports only --inference.type=sync; RTC is unsupported")
 
     # --- 1. Policy (heavy I/O, but no hardware yet) -------------------
     logger.info("Loading policy from '%s'...", cfg.policy.pretrained_path)
-    policy_config = cfg.policy
     policy_class = get_policy_class(policy_config.type)
 
     if hasattr(policy_config, "compile_model"):
@@ -235,13 +268,20 @@ def build_rollout_context(
     # --- 3. Hardware (heaviest side-effect, deferred) -----------------
     logger.info("Connecting robot (%s)...", cfg.robot.type if cfg.robot else "?")
     robot = make_robot_from_config(cfg.robot)
+    is_controlled = isinstance(cfg.strategy, ControlledStrategyConfig)
+    if is_controlled:
+        _require_controlled_capabilities(robot)
     robot.connect()
     logger.info("Robot connected: %s", robot.name)
 
     # Store the initial joint positions so we can return to a safe pose on shutdown.
-    initial_obs = robot.get_observation()
-    initial_position = {k: v for k, v in initial_obs.items() if k.endswith(".pos")}
-    logger.info("Captured initial robot position (%d keys)", len(initial_position))
+    if is_controlled:
+        initial_position = None
+        logger.info("Controlled rollout skips startup-pose observation")
+    else:
+        initial_obs = robot.get_observation()
+        initial_position = {k: v for k, v in initial_obs.items() if k.endswith(".pos")}
+        logger.info("Captured initial robot position (%d keys)", len(initial_position))
 
     robot_wrapper = ThreadSafeRobot(robot)
 
@@ -291,13 +331,22 @@ def build_rollout_context(
         use_videos=cfg.dataset.video if cfg.dataset else True,
     )
     # Observation-side aggregation is needed because of build_dataset_frame
-    observation_dataset_features = aggregate_pipeline_dataset_features(
-        pipeline=robot_observation_processor,
-        initial_features=create_initial_features(observation=observation_features_hw),
-        use_videos=cfg.dataset.video if cfg.dataset else True,
-    )
+    explicit_observation_features = getattr(robot, "observation_dataset_features", None)
+    if callable(explicit_observation_features):
+        observation_dataset_features = explicit_observation_features(
+            use_videos=cfg.dataset.video if cfg.dataset else True
+        )
+    else:
+        observation_dataset_features = aggregate_pipeline_dataset_features(
+            pipeline=robot_observation_processor,
+            initial_features=create_initial_features(observation=observation_features_hw),
+            use_videos=cfg.dataset.video if cfg.dataset else True,
+        )
     dataset_features = combine_feature_dicts(action_dataset_features, observation_dataset_features)
-    hw_features = hw_to_dataset_features(observation_features_hw, "observation")
+    if callable(explicit_observation_features):
+        hw_features = explicit_observation_features(use_videos=False)
+    else:
+        hw_features = hw_to_dataset_features(observation_features_hw, "observation")
     raw_action_keys = list(action_features_hw.keys())
     policy_action_names = getattr(policy_config, "action_feature_names", None)
     ordered_action_keys = _resolve_action_key_order(
@@ -311,19 +360,13 @@ def build_rollout_context(
         expected_visuals = {
             k for k, v in policy_config.input_features.items() if v.type == FeatureType.VISUAL
         }
-        provided_visuals = {
-            f"observation.images.{k}" for k, v in robot.observation_features.items() if isinstance(v, tuple)
-        }
-        policy_subset = expected_visuals.issubset(provided_visuals)
-        hw_subset = provided_visuals.issubset(expected_visuals)
-        if not (policy_subset or hw_subset):
-            raise ValueError(
-                f"Visual feature mismatch between policy and robot hardware.\n"
-                f"Policy expects: {expected_visuals}\n"
-                f"Robot provides: {provided_visuals}\n"
-                f"Use --rename_map to map camera names, e.g. "
-                f"""--rename_map='{{"observation.images.top": "observation.images.cam0"}}'"""
+        visual_feature_keys = getattr(robot, "visual_feature_keys", None)
+        if visual_feature_keys is None:
+            visual_feature_keys = tuple(
+                k for k, v in robot.observation_features.items() if isinstance(v, tuple)
             )
+        provided_visuals = {f"observation.images.{k}" for k in visual_feature_keys}
+        _validate_visual_feature_coverage(expected_visuals, provided_visuals)
 
     # --- 5. Dataset -------------
     dataset = None

@@ -22,6 +22,7 @@ real robots.
 Strategies
 ----------
     --strategy.type=base       Autonomous rollout, no recording
+    --strategy.type=controlled Persistent worker controlled over UDS
     --strategy.type=sentry     Continuous recording with auto-upload
     --strategy.type=highlight  Ring buffer + keystroke save
     --strategy.type=dagger     Human-in-the-loop (DAgger / RaC)
@@ -43,6 +44,14 @@ Usage examples
         --robot.type=koch_follower \\
         --robot.port=/dev/ttyACM0 \\
         --task="pick up cube" --duration=30
+
+    # Controlled FR3 worker — dataset recording is optional
+    lerobot-rollout \
+        --strategy.type=controlled \
+        --strategy.control_socket_path=/run/user/1000/lerobot_controlled.sock \
+        --policy.path=user/fr3_policy \
+        --robot.type=fr3 \
+        --task="controlled inference"
 
     # Base mode — RTC inference for slow VLAs (Pi0, Pi0.5, SmolVLA)
     lerobot-rollout \\
@@ -173,6 +182,7 @@ from lerobot.robots import (  # noqa: F401
     unitree_g1 as unitree_g1_robot,
 )
 from lerobot.rollout import RolloutConfig, build_rollout_context, create_strategy
+from lerobot.rollout.configs import ControlledStrategyConfig
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
@@ -232,6 +242,8 @@ def rollout(cfg: RolloutConfig):
         logger.info("Rollout setup complete, starting rollout...")
         strategy.run(ctx)
     except KeyboardInterrupt:
+        if isinstance(cfg.strategy, ControlledStrategyConfig):
+            raise
         logger.info("Interrupted by user")
     finally:
         strategy.teardown(ctx)

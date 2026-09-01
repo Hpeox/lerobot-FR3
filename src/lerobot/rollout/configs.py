@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import abc
 import logging
+import os
 from dataclasses import dataclass, field
 
 import draccus
@@ -56,6 +57,22 @@ class BaseStrategyConfig(RolloutStrategyConfig):
     """Autonomous rollout with no data recording."""
 
     pass
+
+
+def _default_control_socket_path() -> str:
+    return f"/run/user/{os.getuid()}/lerobot_controlled.sock"
+
+
+@RolloutStrategyConfig.register_subclass("controlled")
+@dataclass
+class ControlledStrategyConfig(RolloutStrategyConfig):
+    """Persistent rollout worker controlled by an external process over UDS."""
+
+    control_socket_path: str = field(default_factory=_default_control_socket_path)
+
+    def __post_init__(self) -> None:
+        if not self.control_socket_path:
+            raise ValueError("Controlled strategy requires a non-empty control_socket_path")
 
 
 @RolloutStrategyConfig.register_subclass("sentry")
@@ -210,13 +227,13 @@ class RolloutConfig:
     # Policy (loaded from --policy.path via __post_init__)
     policy: PreTrainedConfig | None = None
 
-    # Strategy (polymorphic: --strategy.type=base|sentry|highlight|dagger)
+    # Strategy (polymorphic: --strategy.type=base|controlled|sentry|highlight|dagger|episodic)
     strategy: RolloutStrategyConfig = field(default_factory=BaseStrategyConfig)
 
     # Inference backend (polymorphic: --inference.type=sync|rtc)
     inference: InferenceEngineConfig = field(default_factory=SyncInferenceConfig)
 
-    # Dataset (required for sentry, highlight, dagger; None for base)
+    # Dataset (required for recording strategies, optional for controlled, None for base)
     dataset: DatasetRecordConfig | None = None
 
     # Runtime
@@ -271,6 +288,13 @@ class RolloutConfig:
         )
         if needs_dataset and (self.dataset is None or not self.dataset.repo_id):
             raise ValueError(f"{self.strategy.type} strategy requires --dataset.repo_id to be set")
+
+        if (
+            isinstance(self.strategy, ControlledStrategyConfig)
+            and self.dataset is not None
+            and not self.dataset.repo_id
+        ):
+            raise ValueError("controlled strategy requires --dataset.repo_id when --dataset.* is supplied")
 
         if isinstance(self.strategy, BaseStrategyConfig) and self.dataset is not None:
             raise ValueError(

@@ -20,6 +20,7 @@ require_package("datasets", extra="dataset")
 
 from .configs import (
     BaseStrategyConfig,
+    ControlledStrategyConfig,
     DAggerKeyboardConfig,
     DAggerPedalConfig,
     DAggerStrategyConfig,
@@ -39,6 +40,7 @@ from .context import (
     build_rollout_context,
 )
 from .inference import (
+    ACMTDPInferenceEngine,
     InferenceEngine,
     InferenceEngineConfig,
     RTCInferenceConfig,
@@ -49,6 +51,7 @@ from .inference import (
 )
 from .strategies import (
     BaseStrategy,
+    ControlledStrategy,
     DAggerStrategy,
     EpisodicStrategy,
     HighlightStrategy,
@@ -59,7 +62,10 @@ from .strategies import (
 
 __all__ = [
     "BaseStrategy",
+    "ACMTDPInferenceEngine",
     "BaseStrategyConfig",
+    "ControlledStrategy",
+    "ControlledStrategyConfig",
     "DAggerKeyboardConfig",
     "DAggerPedalConfig",
     "DAggerStrategy",

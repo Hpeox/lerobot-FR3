@@ -125,7 +125,15 @@ def prepare_observation_for_inference(
     """
     for name in observation:
         observation[name] = torch.from_numpy(observation[name])
-        if "image" in name:
+        if robot_type == "fr3" and (
+            name.endswith(".force_field") or name.startswith("observation.images.camera.cam")
+        ):
+            from lerobot.robots.fr3.processor_fr3 import prepare_fr3_array_for_policy
+
+            observation[name] = prepare_fr3_array_for_policy(name, observation[name])
+            observation[name] = observation[name].to(device)
+            continue
+        elif "image" in name:
             if observation[name].dtype == torch.uint8:
                 observation[name] = observation[name].type(torch.float32) / 255
             observation[name] = observation[name].permute(2, 0, 1).contiguous()

@@ -72,6 +72,9 @@ class InferenceEngine(abc.ABC):
     def notify_observation(self, obs: dict) -> None:  # noqa: B027
         """Publish the latest processed observation.  Default: no-op."""
 
+    def notify_action_executed(self, action: torch.Tensor, observation: dict | None = None) -> None:  # noqa: B027
+        """Publish the command confirmed by the robot transport. Default: no-op."""
+
     def pause(self) -> None:  # noqa: B027
         """Pause background inference.  Default: no-op."""
 

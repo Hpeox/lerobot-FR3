@@ -391,20 +391,24 @@ def record(
         robot_action_processor = robot_action_processor or _r
         robot_observation_processor = robot_observation_processor or _o
 
-    dataset_features = combine_feature_dicts(
-        aggregate_pipeline_dataset_features(
-            pipeline=teleop_action_processor,
-            initial_features=create_initial_features(
-                action=robot.action_features
-            ),  # TODO(steven, pepijn): in future this should be come from teleop or policy
-            use_videos=cfg.dataset.video,
-        ),
-        aggregate_pipeline_dataset_features(
+    action_dataset_features = aggregate_pipeline_dataset_features(
+        pipeline=teleop_action_processor,
+        initial_features=create_initial_features(
+            action=robot.action_features
+        ),  # TODO(steven, pepijn): in future this should be come from teleop or policy
+        use_videos=cfg.dataset.video,
+    )
+    explicit_observation_features = getattr(robot, "observation_dataset_features", None)
+    observation_dataset_features = (
+        explicit_observation_features(use_videos=cfg.dataset.video)
+        if callable(explicit_observation_features)
+        else aggregate_pipeline_dataset_features(
             pipeline=robot_observation_processor,
             initial_features=create_initial_features(observation=robot.observation_features),
             use_videos=cfg.dataset.video,
-        ),
+        )
     )
+    dataset_features = combine_feature_dicts(action_dataset_features, observation_dataset_features)
 
     dataset = None
     listener = None

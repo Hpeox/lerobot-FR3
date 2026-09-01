@@ -1,0 +1,152 @@
+# FR3 Robot and SensorHub
+
+The `fr3` Robot integrates an FR3 arm, Robotiq gripper, an ordered non-empty subset of externally
+managed RealSense writers, a dual-Xense writer, and an FT300S writer. The Robot owns only its
+SensorHub subprocess and its local command publisher. It never starts or stops the upstream sensor
+writers, telemetry relay, or remote command subscriber.
+
+## Scope and startup
+
+An external run controller does not exist yet and is not part of this implementation. Until one is
+implemented, an operator or temporary script must start and verify these prerequisites before
+starting LeRobot:
+
+1. Every RealSense SHM writer selected by `realsense_shm_names`; the default tuple is
+   `("/realsense_cam1", "/realsense_cam2")`.
+2. The dual-Xense writer: `xense_sensor_frame`.
+3. The FT300S writer: `ft300_sensor_frame`.
+4. The FGT1 telemetry relay at `tcp://192.168.10.37:6000`.
+5. The remote command `SUB` bound to `tcp://*:6001`.
+
+`FR3.connect()` starts SensorHub, which defensively attaches and validates those already-running
+sources. Every source must produce at least two coherent, advancing samples, and SensorHub must
+publish one aligned snapshot before it reports `READY`. A missing or invalid prerequisite makes
+`connect()` fail within the configured startup timeout.
+
+Example CLI selection:
+
+```bash
+lerobot-rollout \
+  --robot.type=fr3 \
+  --robot.id=fr3 \
+  ...
+```
+
+Install the ZMQ dependency with `pip install 'lerobot[fr3]'` (or the equivalent `uv` command).
+
+## Action and observation interface
+
+Actions contain exactly `fr3_joint1.pos` through `fr3_joint7.pos` in radians and `gripper.pos` on
+the policy scale `[0, 1]`. Joint values are not limited in the Robot. The gripper value is clamped,
+logged when changed, and converted with `floor(value * 255 + 0.5)`. `send_action()` returns the eight
+values actually submitted to the local publisher.
+
+Observations expose joint position, velocity, torque, normalized and raw gripper feedback, FT300S
+wrench, a conventional float32 `(4, 4)` `O_T_EE`, two independent `(35, 20, 3)` float32 Xense
+force fields, and one RGB/Z16 depth pair per configured RealSense input. Tuple order defines the
+logical `camera.cam1` through `camera.camN` order. The FR3 feature adapter declares Xense as numeric
+Array3D data; it is not encoded as video.
+The FR3 policy processor converts online Xense HWC to BCHW and offline BTHWC to BTCHW. It performs
+no sensor I/O, alignment, feature encoding, safety control, or CNN fusion.
+
+## Command ABI v1
+
+The Robot uses a latest-only ZMQ `PUB` that connects to `tcp://192.168.10.37:6001`. The remote
+controller uses `SUB`, binds `tcp://*:6001`, subscribes to `b""`, and both sides use `CONFLATE=1`,
+HWM 1, and `LINGER=0`. Messages are single-part, little-endian, and exactly 112 bytes:
+
+```text
+offset  size  field
+0       8     magic = "FRCMD1\0\0"
+8       4     abi_version = 1
+12      4     header_size = 48
+16      4     total_size = 112
+20      4     flags (bit 0 = RESET_JOINT)
+24      8     sequence:uint64
+32      8     realtime_ns:int64
+40      8     monotonic_ns:int64
+48      56    joint_targets[7]:float64
+104     1     gripper_gPO:uint8
+105     7     zero padding
+```
+
+PUB/SUB has no delivery acknowledgement. The remote subscriber must be ready first, and its
+real-time controller must implement the watchdog/timeout hold behavior; that remote implementation
+is outside this repository.
+
+Normal `send_action()` frames use flags `0`. The FR3-specific internal `_reset_joints(q_reset)`
+operation sends bit 0 (`RESET_JOINT`) with seven concrete reset targets and `gripper_gPO=0`. It
+allocates one command sequence and retransmits the identical frame until robot telemetry reports
+`RESETTING=1`; repeated frames with that sequence must be idempotent on the remote controller. It
+then stops retransmitting and returns only after telemetry reports `RESETTING=0`. The acknowledgement
+and completion waits have finite configurable timeouts. This operation is not part of the generic
+LeRobot `Robot` interface and is intended only for a rollout `INITIALIZE` phase boundary. The remote
+reset implementation must ignore the gripper byte in a `RESET_JOINT` frame.
+
+## FGT1 telemetry ABI
+
+SensorHub accepts only 504-byte `FGT1` version 1 frames. Robot source 2 requires valid-mask bit 2
+and maps `q=floats[8:15]`, `dq=floats[15:22]`, `tau_J=floats[22:29]`, and
+`O_T_EE=floats[36:52]`. The libfranka matrix is column-major on the wire and is converted exactly
+once at this protocol boundary into a conventional float32 `(4, 4)` matrix. Gripper source 3
+requires valid-mask bit 4 and supplies `gPO/gCU`. Their sequences and caches remain independent.
+GELLO source 1 is ignored. Robot telemetry flags bit 0 is `RESETTING`; SensorHub carries it only as
+runtime control state. It is not part of `RobotSample`, aligned SHM, or the observation dictionary.
+
+## AlignedObservation SHM ABI v2
+
+SensorHub owns `/fr3_aligned_observation`. It is a Linux x86-64 little-endian, 8-byte-aligned,
+two-slot seqlock mapping with magic `FR3OBS2\0`. For `N = len(realsense_shm_names)`:
+
+```text
+global header size = 320
+slot header size   = 96 + 16*N
+payload size       = N*(921,600 + 614,400) + 16,984
+slot stride        = slot header size + payload size
+total size         = 320 + 2*slot stride
+```
+
+The global header stores ABI sizes, dimensions, `camera_count`, latest sequence, and fatal
+status/message. The slot header stores aligned metadata followed by sequence/source-time pairs for
+the N ordered cameras, Xense, FT300S, robot, and gripper. Payload order is N RGB arrays, N depth
+arrays, two Xense fields, wrench, q, dq, tau_J, `O_T_EE`, normalized gripper position, gPO, gCU,
+and six padding bytes. Camera names are not encoded in this mapping.
+
+For snapshot `L`, slot `L % 2` is stable only when its seqlock equals `2 * L`. A reader copies the
+whole slot and checks the seqlock again. The Robot returns arrays backed by that independent local
+copy, so a later SensorHub publication cannot overwrite data already handed to a policy thread.
+
+## SensorHub control and failure behavior
+
+The control socket uses `AF_UNIX/SOCK_SEQPACKET`. Each JSON packet is at most 512 bytes and contains
+exactly `protocol_version`, `type`, `sequence`, `timestamp_ns`, `status_code`, and `message`. Types are
+`READY`, `HEALTH`, `FATAL`, `PING`, `PONG`, `SHUTDOWN`, `GET_ROBOT_RESETTING`, and
+`ROBOT_RESETTING`. Protocol version 2 uses `ROBOT_RESETTING.status_code` values 0, 1, and 2 for idle,
+resetting, and unknown. FR3 request sequences and SensorHub response/status sequences are independent
+directional counters; neither is related to the FRCMD1 command sequence.
+
+All modalities are required. There is no reader reconnect, SHM remap, local recovery, or automatic
+SensorHub restart. After strict startup, temporary data absence and alignment misses cause
+`CausalAligner.select()` to return `None`; SensorHub retries without publishing or declaring fatal.
+The same bounded caches, process, and aligned SHM remain in place, and publication resumes when a
+complete causal sample is available. `required_sample_max_age_ms` rejects stale cached telemetry, so
+NUC recovery does not require cache clearing. Unexpected reader/parser, ABI, publisher, internal IPC,
+or invariant failures remain fatal. Parent disappearance terminates SensorHub without sending
+`FATAL`. `FR3.disconnect()` requests `SHUTDOWN`, then escalates to process-group `SIGTERM` and
+`SIGKILL` if necessary. It does not signal external writers, the relay, or the remote controller.
+
+The aligned SHM is a session-level stream. Its `latest_sequence` remains monotonic across rollout
+boundaries and source outages; it stops advancing while no valid aligned sample exists and resumes
+in the same mapping afterward. The SensorHub alignment publisher emits at most one snapshot every
+`33.333 ms` (30 Hz), schedules the next publication from the completion of the previous one, and
+does not catch up with a burst after scheduler delay. The reader copies each selected slot once
+through a `memoryview` into an owned `bytearray`, then performs the existing seqlock validation;
+the returned arrays remain independent of later SensorHub publications.
+
+## Future external controller contract
+
+The future controller should start and monitor its owned writers, relay, and remote subscriber;
+verify source-level liveness; start LeRobot; and use aligned SHM progress as the coarse final-data
+health signal. It should decide rollout/session policy without supervising SensorHub or interpreting
+the private FR3/SensorHub reset protocol. This is an interface contract only—no external controller
+is implemented here.
