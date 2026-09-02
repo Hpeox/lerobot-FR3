@@ -275,12 +275,16 @@ class ACMTDPInferenceEngine(InferenceEngine):
             getattr(config, "pred_horizon", 16) != PREDICTION_HORIZON
             or getattr(config, "action_dim", 8) != ACTION_DIM
         ):
-            raise ValueError("ACMT-DP v3/v4/v5 rollout requires pred_horizon=16 and action_dim=8")
+            raise ValueError("ACMT-DP/ACMT-ACT rollout requires pred_horizon=16 and action_dim=8")
+        policy_name = getattr(policy, "name", None)
         schema_version = getattr(config, "checkpoint_schema_version", 4)
-        if schema_version not in (3, 4, 5):
+        if policy_name == "acmt_act":
+            if getattr(config, "checkpoint_schema", None) != "acmt_act.v2" or schema_version != 2:
+                raise ValueError("ACMT-ACT rollout requires checkpoint schema acmt_act.v2")
+        elif schema_version not in (3, 4, 5):
             raise ValueError("ACMT-DP rollout requires checkpoint_schema_version=3, 4 or 5")
-        if getattr(config, "tactile_source", None) == "tactigen":
-            logger.info("ACMT-DP TactiGen uses rolling 16/8 runtime; RTC is unsupported")
+        if getattr(config, "tactile_source", None) in {"tactigen", "substitution"}:
+            logger.info("Causal tactile generation uses the sync 16/8 runtime; RTC is unsupported")
 
     def start(self) -> None:
         self._stopped = False
@@ -539,7 +543,7 @@ class ACMTDPInferenceEngine(InferenceEngine):
             current_window = getattr(self, "_current_action_window", None)
             self._current_action_window = None
             generation = self._generation
-            if getattr(self._policy.config, "tactile_source", None) == "tactigen":
+            if getattr(self._policy.config, "tactile_source", None) in {"tactigen", "substitution"}:
                 self._tactile_future = self._tactile_worker.submit(
                     self._notify_tactile,
                     action.to(self._device),

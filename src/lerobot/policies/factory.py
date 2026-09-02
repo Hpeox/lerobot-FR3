@@ -47,6 +47,7 @@ from lerobot.utils.feature_utils import dataset_to_policy_features
 from .acmt_dp.configuration_acmt_dp import ACMTDPConfig
 from .acmt_dp.configuration_acmt_dp_v3 import ACMTDPV3Config
 from .acmt_dp.configuration_acmt_dp_v5 import ACMTDPV5Config
+from .acmt_act.configuration_acmt_act import ACMTACTConfig
 from .act.configuration_act import ACTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig
 from .eo1.configuration_eo1 import EO1Config
@@ -128,6 +129,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .act.modeling_act import ACTPolicy
 
         return ACTPolicy
+    elif name == "acmt_act":
+        from .acmt_act.modeling_acmt_act import ACMTACTPolicy
+
+        return ACMTACTPolicy
     elif name == "multi_task_dit":
         from .multi_task_dit.modeling_multi_task_dit import MultiTaskDiTPolicy
 
@@ -230,6 +235,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return DiffusionConfig(**kwargs)
     elif policy_type == "act":
         return ACTConfig(**kwargs)
+    elif policy_type == "acmt_act":
+        return ACMTACTConfig(**kwargs)
     elif policy_type == "multi_task_dit":
         return MultiTaskDiTConfig(**kwargs)
     elif policy_type == "vqbet":
@@ -341,12 +348,25 @@ def make_pre_post_processors(
                 ),
             )
 
+        # ACMT-ACT substitution deliberately reuses the real checkpoint's
+        # normalizer statistics and action postprocessor, but its observation
+        # step must switch from physical Xense fields to the private raw
+        # RGB-D/robot fields consumed by the external causal generator.  The
+        # serialized real pipeline cannot know this inference-time choice, so
+        # override only that step while leaving every learned/statistical
+        # processor untouched.
+        preprocessor_overrides = dict(kwargs.get("preprocessor_overrides", {}) or {})
+        if isinstance(policy_cfg, ACMTACTConfig):
+            acmt_override = dict(preprocessor_overrides.get("acmt_act_observation_processor", {}) or {})
+            acmt_override["tactile_source"] = policy_cfg.tactile_source
+            preprocessor_overrides["acmt_act_observation_processor"] = acmt_override
+
         preprocessor = PolicyProcessorPipeline.from_pretrained(
             pretrained_model_name_or_path=pretrained_path,
             config_filename=kwargs.get(
                 "preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
             ),
-            overrides=kwargs.get("preprocessor_overrides", {}),
+            overrides=preprocessor_overrides,
             to_transition=batch_to_transition,
             to_output=transition_to_batch,
             revision=pretrained_revision,
@@ -409,6 +429,14 @@ def make_pre_post_processors(
         from .diffusion.processor_diffusion import make_diffusion_pre_post_processors
 
         processors = make_diffusion_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, ACMTACTConfig):
+        from .acmt_act.processor_acmt_act import make_acmt_act_pre_post_processors
+
+        processors = make_acmt_act_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
