@@ -286,8 +286,8 @@ class ACMTDPInferenceEngine(InferenceEngine):
             or getattr(config, "action_dim", 8) != ACTION_DIM
         ):
             raise ValueError("ACMT-DP v4/v5 rollout requires pred_horizon=16 and action_dim=8")
-        if getattr(config, "tactile_source", None) == "tactigen":
-            logger.info("ACMT-DP TactiGen uses sync 16/8 runtime; RTC is unsupported")
+        if getattr(config, "tactile_source", None) in {"tactigen", "substitution"}:
+            logger.info("Causal tactile generation uses the sync 16/8 runtime; RTC is unsupported")
 
     def start(self) -> None:
         self._stopped = False
@@ -474,7 +474,7 @@ class ACMTDPInferenceEngine(InferenceEngine):
             current_window = getattr(self, "_current_action_window", None)
             self._current_action_window = None
             generation = self._generation
-            if getattr(self._policy.config, "tactile_source", None) == "tactigen":
+            if getattr(self._policy.config, "tactile_source", None) in {"tactigen", "substitution"}:
                 self._tactile_future = self._tactile_worker.submit(
                     self._notify_tactile,
                     action.to(self._device),

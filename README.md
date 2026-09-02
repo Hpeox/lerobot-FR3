@@ -101,6 +101,16 @@ lerobot-train \
   --dataset.repo_id=lerobot/aloha_mobile_cabinet
 ```
 
+### ACMT-ACT (FR3)
+
+This fork also registers `--policy.type=acmt_act`, a four-camera LeRobot ACT
+policy with a single current force-field token.  It predicts a 16-step,
+8-dimensional absolute joint/gripper chunk and executes the first eight steps.
+Use `tactile_source=none` or `real` for training; `substitution` loads the
+same real checkpoint and supplies causal, frozen ACMT force fields at runtime.
+The policy processor enforces the 480x640 input and the fixed top/side/wrist
+320x580 crops, and preserves raw wrist RGB-D only for the external generator.
+
 | Category                   | Models                                                                                                                                                                                                                                                                                                                                                                                     |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **Imitation Learning**     | [ACT](./docs/source/policy_act_README.md), [Diffusion](./docs/source/policy_diffusion_README.md), [VQ-BeT](./docs/source/policy_vqbet_README.md), [Multitask DiT Policy](./docs/source/policy_multi_task_dit_README.md)                                                                                                                                                                    |

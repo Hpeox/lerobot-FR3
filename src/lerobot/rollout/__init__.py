@@ -40,6 +40,7 @@ from .context import (
     build_rollout_context,
 )
 from .inference import (
+    ACMTACTInferenceEngine,
     ACMTDPInferenceEngine,
     InferenceEngine,
     InferenceEngineConfig,
@@ -62,6 +63,7 @@ from .strategies import (
 
 __all__ = [
     "BaseStrategy",
+    "ACMTACTInferenceEngine",
     "ACMTDPInferenceEngine",
     "BaseStrategyConfig",
     "ControlledStrategy",

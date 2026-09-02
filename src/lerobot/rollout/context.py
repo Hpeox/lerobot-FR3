@@ -199,7 +199,7 @@ def build_rollout_context(
     is_rtc = isinstance(cfg.inference, RTCInferenceConfig)
     policy_config = cfg.policy
 
-    if policy_config is not None and policy_config.type in {"acmt_dp", "acmt_dp_v5"}:
+    if policy_config is not None and policy_config.type in {"acmt_dp", "acmt_dp_v5", "acmt_act"}:
         if cfg.fps != 30.0:
             raise ValueError("ACMT-DP v4/v5 rollout requires fps=30")
         if cfg.interpolation_multiplier != 1:
