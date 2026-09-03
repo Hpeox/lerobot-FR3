@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ACMT-ACT v3: four independent ResNet34 backbones, physical/effective
+# ACMT-ACT v3: four independent ResNet50 backbones, physical/effective
 # batch-size 16, no gradient accumulation, 200k optimizer updates per run.
 # The four runs are intentionally serialized so one 5090 is never shared by
 # competing jobs.  A completed run is skipped; an interrupted run resumes
@@ -14,7 +14,7 @@ MEMMAP_PEG="${MEMMAP_PEG:-${MEMMAP_ROOT}/16mm-peg-in-hole}"
 MEMMAP_GEAR="${MEMMAP_GEAR:-${MEMMAP_ROOT}/gear-insert-big2small}"
 OUTPUT_PEG="${OUTPUT_PEG:-/data2/cym/16mm_peg_in_hole/acmt_act}"
 OUTPUT_GEAR="${OUTPUT_GEAR:-/data2/cym/gear_insert_big2small/acmt_act}"
-LOG_ROOT="${LOG_ROOT:-/data2/cym/acmt_act_logs/independent_resnet34_200k}"
+LOG_ROOT="${LOG_ROOT:-/data2/cym/acmt_act_logs/independent_resnet50_200k}"
 STEPS="${STEPS:-200000}"
 mkdir -p "${LOG_ROOT}"
 
@@ -84,8 +84,8 @@ run_one() {
     --policy.checkpoint_schema=acmt_act.v3 \
     --policy.checkpoint_schema_version=3 \
     --policy.camera_backbone_mode=independent \
-    --policy.vision_backbone=resnet34 \
-    --policy.pretrained_backbone_weights=ResNet34_Weights.IMAGENET1K_V1 \
+    --policy.vision_backbone=resnet50 \
+    --policy.pretrained_backbone_weights=ResNet50_Weights.IMAGENET1K_V2 \
     --policy.device=cuda \
     --policy.dtype=float16 \
     --policy.use_amp=true \
@@ -132,8 +132,8 @@ select_best_checkpoint() {
   fi
 }
 
-run_one peg none "${OUTPUT_PEG}/none/independent_resnet34/seed42"
-run_one gear none "${OUTPUT_GEAR}/none/independent_resnet34/seed42"
-run_one peg real "${OUTPUT_PEG}/real/independent_resnet34/seed42"
-run_one gear real "${OUTPUT_GEAR}/real/independent_resnet34/seed42"
+run_one peg none "${OUTPUT_PEG}/none/independent_resnet50/seed42"
+run_one gear none "${OUTPUT_GEAR}/none/independent_resnet50/seed42"
+run_one peg real "${OUTPUT_PEG}/real/independent_resnet50/seed42"
+run_one gear real "${OUTPUT_GEAR}/real/independent_resnet50/seed42"
 echo "[DONE] all ACMT-ACT v3 runs" | tee -a "${LOG_ROOT}/all_train.log"

@@ -33,8 +33,8 @@ def main() -> None:
         device=str(device),
         tactile_source=args.tactile_source,
         task_variant=args.task,
-        vision_backbone="resnet34",
-        pretrained_backbone_weights="ResNet34_Weights.IMAGENET1K_V1",
+        vision_backbone="resnet50",
+        pretrained_backbone_weights="ResNet50_Weights.IMAGENET1K_V2",
     )
     policy = make_policy(config, ds_meta=dataset.meta)
     preprocessor, _ = make_pre_post_processors(config, dataset_stats=dataset.meta.stats)

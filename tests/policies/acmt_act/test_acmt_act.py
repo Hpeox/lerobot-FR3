@@ -88,7 +88,7 @@ def test_independent_camera_backbones_and_output_shape() -> None:
     assert len({id(module) for module in policy.model.encoder_img_feat_input_proj}) == 4
     assert policy.config.checkpoint_schema == "acmt_act.v3"
     assert policy.config.checkpoint_schema_version == 3
-    assert policy.config.vision_backbone == "resnet34"
+    assert policy.config.vision_backbone == "resnet50"
     assert not any(isinstance(module, nn.BatchNorm2d) for module in policy.model.modules())
     batch = _rgb_batch(policy.config, size=32)
     batch[XENSE0] = torch.zeros(1, 3, 35, 20)

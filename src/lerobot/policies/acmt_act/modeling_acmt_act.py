@@ -139,7 +139,7 @@ class ACMTACT(ACT):
         super().__init__(config)
 
         # ACT's base class creates one shared ResNet.  v3 deliberately
-        # replaces that module with four separately-owned ResNet34 instances
+        # replaces that module with four separately-owned ResNet50 instances
         # and four separately-owned 1x1 projections.  They are initialized
         # from the same ImageNet checkpoint, but no parameter object is shared
         # between camera streams.
@@ -162,7 +162,7 @@ class ACMTACT(ACT):
         self.backbone = nn.ModuleList([first_backbone, *(make_backbone() for _ in config.camera_keys[1:])])
         last_block = first_backbone.layer4[-1]
         # ResNet18/34 use BasicBlock (conv2), while larger variants use
-        # Bottleneck (conv3).  v3 is ResNet34, but deriving this from the
+        # Bottleneck (conv3).  v3 is ResNet50, but deriving this from the
         # actual first backbone keeps the projection robust to config loading.
         if hasattr(last_block, "conv3"):
             backbone_channels = last_block.conv3.out_channels
