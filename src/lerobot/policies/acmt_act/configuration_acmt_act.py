@@ -34,6 +34,12 @@ CAMERA_KEYS = (
     "camera.cam4",
 )
 CAMERA_NAMES = ("top", "side", "wrist_left", "wrist_right")
+DEFAULT_SOURCE_CAMERA_KEYS = (
+    "camera.cam4",
+    "camera.cam3",
+    "camera.cam1",
+    "camera.cam2",
+)
 
 # (top, left, height, width), in the original 480x640 frame.
 DEFAULT_CROP_PARAMS = {
@@ -104,6 +110,7 @@ class ACMTACTConfig(ACTConfig):
 
     camera_keys: tuple[str, str, str, str] = CAMERA_KEYS
     camera_names: tuple[str, str, str, str] = CAMERA_NAMES
+    source_camera_keys: tuple[str, str, str, str] = DEFAULT_SOURCE_CAMERA_KEYS
     crop_params: dict[str, tuple[int, int, int, int]] = field(
         default_factory=lambda: dict(DEFAULT_CROP_PARAMS)
     )
@@ -145,6 +152,7 @@ class ACMTACTConfig(ACTConfig):
             self.output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(8,))}
         self.camera_keys = tuple(self.camera_keys)
         self.camera_names = tuple(self.camera_names)
+        self.source_camera_keys = tuple(self.source_camera_keys)
         self.crop_params = {
             str(name): tuple(int(v) for v in values) for name, values in self.crop_params.items()
         }
@@ -202,6 +210,12 @@ class ACMTACTConfig(ACTConfig):
             raise ValueError("ACMT-ACT fixes a four-frame causal ACMT ring at 30 Hz")
         if self.camera_keys != CAMERA_KEYS or self.camera_names != CAMERA_NAMES:
             raise ValueError("ACMT-ACT camera order must be top, side, wrist_left, wrist_right")
+        if (
+            len(self.source_camera_keys) != 4
+            or len(set(self.source_camera_keys)) != 4
+            or set(self.source_camera_keys) != set(self.camera_keys)
+        ):
+            raise ValueError("ACMT-ACT source_camera_keys must be a permutation of camera_keys")
         expected_crops = set(CAMERA_NAMES)
         if set(self.crop_params) != expected_crops:
             raise ValueError(f"crop_params must contain exactly {sorted(expected_crops)}")
@@ -257,6 +271,7 @@ __all__ = [
     "ACMTACTConfig",
     "CAMERA_KEYS",
     "CAMERA_NAMES",
+    "DEFAULT_SOURCE_CAMERA_KEYS",
     "DEFAULT_CROP_PARAMS",
     "DQ",
     "FT300",

@@ -14,12 +14,14 @@ from lerobot.policies.acmt_act.configuration_acmt_act import (
 from lerobot.policies.acmt_act.modeling_acmt_act import ACMTACTPolicy
 from lerobot.policies.acmt_act.processor_acmt_act import (
     ACMTACTObservationProcessorStep,
+    DEFAULT_SOURCE_CAMERA_KEYS,
     GEN_DEPTH,
     GEN_LOWDIM,
     GEN_POSE,
     GEN_RGB,
     make_acmt_act_pre_post_processors,
 )
+from lerobot.policies.acmt_dp.gripper_mapping import ACMTDPGripperGPOProcessorStep
 from lerobot.policies.factory import get_policy_class, make_policy_config, make_pre_post_processors
 from lerobot.utils.constants import OBS_STATE
 
@@ -80,6 +82,26 @@ def test_crop_boxes_are_exact_and_reject_wrong_resolution() -> None:
         preprocessor(bad)
 
 
+def test_runtime_camera_mapping_uses_a_snapshot_without_cyclic_overwrite() -> None:
+    config = _config()
+    preprocessor, _ = make_acmt_act_pre_post_processors(config)
+    raw = {OBS_STATE: np.zeros(8, dtype=np.float32)}
+    for index, key in enumerate(config.image_features, start=1):
+        image = np.zeros((480, 640, 3), dtype=np.uint8)
+        image[..., 0] = index * 16
+        raw[key] = image
+
+    processed = preprocessor(raw)
+    mean = torch.tensor((0.485, 0.456, 0.406)).view(3, 1, 1)
+    std = torch.tensor((0.229, 0.224, 0.225)).view(3, 1, 1)
+    for target, source in zip(CAMERAS, DEFAULT_SOURCE_CAMERA_KEYS, strict=True):
+        value = processed[rgb_key(target)][0] * std + mean
+        expected = float(int(source.removeprefix("camera.cam")) * 16) / 255.0
+        torch.testing.assert_close(value[:, 0, 0], torch.tensor((expected, 0.0, 0.0)))
+
+    assert config.source_camera_keys == DEFAULT_SOURCE_CAMERA_KEYS
+
+
 def test_independent_camera_backbones_and_output_shape() -> None:
     policy = ACMTACTPolicy(_config())
     assert len(policy.model.backbone) == 4
@@ -114,7 +136,7 @@ def test_none_and_real_have_identical_parameters() -> None:
 
 def test_processor_serialization_and_real_shapes(tmp_path) -> None:
     config = _config("real")
-    preprocessor, _ = make_acmt_act_pre_post_processors(config)
+    preprocessor, postprocessor = make_acmt_act_pre_post_processors(config)
     raw = {
         OBS_STATE: np.zeros(8, dtype=np.float32),
         XENSE0: np.zeros((35, 20, 3), dtype=np.float32),
@@ -130,6 +152,17 @@ def test_processor_serialization_and_real_shapes(tmp_path) -> None:
 
     restored = PolicyProcessorPipeline.from_pretrained(tmp_path, config_filename="policy_preprocessor.json")
     assert restored(raw)[rgb_key(CAMERAS[0])].shape == (1, 3, 320, 580)
+    step = next(item for item in restored.steps if isinstance(item, ACMTACTObservationProcessorStep))
+    assert step.source_camera_keys == DEFAULT_SOURCE_CAMERA_KEYS
+    assert isinstance(postprocessor.steps[-1], ACMTDPGripperGPOProcessorStep)
+
+
+def test_gripper_postprocessor_maps_policy_opening_to_fr3_gpo_direction() -> None:
+    step = ACMTDPGripperGPOProcessorStep()
+    action = torch.tensor([[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]])
+    mapped = step.action(action)
+    torch.testing.assert_close(mapped[:, :7], action[:, :7])
+    torch.testing.assert_close(mapped[:, 7], torch.tensor([1.0, 3.0 / 255.0]))
 
 
 def test_substitution_overrides_serialized_real_observation_step(tmp_path) -> None:

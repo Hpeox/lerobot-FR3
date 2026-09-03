@@ -28,6 +28,7 @@ from lerobot.processor.pipeline import ObservationProcessorStep, ProcessorStepRe
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 from .configuration_acmt_act import (
+    DEFAULT_SOURCE_CAMERA_KEYS,
     DQ,
     FT300,
     GRIPPER_GPO,
@@ -39,6 +40,7 @@ from .configuration_acmt_act import (
     depth_key,
     rgb_key,
 )
+from ..acmt_dp.gripper_mapping import ACMTDPGripperGPOProcessorStep
 
 
 # Private fields are intentionally not part of the ACT model input.  They are
@@ -159,14 +161,29 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
     camera_keys: tuple[str, ...]
     camera_names: tuple[str, ...]
     crop_params: dict[str, tuple[int, int, int, int]]
+    source_camera_keys: tuple[str, ...] = DEFAULT_SOURCE_CAMERA_KEYS
     tactile_source: str = "none"
     image_mean: tuple[float, float, float] = _IMAGENET_MEAN
     image_std: tuple[float, float, float] = _IMAGENET_STD
+
+    def __post_init__(self) -> None:
+        self.camera_keys = tuple(self.camera_keys)
+        self.camera_names = tuple(self.camera_names)
+        self.source_camera_keys = tuple(self.source_camera_keys)
+        if len(self.camera_keys) != 4 or len(set(self.camera_keys)) != 4:
+            raise ValueError("ACMT-ACT camera_keys must contain four distinct cameras")
+        if len(self.camera_names) != 4 or len(set(self.camera_names)) != 4:
+            raise ValueError("ACMT-ACT camera_names must contain four distinct names")
+        if len(self.source_camera_keys) != 4 or len(set(self.source_camera_keys)) != 4:
+            raise ValueError("ACMT-ACT source_camera_keys must contain four distinct cameras")
+        if set(self.source_camera_keys) != set(self.camera_keys):
+            raise ValueError("ACMT-ACT source_camera_keys must match camera_keys")
 
     def get_config(self) -> dict[str, Any]:
         return {
             "camera_keys": list(self.camera_keys),
             "camera_names": list(self.camera_names),
+            "source_camera_keys": list(self.source_camera_keys),
             "crop_params": {key: list(value) for key, value in self.crop_params.items()},
             "tactile_source": self.tactile_source,
             "image_mean": list(self.image_mean),
@@ -174,13 +191,17 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
         }
 
     def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
+        source = dict(observation)
         result = dict(observation)
         rgb_values: dict[str, torch.Tensor] = {}
-        for camera, name in zip(self.camera_keys, self.camera_names, strict=True):
-            key = rgb_key(camera)
-            if key not in result:
-                raise KeyError(f"ACMT-ACT observation is missing {key}")
-            raw = _rgb_bchw(result[key], key, allow_precropped=self.tactile_source != "substitution")
+        for target_camera, source_camera, name in zip(
+            self.camera_keys, self.source_camera_keys, self.camera_names, strict=True
+        ):
+            source_key = rgb_key(source_camera)
+            target_key = rgb_key(target_camera)
+            if source_key not in source:
+                raise KeyError(f"ACMT-ACT observation is missing {source_key}")
+            raw = _rgb_bchw(source[source_key], source_key, allow_precropped=self.tactile_source != "substitution")
             if self.tactile_source == "substitution" and name in {"wrist_left", "wrist_right"}:
                 rgb_values[name] = raw
             if tuple(raw.shape[-2:]) == (480, 640):
@@ -193,7 +214,7 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
                 cropped = raw
             mean = cropped.new_tensor(self.image_mean).view(1, 3, 1, 1)
             std = cropped.new_tensor(self.image_std).view(1, 3, 1, 1)
-            result[key] = (cropped - mean) / std
+            result[target_key] = (cropped - mean) / std
 
         state = _vector(result.get("observation.state"), "observation.state", 8)
         # FR3's canonical state ABI stores the seventh joint followed by the
@@ -222,13 +243,24 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
         if self.tactile_source == "substitution":
             required = (DQ, TAU_J, FT300, O_T_EE, GRIPPER_GPO)
             missing = [key for key in required if key not in result]
-            missing.extend(depth_key(camera) for camera in self.camera_keys[2:] if depth_key(camera) not in result)
+            source_by_target = dict(zip(self.camera_keys, self.source_camera_keys, strict=True))
+            missing.extend(
+                depth_key(source_by_target[camera])
+                for camera in self.camera_keys[2:]
+                if depth_key(source_by_target[camera]) not in result
+            )
             if missing:
                 raise KeyError(f"substitution ACMT-ACT observation is missing {sorted(set(missing))}")
             left, right = (rgb_values["wrist_left"], rgb_values["wrist_right"])
             result[GEN_RGB] = torch.stack([left, right], dim=1)
             result[GEN_DEPTH] = torch.stack(
-                [_depth_bchw(result[depth_key(camera)], depth_key(camera)) for camera in self.camera_keys[2:]],
+                [
+                    _depth_bchw(
+                        result[depth_key(source_by_target[camera])],
+                        depth_key(source_by_target[camera]),
+                    )
+                    for camera in self.camera_keys[2:]
+                ],
                 dim=1,
             )
             q = state[:, :7]
@@ -269,6 +301,7 @@ def make_acmt_act_pre_post_processors(
                 camera_keys=config.camera_keys,
                 camera_names=config.camera_names,
                 crop_params=config.crop_params,
+                source_camera_keys=config.source_camera_keys,
                 tactile_source=config.tactile_source,
                 image_mean=config.image_mean,
                 image_std=config.image_std,
@@ -292,6 +325,7 @@ def make_acmt_act_pre_post_processors(
                 stats=dataset_stats,
             ),
             DeviceProcessorStep(device="cpu"),
+            ACMTDPGripperGPOProcessorStep(),
         ],
         name=POLICY_POSTPROCESSOR_DEFAULT_NAME,
         to_transition=policy_action_to_transition,
@@ -302,6 +336,7 @@ def make_acmt_act_pre_post_processors(
 
 __all__ = [
     "ACMTACTObservationProcessorStep",
+    "DEFAULT_SOURCE_CAMERA_KEYS",
     "GEN_DEPTH",
     "GEN_LOWDIM",
     "GEN_POSE",

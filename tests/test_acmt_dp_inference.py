@@ -17,6 +17,8 @@ from lerobot.rollout.inference.acmt_dp import (
     ActionPlan,
     TimedActionQueue,
 )
+from lerobot.rollout.inference.acmt_act import ACMTACTInferenceEngine
+from lerobot.rollout.inference.factory import SyncInferenceConfig, create_inference_engine
 from lerobot.rollout.strategies.core import send_next_action
 from lerobot.utils.action_interpolator import ActionInterpolator
 from lerobot.utils.constants import ACTION
@@ -119,6 +121,37 @@ def test_v5_policy_uses_the_same_rolling_engine_protocol() -> None:
 
 def _observation(sequence: int) -> dict[str, torch.Tensor]:
     return {"sequence": torch.tensor(sequence)}
+
+
+def test_factory_routes_acmt_act_v2_to_rolling_engine() -> None:
+    policy = SimpleNamespace(
+        name="acmt_act",
+        config=SimpleNamespace(
+            control_hz=CONTROL_HZ,
+            action_execution_horizon=EXECUTION_HORIZON,
+            tactile_history=4,
+            pred_horizon=PREDICTION_HORIZON,
+            action_dim=ACTION_DIM,
+            checkpoint_schema="acmt_act.v2",
+            checkpoint_schema_version=2,
+            tactile_source="none",
+        ),
+    )
+    engine = create_inference_engine(
+        SyncInferenceConfig(),
+        policy=policy,
+        preprocessor=_IdentityProcessor(),
+        postprocessor=_IdentityProcessor(),
+        robot_wrapper=SimpleNamespace(robot_type="fr3"),
+        hw_features={},
+        dataset_features={ACTION: {"names": [f"action_{index}" for index in range(ACTION_DIM)]}},
+        ordered_action_keys=[f"action_{index}" for index in range(ACTION_DIM)],
+        task="test",
+        fps=CONTROL_HZ,
+        device="cpu",
+    )
+    assert isinstance(engine, ACMTACTInferenceEngine)
+    engine.stop()
 
 
 @pytest.mark.parametrize("mode", ["real", "none"])

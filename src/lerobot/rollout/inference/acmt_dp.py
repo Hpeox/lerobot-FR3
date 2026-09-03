@@ -266,11 +266,11 @@ class ACMTDPInferenceEngine(InferenceEngine):
 
         config = getattr(policy, "config", None)
         if config is None or getattr(config, "control_hz", 30.0) != CONTROL_HZ:
-            raise ValueError("ACMT-DP v3/v4/v5 rollout requires control_hz=30")
+            raise ValueError("ACMT-DP/ACMT-ACT rollout requires control_hz=30")
         if getattr(config, "action_execution_horizon", 8) != EXECUTION_HORIZON:
-            raise ValueError("ACMT-DP v3/v4/v5 rollout requires action_execution_horizon=8")
+            raise ValueError("ACMT-DP/ACMT-ACT rollout requires action_execution_horizon=8")
         if getattr(config, "tactile_history", 4) != 4:
-            raise ValueError("ACMT-DP v3/v4/v5 rollout requires tactile_history=4")
+            raise ValueError("ACMT-DP/ACMT-ACT rollout requires tactile_history=4")
         if (
             getattr(config, "pred_horizon", 16) != PREDICTION_HORIZON
             or getattr(config, "action_dim", 8) != ACTION_DIM
