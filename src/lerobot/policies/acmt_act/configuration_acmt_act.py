@@ -79,12 +79,14 @@ class ACMTACTConfig(ACTConfig):
     checkpoint_tactile_source: str | None = None
     task_variant: str = "peg"
     checkpoint_task_variant: str | None = None
-    # v2 makes the four camera backbones explicit and rejects the old shared
-    # backbone checkpoints.  The schema is part of the serialized ABI so a
-    # deployment process cannot silently load a structurally different model.
-    checkpoint_schema: str = "acmt_act.v2"
-    checkpoint_schema_version: int = 2
+    # v3 makes the four camera backbones explicit and requires ResNet34.  The
+    # schema is part of the serialized ABI so a deployment process cannot
+    # silently load an older ResNet18/shared-backbone checkpoint.
+    checkpoint_schema: str = "acmt_act.v3"
+    checkpoint_schema_version: int = 3
     camera_backbone_mode: str = "independent"
+    vision_backbone: str = "resnet34"
+    pretrained_backbone_weights: str | None = "ResNet34_Weights.IMAGENET1K_V1"
 
     # ACMT generator is deliberately external to the policy state_dict. The
     # path is used only by substitution inference.
@@ -193,10 +195,16 @@ class ACMTACTConfig(ACTConfig):
 
         super().__post_init__()
 
-        if self.checkpoint_schema != "acmt_act.v2" or self.checkpoint_schema_version != 2:
-            raise ValueError("ACMT-ACT checkpoint schema must be acmt_act.v2")
+        if self.checkpoint_schema != "acmt_act.v3" or self.checkpoint_schema_version != 3:
+            raise ValueError("ACMT-ACT checkpoint schema must be acmt_act.v3")
         if self.camera_backbone_mode != "independent":
-            raise ValueError("ACMT-ACT v2 requires four independent camera backbones")
+            raise ValueError("ACMT-ACT v3 requires four independent camera backbones")
+        if self.vision_backbone != "resnet34":
+            raise ValueError("ACMT-ACT v3 requires vision_backbone=resnet34")
+        if isinstance(self.pretrained_backbone_weights, str) and not self.pretrained_backbone_weights.startswith(
+            "ResNet34_Weights."
+        ):
+            raise ValueError("ACMT-ACT v3 pretrained_backbone_weights must be a ResNet34_Weights value")
         if self.n_obs_steps != 1 or self.chunk_size != 16 or self.n_action_steps != 8:
             raise ValueError("ACMT-ACT fixes n_obs_steps=1, chunk_size=16 and n_action_steps=8")
         if (self.action_execution_horizon, self.pred_horizon, self.action_dim, self.state_dim) != (

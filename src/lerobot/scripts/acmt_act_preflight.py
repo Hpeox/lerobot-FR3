@@ -1,4 +1,4 @@
-"""Run the mandatory physical-batch preflight for ACMT-ACT v2."""
+"""Run the mandatory physical-batch preflight for ACMT-ACT v3."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=20)
     args = parser.parse_args()
     if args.batch_size != 16:
-        raise ValueError("ACMT-ACT v2 preflight requires physical batch_size=16")
+        raise ValueError("ACMT-ACT v3 preflight requires physical batch_size=16")
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("preflight requested CUDA but no CUDA device is available")
@@ -33,7 +33,8 @@ def main() -> None:
         device=str(device),
         tactile_source=args.tactile_source,
         task_variant=args.task,
-        pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1",
+        vision_backbone="resnet34",
+        pretrained_backbone_weights="ResNet34_Weights.IMAGENET1K_V1",
     )
     policy = make_policy(config, ds_meta=dataset.meta)
     preprocessor, _ = make_pre_post_processors(config, dataset_stats=dataset.meta.stats)

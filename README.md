@@ -104,8 +104,8 @@ lerobot-train \
 ### ACMT-ACT (FR3)
 
 This fork also registers `--policy.type=acmt_act`, a four-camera LeRobot ACT
-policy with a current two-wrist force-field token.  In schema `acmt_act.v2`,
-each camera owns an independent trainable ImageNet ResNet18 and 1x1 projection
+policy with a current two-wrist force-field token.  In schema `acmt_act.v3`,
+each camera owns an independent trainable ImageNet ResNet34 and 1x1 projection
 (the visual encoders are initialized identically but never share parameters).
 It predicts a 16-step, 8-dimensional absolute joint/gripper chunk and executes
 the first eight steps.  Use `tactile_source=none` or `real` for training;
@@ -120,7 +120,10 @@ contains only the cropped RGB, state, tactile and action arrays; training never
 opens H5 files and deployment never reads the training Memmap.  The provided
 `scripts/train_acmt_act_memmap_200k.sh` runs the mandatory physical-batch-16
 preflight and serializes Peg none, Gear none, Peg real and Gear real runs, each
-for exactly 200,000 optimizer updates, resuming from `checkpoints/last`.
+for exactly 200,000 optimizer updates, resuming from `checkpoints/last`.  Held-out
+validation is evaluated every 20,000 steps; after each completed run the launcher
+creates `checkpoints/best` pointing to the lowest validation-loss checkpoint while
+leaving `checkpoints/last` as the resume pointer.
 
 | Category                   | Models                                                                                                                                                                                                                                                                                                                                                                                     |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |

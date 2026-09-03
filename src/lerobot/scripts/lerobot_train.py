@@ -226,7 +226,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     if cfg.dataset.backend == "acmt_act_memmap" and accelerator.num_processes != 1:
         raise RuntimeError(
-            "ACMT-ACT v2 requires exactly one Accelerate process so physical and effective batch_size stay 16; "
+            "ACMT-ACT v3 requires exactly one Accelerate process so physical and effective batch_size stay 16; "
             f"got num_processes={accelerator.num_processes}"
         )
 
@@ -476,7 +476,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # declares language columns; otherwise stay on PyTorch's default
     # collate so non-language training runs are unaffected.
     collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
-    # ACMT-ACT v2 explicitly promises a physical/effective batch size of 16.
+    # ACMT-ACT v3 explicitly promises a physical/effective batch size of 16.
     # Its memmap frame count is generally not divisible by 16, so dropping one
     # incomplete tail batch is preferable to silently changing the optimizer
     # batch size. Existing LeRobot backends preserve their historical behavior.
