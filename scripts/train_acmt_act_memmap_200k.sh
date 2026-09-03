@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ACMT-ACT v2: four independent ResNet18 backbones, physical/effective
+# ACMT-ACT v3: four independent ResNet34 backbones, physical/effective
 # batch-size 16, no gradient accumulation, 200k optimizer updates per run.
 # The four runs are intentionally serialized so one 5090 is never shared by
 # competing jobs.  A completed run is skipped; an interrupted run resumes
@@ -14,7 +14,7 @@ MEMMAP_PEG="${MEMMAP_PEG:-${MEMMAP_ROOT}/16mm-peg-in-hole}"
 MEMMAP_GEAR="${MEMMAP_GEAR:-${MEMMAP_ROOT}/gear-insert-big2small}"
 OUTPUT_PEG="${OUTPUT_PEG:-/data2/cym/16mm_peg_in_hole/acmt_act}"
 OUTPUT_GEAR="${OUTPUT_GEAR:-/data2/cym/gear_insert_big2small/acmt_act}"
-LOG_ROOT="${LOG_ROOT:-/data2/cym/acmt_act_logs/independent_resnet18_200k}"
+LOG_ROOT="${LOG_ROOT:-/data2/cym/acmt_act_logs/independent_resnet34_200k}"
 STEPS="${STEPS:-200000}"
 mkdir -p "${LOG_ROOT}"
 
@@ -81,10 +81,11 @@ run_one() {
     --policy.type=acmt_act \
     --policy.tactile_source="${source}" \
     --policy.task_variant="${task}" \
-    --policy.checkpoint_schema=acmt_act.v2 \
-    --policy.checkpoint_schema_version=2 \
+    --policy.checkpoint_schema=acmt_act.v3 \
+    --policy.checkpoint_schema_version=3 \
     --policy.camera_backbone_mode=independent \
-    --policy.pretrained_backbone_weights=ResNet18_Weights.IMAGENET1K_V1 \
+    --policy.vision_backbone=resnet34 \
+    --policy.pretrained_backbone_weights=ResNet34_Weights.IMAGENET1K_V1 \
     --policy.device=cuda \
     --policy.dtype=float16 \
     --policy.use_amp=true \
@@ -108,11 +109,31 @@ run_one() {
     --wandb.enable=false \
     "${resume_args[@]}" \
     >"${log}" 2>&1
+  select_best_checkpoint "${output}" "${log}"
   echo "[DONE] ${task}/${source}" | tee -a "${LOG_ROOT}/all_train.log"
 }
 
-run_one peg none "${OUTPUT_PEG}/none/independent_resnet18/seed42"
-run_one gear none "${OUTPUT_GEAR}/none/independent_resnet18/seed42"
-run_one peg real "${OUTPUT_PEG}/real/independent_resnet18/seed42"
-run_one gear real "${OUTPUT_GEAR}/real/independent_resnet18/seed42"
-echo "[DONE] all ACMT-ACT v2 runs" | tee -a "${LOG_ROOT}/all_train.log"
+select_best_checkpoint() {
+  local output="$1"
+  local log="$2"
+  local best_step=""
+  # eval_steps=20000 produces one held-out eval value per saved checkpoint.
+  # Keep the normal `last` link for resuming, and expose a separate `best`
+  # link for deployment/evaluation.  Missing/invalid eval lines are ignored.
+  if [[ -f "${log}" ]]; then
+    best_step="$(sed -nE 's/.*step ([0-9]+): eval_loss=([-+0-9.eE]+).*/\1 \2/p' "${log}" \
+      | sort -k2,2g | head -n1 | awk '{printf "%06d", $1}')"
+  fi
+  if [[ -n "${best_step}" && -d "${output}/checkpoints/${best_step}" ]]; then
+    ln -sfn "${best_step}" "${output}/checkpoints/best"
+    echo "[BEST] ${output}: step=${best_step}" | tee -a "${LOG_ROOT}/all_train.log"
+  else
+    echo "[BEST] ${output}: no complete eval checkpoint found" | tee -a "${LOG_ROOT}/all_train.log"
+  fi
+}
+
+run_one peg none "${OUTPUT_PEG}/none/independent_resnet34/seed42"
+run_one gear none "${OUTPUT_GEAR}/none/independent_resnet34/seed42"
+run_one peg real "${OUTPUT_PEG}/real/independent_resnet34/seed42"
+run_one gear real "${OUTPUT_GEAR}/real/independent_resnet34/seed42"
+echo "[DONE] all ACMT-ACT v3 runs" | tee -a "${LOG_ROOT}/all_train.log"

@@ -138,13 +138,13 @@ class ACMTACT(ACT):
             config.pretrained_backbone_weights = pretrained
         super().__init__(config)
 
-        # ACT's base class creates one shared ResNet.  v2 deliberately
-        # replaces that module with four separately-owned ResNet18 instances
+        # ACT's base class creates one shared ResNet.  v3 deliberately
+        # replaces that module with four separately-owned ResNet34 instances
         # and four separately-owned 1x1 projections.  They are initialized
         # from the same ImageNet checkpoint, but no parameter object is shared
         # between camera streams.
         if config.camera_backbone_mode != "independent":
-            raise ValueError("ACMT-ACT v2 requires independent camera backbones")
+            raise ValueError("ACMT-ACT v3 requires independent camera backbones")
         def make_backbone() -> IntermediateLayerGetter:
             backbone_model = getattr(torchvision.models, config.vision_backbone)(
                 replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
@@ -160,9 +160,14 @@ class ACMTACT(ACT):
         del self.backbone
         del self.encoder_img_feat_input_proj
         self.backbone = nn.ModuleList([first_backbone, *(make_backbone() for _ in config.camera_keys[1:])])
-        backbone_channels = 512 if config.vision_backbone == "resnet18" else make_backbone().layer4[-1].conv3.out_channels
-        # ``make_backbone`` above returns a getter; for non-18 ResNets the
-        # temporary module is immediately released after discovering channels.
+        last_block = first_backbone.layer4[-1]
+        # ResNet18/34 use BasicBlock (conv2), while larger variants use
+        # Bottleneck (conv3).  v3 is ResNet34, but deriving this from the
+        # actual first backbone keeps the projection robust to config loading.
+        if hasattr(last_block, "conv3"):
+            backbone_channels = last_block.conv3.out_channels
+        else:
+            backbone_channels = last_block.conv2.out_channels
         self.encoder_img_feat_input_proj = nn.ModuleList(
             [nn.Conv2d(backbone_channels, config.dim_model, kernel_size=1) for _ in config.camera_keys]
         )
@@ -365,8 +370,8 @@ class ACMTACTPolicy(PreTrainedPolicy):
             raw = json.loads(config_path.read_text(encoding="utf-8"))
             if raw.get("type") != "acmt_act":
                 raise ValueError("ACMT-ACT loader refuses non-acmt_act checkpoints")
-            if raw.get("checkpoint_schema") != "acmt_act.v2" or raw.get("checkpoint_schema_version") != 2:
-                raise ValueError("checkpoint is not ACMT-ACT schema acmt_act.v2")
+            if raw.get("checkpoint_schema") != "acmt_act.v3" or raw.get("checkpoint_schema_version") != 3:
+                raise ValueError("checkpoint is not ACMT-ACT schema acmt_act.v3")
             source = (config.tactile_source if config is not None else raw.get("tactile_source", "none"))
             checkpoint_source = raw.get("checkpoint_tactile_source", source)
             checkpoint_task = raw.get("checkpoint_task_variant", raw.get("task_variant", "peg"))
