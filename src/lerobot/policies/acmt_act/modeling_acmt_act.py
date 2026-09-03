@@ -19,7 +19,10 @@ from typing import Any
 import einops
 import torch
 import torch.nn.functional as F  # noqa: N812
+import torchvision
 from torch import Tensor, nn
+from torchvision.models._utils import IntermediateLayerGetter
+from torchvision.ops.misc import FrozenBatchNorm2d
 
 from lerobot.policies.act.modeling_act import (
     ACT,
@@ -122,7 +125,47 @@ class ACMTACT(ACT):
     """Reference ACT network plus a single tactile conditioning token."""
 
     def __init__(self, config: ACMTACTConfig):
+        # Resolve the serialized torchvision enum before ACT.__init__ builds
+        # camera 0. The remaining three cameras below receive this same enum,
+        # so all four streams use exactly the same ImageNet initialization.
+        pretrained = config.pretrained_backbone_weights
+        if isinstance(pretrained, str):
+            enum_name = config.vision_backbone.replace("resnet", "ResNet") + "_Weights"
+            enum_cls = getattr(torchvision.models, enum_name, None)
+            if enum_cls is None:
+                raise ValueError(f"Unknown torchvision weights enum for {config.vision_backbone}")
+            pretrained = getattr(enum_cls, pretrained.rsplit(".", 1)[-1])
+            config.pretrained_backbone_weights = pretrained
         super().__init__(config)
+
+        # ACT's base class creates one shared ResNet.  v2 deliberately
+        # replaces that module with four separately-owned ResNet18 instances
+        # and four separately-owned 1x1 projections.  They are initialized
+        # from the same ImageNet checkpoint, but no parameter object is shared
+        # between camera streams.
+        if config.camera_backbone_mode != "independent":
+            raise ValueError("ACMT-ACT v2 requires independent camera backbones")
+        def make_backbone() -> IntermediateLayerGetter:
+            backbone_model = getattr(torchvision.models, config.vision_backbone)(
+                replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
+                weights=pretrained,
+                norm_layer=FrozenBatchNorm2d,
+            )
+            return IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+
+        # Remove the shared projection registered by ACT.__init__.  Reuse the
+        # already-created first ResNet as camera 0 (rather than allocating a
+        # fifth temporary network), then construct three independent peers.
+        first_backbone = self.backbone
+        del self.backbone
+        del self.encoder_img_feat_input_proj
+        self.backbone = nn.ModuleList([first_backbone, *(make_backbone() for _ in config.camera_keys[1:])])
+        backbone_channels = 512 if config.vision_backbone == "resnet18" else make_backbone().layer4[-1].conv3.out_channels
+        # ``make_backbone`` above returns a getter; for non-18 ResNets the
+        # temporary module is immediately released after discovering channels.
+        self.encoder_img_feat_input_proj = nn.ModuleList(
+            [nn.Conv2d(backbone_channels, config.dim_model, kernel_size=1) for _ in config.camera_keys]
+        )
         self.tactile_encoder = ACMTACTileEncoder(config.force_mean, config.force_std)
         self.encoder_tactile_input_proj = nn.Linear(config.tactile_feature_dim, config.dim_model)
 
@@ -186,10 +229,14 @@ class ACMTACT(ACT):
         encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
 
         if images:
-            for image in images:
-                cam_features = self.backbone(image)["feature_map"]
+            if len(images) != len(self.backbone):
+                raise ValueError(f"ACMT-ACT expects {len(self.backbone)} camera images, got {len(images)}")
+            for image, backbone, image_proj in zip(
+                images, self.backbone, self.encoder_img_feat_input_proj, strict=True
+            ):
+                cam_features = backbone(image)["feature_map"]
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
-                cam_features = self.encoder_img_feat_input_proj(cam_features)
+                cam_features = image_proj(cam_features)
                 cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
                 cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
                 encoder_in_tokens.extend(list(cam_features))
@@ -272,10 +319,25 @@ class ACMTACTPolicy(PreTrainedPolicy):
     config_class = ACMTACTConfig
     name = "acmt_act"
 
-    def __init__(self, config: ACMTACTConfig, **_: Any):
+    def __init__(self, config: ACMTACTConfig, dataset_stats: Mapping[str, Any] | None = None, **_: Any):
         super().__init__(config)
         config.validate_features()
         self.config = config
+        # Use the training-set force statistics for both physical sensors when
+        # available.  This keeps none/real initialization identical while
+        # avoiding a hidden dependence on a particular task's raw scale.
+        if dataset_stats:
+            means, stds = [], []
+            for key in (XENSE0, XENSE1):
+                stats = dataset_stats.get(key)
+                if isinstance(stats, Mapping) and "mean" in stats and "std" in stats:
+                    means.append(torch.as_tensor(stats["mean"], dtype=torch.float32).flatten())
+                    stds.append(torch.as_tensor(stats["std"], dtype=torch.float32).flatten())
+            if means and all(value.numel() >= 3 for value in means):
+                config.force_mean = tuple(torch.stack([value[:3] for value in means]).mean(0).tolist())
+                config.force_std = tuple(
+                    torch.stack([value[:3] for value in stds]).mean(0).clamp_min(1e-6).tolist()
+                )
         self.model = ACMTACT(config)
         # Runtime-only state.  `_ACMTGeneratorRuntime` is not an nn.Module, so
         # no generator weights appear in `named_parameters()` or checkpoints.
@@ -303,8 +365,8 @@ class ACMTACTPolicy(PreTrainedPolicy):
             raw = json.loads(config_path.read_text(encoding="utf-8"))
             if raw.get("type") != "acmt_act":
                 raise ValueError("ACMT-ACT loader refuses non-acmt_act checkpoints")
-            if raw.get("checkpoint_schema") != "acmt_act.v1" or raw.get("checkpoint_schema_version") != 1:
-                raise ValueError("checkpoint is not ACMT-ACT schema acmt_act.v1")
+            if raw.get("checkpoint_schema") != "acmt_act.v2" or raw.get("checkpoint_schema_version") != 2:
+                raise ValueError("checkpoint is not ACMT-ACT schema acmt_act.v2")
             source = (config.tactile_source if config is not None else raw.get("tactile_source", "none"))
             checkpoint_source = raw.get("checkpoint_tactile_source", source)
             checkpoint_task = raw.get("checkpoint_task_variant", raw.get("task_variant", "peg"))

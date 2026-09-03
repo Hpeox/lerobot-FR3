@@ -18,8 +18,12 @@ from __future__ import annotations
 
 from typing import Literal
 
-import datasets
-import pyarrow as pa
+try:
+    import datasets
+    import pyarrow as pa
+except ModuleNotFoundError:  # language columns are unused by ACMT-ACT memmap training
+    datasets = None
+    pa = None
 
 LANGUAGE_PERSISTENT = "language_persistent"
 LANGUAGE_EVENTS = "language_events"

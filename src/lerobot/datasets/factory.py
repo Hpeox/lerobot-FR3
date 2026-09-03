@@ -15,7 +15,9 @@
 # limitations under the License.
 import logging
 import math
+from pathlib import Path
 from pprint import pformat
+from typing import Any
 
 import torch
 
@@ -25,10 +27,35 @@ from lerobot.configs.train import TrainPipelineConfig
 from lerobot.transforms import ImageTransforms
 from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_PREFIX, REWARD
 
-from .dataset_metadata import LeRobotDatasetMetadata
-from .lerobot_dataset import LeRobotDataset
-from .multi_dataset import MultiLeRobotDataset
-from .streaming_dataset import StreamingLeRobotDataset
+try:
+    from .dataset_metadata import LeRobotDatasetMetadata
+    from .lerobot_dataset import LeRobotDataset
+    from .multi_dataset import MultiLeRobotDataset
+    from .streaming_dataset import StreamingLeRobotDataset
+except ImportError:  # Optional dataset/AV extras are not needed by memmap mode.
+    LeRobotDatasetMetadata = Any  # type: ignore[misc,assignment]
+    LeRobotDataset = Any  # type: ignore[misc,assignment]
+    MultiLeRobotDataset = Any  # type: ignore[misc,assignment]
+    StreamingLeRobotDataset = Any  # type: ignore[misc,assignment]
+
+
+def _make_acmt_act_memmap_dataset(cfg: TrainPipelineConfig, split: str):
+    """Construct the H5-free ACMT-ACT training backend."""
+    from .acmt_act_memmap import ACMTACTMemmapDataset
+
+    root = cfg.dataset.root
+    if root is None:
+        raise ValueError("dataset.root is required for backend='acmt_act_memmap'")
+    split_file = Path(cfg.dataset.split_file) if cfg.dataset.split_file else Path(root) / "splits.json"
+    if not split_file.is_file():
+        raise FileNotFoundError(f"ACMT-ACT memmap split file not found: {split_file}")
+    # The converter writes the canonical split inside the memmap directory.
+    # An explicitly supplied path is accepted only when it describes the same
+    # file, preventing an accidental cross-task split.
+    canonical = Path(root).resolve() / "splits.json"
+    if split_file.resolve() != canonical:
+        raise ValueError(f"backend='acmt_act_memmap' requires split_file={canonical}")
+    return ACMTACTMemmapDataset(root, split=split, repo_id=str(cfg.dataset.repo_id))
 
 
 def resolve_delta_timestamps(
@@ -78,6 +105,9 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
     Returns:
         LeRobotDataset | MultiLeRobotDataset
     """
+    if cfg.dataset.backend == "acmt_act_memmap":
+        return _make_acmt_act_memmap_dataset(cfg, "train")
+
     image_transforms = (
         ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
     )
@@ -144,6 +174,18 @@ def make_train_eval_datasets(
     The last ceil(n_episodes * eval_split) episodes per task are held out for evaluation.
     If eval_split == 0.0, returns (full_dataset, None).
     """
+    if cfg.dataset.backend == "acmt_act_memmap":
+        train_dataset = _make_acmt_act_memmap_dataset(cfg, "train")
+        eval_dataset = (
+            _make_acmt_act_memmap_dataset(cfg, "val") if cfg.dataset.eval_split > 0.0 else None
+        )
+        logging.info(
+            "ACMT-ACT memmap split: %s train episodes, %s val episodes",
+            train_dataset.num_episodes,
+            eval_dataset.num_episodes if eval_dataset is not None else 0,
+        )
+        return train_dataset, eval_dataset
+
     full_dataset = make_dataset(cfg)
 
     if cfg.dataset.eval_split == 0.0:

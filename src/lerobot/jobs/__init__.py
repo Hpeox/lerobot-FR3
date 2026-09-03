@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from lerobot.utils.import_utils import require_package
+from lerobot.utils.import_utils import is_package_available, require_package
 
-# LeRobotDataset (imported at module top in dataset.py) pulls in heavy dataset deps;
-# guard the optional dependency here so importing this package fails loudly if it's missing.
-require_package("datasets", extra="dataset")
-
-from .hf import submit_to_hf
+# Local ACMT-ACT memmap training does not use the Hub Jobs path.  Keep that
+# import optional so the lightweight training environment can still invoke
+# ``lerobot-train`` without installing the Hub dataset/AV extras.
+if is_package_available("datasets"):
+    require_package("datasets", extra="dataset")
+    from .hf import submit_to_hf
+else:
+    def submit_to_hf(*args, **kwargs):
+        raise ImportError("HF Jobs submission requires the optional 'datasets' extra")
 
 __all__ = ["submit_to_hf"]

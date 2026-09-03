@@ -159,13 +159,21 @@ class EpisodeAwareSampler:
         return self._num_frames
 
 
-def compute_sampler_state(step: int, num_frames: int, batch_size: int, num_processes: int) -> dict:
+def compute_sampler_state(
+    step: int,
+    num_frames: int,
+    batch_size: int,
+    num_processes: int,
+    drop_last: bool = False,
+) -> dict:
     """Map an optimization step to an `EpisodeAwareSampler` state for sample-exact resume.
 
     Under accelerate's batch sharding, one step consumes `batch_size * num_processes` sampler
-    positions and each rank sees `ceil(ceil(num_frames / batch_size) / num_processes)` batches
-    per epoch (`even_batches` padding included). The start index provably stays below
-    `num_frames`; the `min` is defensive.
+    positions. With the default ``drop_last=False``, each rank sees
+    ``ceil(ceil(num_frames / batch_size) / num_processes)`` batches per epoch
+    (``even_batches`` padding included). With ``drop_last=True``, only complete
+    batches are counted so a fixed physical batch size can be resumed exactly.
+    The start index provably stays below `num_frames`; the `min` is defensive.
 
     Assumptions (resume is only sample-exact when they hold):
         - `num_processes` and `batch_size` match the run that wrote the checkpoint. Both scale how
@@ -175,7 +183,8 @@ def compute_sampler_state(step: int, num_frames: int, batch_size: int, num_proce
           mirrors that padding; with `even_batches=False` the per-epoch batch count differs and
           the boundary is off.
     """
-    batches_per_epoch = math.ceil(math.ceil(num_frames / batch_size) / num_processes)
+    batches = num_frames // batch_size if drop_last else math.ceil(num_frames / batch_size)
+    batches_per_epoch = math.ceil(batches / num_processes)
     epoch, batches_into_epoch = divmod(step, batches_per_epoch)
     start_index = min(batches_into_epoch * batch_size * num_processes, num_frames)
     return {"epoch": epoch, "start_index": start_index}

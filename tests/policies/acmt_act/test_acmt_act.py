@@ -80,11 +80,13 @@ def test_crop_boxes_are_exact_and_reject_wrong_resolution() -> None:
         preprocessor(bad)
 
 
-def test_shared_backbone_and_output_shape() -> None:
+def test_independent_camera_backbones_and_output_shape() -> None:
     policy = ACMTACTPolicy(_config())
-    # IntermediateLayerGetter wraps one ResNet instance; every camera is sent
-    # through this same object in ACMTACT.forward.
-    assert len({id(module) for module in policy.model.modules() if module is policy.model.backbone}) == 1
+    assert len(policy.model.backbone) == 4
+    assert len(policy.model.encoder_img_feat_input_proj) == 4
+    assert len({id(module) for module in policy.model.backbone}) == 4
+    assert len({id(module) for module in policy.model.encoder_img_feat_input_proj}) == 4
+    assert policy.config.checkpoint_schema == "acmt_act.v2"
     assert not any(isinstance(module, nn.BatchNorm2d) for module in policy.model.modules())
     batch = _rgb_batch(policy.config, size=32)
     batch[XENSE0] = torch.zeros(1, 3, 35, 20)

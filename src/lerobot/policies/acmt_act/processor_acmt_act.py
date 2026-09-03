@@ -58,7 +58,7 @@ def _tensor(value: Any, key: str) -> torch.Tensor:
     return torch.as_tensor(value)
 
 
-def _rgb_bchw(value: Any, key: str) -> torch.Tensor:
+def _rgb_bchw(value: Any, key: str, *, allow_precropped: bool = False) -> torch.Tensor:
     tensor = _tensor(value, key)
     if tensor.ndim == 3:
         if tensor.shape[0] == 3:
@@ -76,8 +76,11 @@ def _rgb_bchw(value: Any, key: str) -> torch.Tensor:
             raise ValueError(f"{key} must be BCHW or BHWC RGB, got {tuple(tensor.shape)}")
     else:
         raise ValueError(f"{key} must be a 3D/4D RGB tensor, got {tuple(tensor.shape)}")
-    if tuple(tensor.shape[-2:]) != (480, 640):
-        raise ValueError(f"{key} must be 480x640 before ACMT-ACT crop, got {tuple(tensor.shape[-2:])}")
+    spatial = tuple(tensor.shape[-2:])
+    if spatial != (480, 640) and not (allow_precropped and spatial == (320, 580)):
+        raise ValueError(
+            f"{key} must be 480x640 before ACMT-ACT crop (or 320x580 memmap input), got {spatial}"
+        )
     tensor = tensor.to(dtype=torch.float32)
     if tensor.numel() and float(tensor.detach().amax()) > 1.5:
         tensor = tensor / 255.0
@@ -177,11 +180,17 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
             key = rgb_key(camera)
             if key not in result:
                 raise KeyError(f"ACMT-ACT observation is missing {key}")
-            raw = _rgb_bchw(result[key], key)
+            raw = _rgb_bchw(result[key], key, allow_precropped=self.tactile_source != "substitution")
             if self.tactile_source == "substitution" and name in {"wrist_left", "wrist_right"}:
                 rgb_values[name] = raw
-            y, x, height, width = self.crop_params[name]
-            cropped = raw[..., y : y + height, x : x + width]
+            if tuple(raw.shape[-2:]) == (480, 640):
+                y, x, height, width = self.crop_params[name]
+                cropped = raw[..., y : y + height, x : x + width]
+            else:
+                # The training-only ACMT-ACT memmap already contains the
+                # exact crop.  Deployment still supplies the raw 480x640
+                # frame and takes the branch above.
+                cropped = raw
             mean = cropped.new_tensor(self.image_mean).view(1, 3, 1, 1)
             std = cropped.new_tensor(self.image_std).view(1, 3, 1, 1)
             result[key] = (cropped - mean) / std
