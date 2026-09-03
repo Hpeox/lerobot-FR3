@@ -73,8 +73,12 @@ class ACMTACTConfig(ACTConfig):
     checkpoint_tactile_source: str | None = None
     task_variant: str = "peg"
     checkpoint_task_variant: str | None = None
-    checkpoint_schema: str = "acmt_act.v1"
-    checkpoint_schema_version: int = 1
+    # v2 makes the four camera backbones explicit and rejects the old shared
+    # backbone checkpoints.  The schema is part of the serialized ABI so a
+    # deployment process cannot silently load a structurally different model.
+    checkpoint_schema: str = "acmt_act.v2"
+    checkpoint_schema_version: int = 2
+    camera_backbone_mode: str = "independent"
 
     # ACMT generator is deliberately external to the policy state_dict. The
     # path is used only by substitution inference.
@@ -93,6 +97,10 @@ class ACMTACTConfig(ACTConfig):
     state_dim: int = 8
     tactile_history: int = 4  # causal ACMT ring; ACT consumes its latest frame
     control_hz: float = 30.0
+    # Train through Accelerate's autocast context.  This is deliberately a
+    # config field rather than an environment-only switch so checkpoints keep
+    # the precision used for their training run.
+    dtype: str = "float16"
 
     camera_keys: tuple[str, str, str, str] = CAMERA_KEYS
     camera_names: tuple[str, str, str, str] = CAMERA_NAMES
@@ -122,6 +130,15 @@ class ACMTACTConfig(ACTConfig):
     output_features: dict[str, PolicyFeature] | None = None
 
     def __post_init__(self) -> None:
+        # draccus represents a CLI value such as
+        # ``--policy.pretrained_backbone_weights=None`` as the literal string
+        # ``"None"``. Normalize that spelling before torchvision's ACT base
+        # class constructs its first backbone.
+        if isinstance(self.pretrained_backbone_weights, str) and self.pretrained_backbone_weights.lower() in {
+            "none",
+            "null",
+        }:
+            self.pretrained_backbone_weights = None
         if self.input_features is None:
             self.input_features = self._default_input_features()
         if self.output_features is None:
@@ -168,8 +185,10 @@ class ACMTACTConfig(ACTConfig):
 
         super().__post_init__()
 
-        if self.checkpoint_schema != "acmt_act.v1" or self.checkpoint_schema_version != 1:
-            raise ValueError("ACMT-ACT checkpoint schema must be acmt_act.v1")
+        if self.checkpoint_schema != "acmt_act.v2" or self.checkpoint_schema_version != 2:
+            raise ValueError("ACMT-ACT checkpoint schema must be acmt_act.v2")
+        if self.camera_backbone_mode != "independent":
+            raise ValueError("ACMT-ACT v2 requires four independent camera backbones")
         if self.n_obs_steps != 1 or self.chunk_size != 16 or self.n_action_steps != 8:
             raise ValueError("ACMT-ACT fixes n_obs_steps=1, chunk_size=16 and n_action_steps=8")
         if (self.action_execution_horizon, self.pred_horizon, self.action_dim, self.state_dim) != (

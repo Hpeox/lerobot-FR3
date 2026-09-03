@@ -46,8 +46,14 @@ class DatasetConfig:
     streaming: bool = False
     # Fraction of episodes held out per task for offline evaluation (0.0 = disabled).
     eval_split: float = 0.0
+    # Optional local backend used by research policies.  The ACMT-ACT backend
+    # reads immutable .npy memmaps and never opens the source H5 files.
+    backend: str = "lerobot"
+    split_file: str | None = None
 
     def __post_init__(self) -> None:
+        if self.backend not in {"lerobot", "acmt_act_memmap"}:
+            raise ValueError(f"Unsupported dataset backend: {self.backend!r}")
         if self.depth_output_unit not in (DEPTH_METER_UNIT, DEPTH_MILLIMETER_UNIT):
             raise ValueError(
                 f"depth_output_unit must be '{DEPTH_METER_UNIT}' or '{DEPTH_MILLIMETER_UNIT}', got {self.depth_output_unit!r}"

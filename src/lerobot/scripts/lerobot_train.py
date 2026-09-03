@@ -68,7 +68,10 @@ from lerobot.utils.utils import (
     inside_slurm,
 )
 
-from .lerobot_eval import eval_policy_all
+try:
+    from .lerobot_eval import eval_policy_all
+except ModuleNotFoundError:  # The memmap backend does not require dataset/AV evaluation extras.
+    eval_policy_all = None
 
 
 def update_policy(
@@ -219,6 +222,12 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             mixed_precision=mixed_precision,
             kwargs_handlers=[ddp_kwargs],
             cpu=force_cpu,
+        )
+
+    if cfg.dataset.backend == "acmt_act_memmap" and accelerator.num_processes != 1:
+        raise RuntimeError(
+            "ACMT-ACT v2 requires exactly one Accelerate process so physical and effective batch_size stay 16; "
+            f"got num_processes={accelerator.num_processes}"
         )
 
     init_logging(accelerator=accelerator)
@@ -446,7 +455,13 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     f"batch_size={saved_batch_size}. The data order resumes at the right epoch/offset, "
                     "but per-rank sample-exactness requires the same batch size."
                 )
-            sampler_state = compute_sampler_state(step, len(sampler), ckpt_batch_size, ckpt_num_processes)
+            sampler_state = compute_sampler_state(
+                step,
+                len(sampler),
+                ckpt_batch_size,
+                ckpt_num_processes,
+                drop_last=cfg.dataset.backend == "acmt_act_memmap",
+            )
             sampler.load_state_dict(sampler_state)
             if is_main_process:
                 logging.info(
@@ -461,6 +476,11 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # declares language columns; otherwise stay on PyTorch's default
     # collate so non-language training runs are unaffected.
     collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
+    # ACMT-ACT v2 explicitly promises a physical/effective batch size of 16.
+    # Its memmap frame count is generally not divisible by 16, so dropping one
+    # incomplete tail batch is preferable to silently changing the optimizer
+    # batch size. Existing LeRobot backends preserve their historical behavior.
+    train_drop_last = cfg.dataset.backend == "acmt_act_memmap"
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=cfg.num_workers,
@@ -468,7 +488,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         shuffle=shuffle and not cfg.dataset.streaming,
         sampler=sampler,
         pin_memory=device.type == "cuda",
-        drop_last=False,
+        drop_last=train_drop_last,
         collate_fn=collate_fn,
         prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
         persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
