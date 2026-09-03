@@ -105,7 +105,7 @@ lerobot-train \
 
 This fork also registers `--policy.type=acmt_act`, a four-camera LeRobot ACT
 policy with a current two-wrist force-field token.  In schema `acmt_act.v3`,
-each camera owns an independent trainable ImageNet ResNet34 and 1x1 projection
+each camera owns an independent trainable ImageNet ResNet50 and 1x1 projection
 (the visual encoders are initialized identically but never share parameters).
 It predicts a 16-step, 8-dimensional absolute joint/gripper chunk and executes
 the first eight steps.  Use `tactile_source=none` or `real` for training;
