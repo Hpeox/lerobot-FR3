@@ -154,6 +154,37 @@ def test_factory_routes_acmt_act_v2_to_rolling_engine() -> None:
     engine.stop()
 
 
+def test_factory_routes_acmt_act_v3_to_rolling_engine() -> None:
+    policy = SimpleNamespace(
+        name="acmt_act",
+        config=SimpleNamespace(
+            control_hz=CONTROL_HZ,
+            action_execution_horizon=EXECUTION_HORIZON,
+            tactile_history=4,
+            pred_horizon=PREDICTION_HORIZON,
+            action_dim=ACTION_DIM,
+            checkpoint_schema="acmt_act.v3",
+            checkpoint_schema_version=3,
+            tactile_source="none",
+        ),
+    )
+    engine = create_inference_engine(
+        SyncInferenceConfig(),
+        policy=policy,
+        preprocessor=_IdentityProcessor(),
+        postprocessor=_IdentityProcessor(),
+        robot_wrapper=SimpleNamespace(robot_type="fr3"),
+        hw_features={},
+        dataset_features={ACTION: {"names": [f"action_{index}" for index in range(ACTION_DIM)]}},
+        ordered_action_keys=[f"action_{index}" for index in range(ACTION_DIM)],
+        task="test",
+        fps=CONTROL_HZ,
+        device="cpu",
+    )
+    assert isinstance(engine, ACMTACTInferenceEngine)
+    engine.stop()
+
+
 @pytest.mark.parametrize("mode", ["real", "none"])
 def test_background_plan_does_not_block_observation_capture(mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
     clock = _FakeClock()
