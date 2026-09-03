@@ -55,6 +55,15 @@ def test_factory_and_config_protocol() -> None:
     assert get_policy_class("acmt_act") is ACMTACTPolicy
 
 
+def test_v3_accepts_serialized_short_resnet34_weight_name() -> None:
+    config = ACMTACTConfig(
+        device="cpu",
+        pretrained_backbone_weights="IMAGENET1K_V1",
+        tactile_source="none",
+    )
+    assert config.pretrained_backbone_weights == "IMAGENET1K_V1"
+
+
 def test_crop_boxes_are_exact_and_reject_wrong_resolution() -> None:
     config = _config()
     preprocessor, _ = make_acmt_act_pre_post_processors(config)

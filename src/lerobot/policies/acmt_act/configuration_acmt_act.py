@@ -201,10 +201,11 @@ class ACMTACTConfig(ACTConfig):
             raise ValueError("ACMT-ACT v3 requires four independent camera backbones")
         if self.vision_backbone != "resnet34":
             raise ValueError("ACMT-ACT v3 requires vision_backbone=resnet34")
-        if isinstance(self.pretrained_backbone_weights, str) and not self.pretrained_backbone_weights.startswith(
-            "ResNet34_Weights."
-        ):
-            raise ValueError("ACMT-ACT v3 pretrained_backbone_weights must be a ResNet34_Weights value")
+        if isinstance(self.pretrained_backbone_weights, str) and self.pretrained_backbone_weights not in {
+            "IMAGENET1K_V1",
+            "ResNet34_Weights.IMAGENET1K_V1",
+        }:
+            raise ValueError("ACMT-ACT v3 pretrained_backbone_weights must be the ResNet34 IMAGENET1K_V1 value")
         if self.n_obs_steps != 1 or self.chunk_size != 16 or self.n_action_steps != 8:
             raise ValueError("ACMT-ACT fixes n_obs_steps=1, chunk_size=16 and n_action_steps=8")
         if (self.action_execution_horizon, self.pred_horizon, self.action_dim, self.state_dim) != (
