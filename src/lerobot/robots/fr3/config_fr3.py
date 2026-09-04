@@ -63,7 +63,7 @@ class FR3Config(RobotConfig):
     sensorhub_start_timeout_s: float = 10.0
     sensorhub_stop_timeout_s: float = 2.0
     snapshot_read_timeout_ms: int = 20
-    max_snapshot_age_ms: int = 100
+    max_snapshot_age_ms: int = 150
     cache_horizon_s: float = 0.5
     camera_bundle_span_warn_ms: int = 20
     camera_max_skew_ms: int = 50
