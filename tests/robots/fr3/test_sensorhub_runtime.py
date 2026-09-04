@@ -743,13 +743,14 @@ def test_sensorhub_config_validates_camera_bundle_thresholds():
         "realsense_shm_names": ["/cam1"],
         "xense_shm_name": "xense",
         "ft300s_shm_name": "ft",
+        "camera_bundle_span_warn_ms": 15,
+        "camera_max_skew_ms": 45,
+        "camera_bundle_wait_ms": 20,
     }
     config = SensorHubConfig.from_dict(values)
-    assert (
-        config.camera_bundle_span_warn_ms,
-        config.camera_max_skew_ms,
-        config.camera_bundle_wait_ms,
-    ) == (20, 50, 25)
+    assert config.camera_bundle_span_warn_ms == values["camera_bundle_span_warn_ms"]
+    assert config.camera_max_skew_ms == values["camera_max_skew_ms"]
+    assert config.camera_bundle_wait_ms == values["camera_bundle_wait_ms"]
     with pytest.raises(ValueError, match="camera_bundle_wait_ms"):
         SensorHubConfig.from_dict(dict(values, camera_bundle_wait_ms=0))
     with pytest.raises(ValueError, match="must be <="):

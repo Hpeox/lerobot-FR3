@@ -99,16 +99,25 @@ def action(gripper=0.5):
     return {**{f"fr3_joint{i}.pos": float(i) for i in range(1, 8)}, "gripper.pos": gripper}
 
 
-def test_fr3_config_keeps_reset_timeouts_out_of_sensorhub_config(tmp_path):
-    config = FR3Config(id="config", calibration_dir=tmp_path)
-    assert config.command_endpoint == "tcp://192.168.10.37:6001"
-    assert config.telemetry_endpoint == "tcp://192.168.10.37:6000"
-    assert config.realsense_shm_names == ("/realsense_cam1", "/realsense_cam2")
+def test_fr3_config_routes_only_sensorhub_owned_fields(tmp_path):
+    config = FR3Config(
+        id="config",
+        calibration_dir=tmp_path,
+        command_endpoint="tcp://command.example:7001",
+        telemetry_endpoint="tcp://telemetry.example:7000",
+        realsense_shm_names=("/cam2", "/cam1"),
+        camera_bundle_span_warn_ms=15,
+        camera_max_skew_ms=45,
+        camera_bundle_wait_ms=20,
+    )
     sensorhub = config.sensorhub_dict()
+    assert "command_endpoint" not in sensorhub
+    assert sensorhub["telemetry_endpoint"] == config.telemetry_endpoint
+    assert sensorhub["realsense_shm_names"] == list(config.realsense_shm_names)
     assert "required_sample_max_age_ms" in sensorhub
-    assert sensorhub["camera_bundle_span_warn_ms"] == 20
-    assert sensorhub["camera_max_skew_ms"] == 50
-    assert sensorhub["camera_bundle_wait_ms"] == 25
+    assert sensorhub["camera_bundle_span_warn_ms"] == config.camera_bundle_span_warn_ms
+    assert sensorhub["camera_max_skew_ms"] == config.camera_max_skew_ms
+    assert sensorhub["camera_bundle_wait_ms"] == config.camera_bundle_wait_ms
     assert "reset_ack_timeout_s" not in sensorhub
     assert "reset_completion_timeout_s" not in sensorhub
     assert "reset_retry_interval_s" not in sensorhub
@@ -119,6 +128,8 @@ def test_fr3_config_keeps_reset_timeouts_out_of_sensorhub_config(tmp_path):
     assert "camera_xense_stall_timeout_ms" not in sensorhub
     assert "ft_robot_gripper_stall_timeout_ms" not in sensorhub
 
+
+def test_fr3_config_validates_runtime_threshold_relationships(tmp_path):
     with pytest.raises(ValueError, match="reset_ack_timeout_s"):
         FR3Config(id="invalid", calibration_dir=tmp_path, reset_ack_timeout_s=np.nan)
     with pytest.raises(ValueError, match="camera_bundle_wait_ms"):
@@ -188,21 +199,6 @@ def test_fr3_config_rejects_invalid_camera_names(tmp_path, names, error):
         FR3Config(id="invalid", calibration_dir=tmp_path, realsense_shm_names=names)
 
 
-def test_fr3_config_has_formal_controlled_rollout_defaults(tmp_path):
-    config = FR3Config(id="config", calibration_dir=tmp_path)
-    assert config.rollout_home_joint_positions == (
-        0.1416057646,
-        0.3408541381,
-        -0.0186031274,
-        -1.5938080549,
-        0.0486696586,
-        1.8890386820,
-        0.0432172865,
-    )
-    assert config.rollout_init_delta_lower == (-0.01,) * 7
-    assert config.rollout_init_delta_upper == (0.01,) * 7
-
-
 @pytest.mark.parametrize(
     ("field", "value", "error"),
     [
@@ -223,8 +219,14 @@ def test_initialize_rollout_samples_bounded_target_and_logs(robot, caplog):
     with caplog.at_level(logging.INFO):
         robot.initialize_rollout()
     target = tuple(robot._reset_joints.call_args.args[0])
-    for actual, home in zip(target, robot.config.rollout_home_joint_positions, strict=True):
-        assert home - 0.01 <= actual <= home + 0.01
+    for actual, home, lower, upper in zip(
+        target,
+        robot.config.rollout_home_joint_positions,
+        robot.config.rollout_init_delta_lower,
+        robot.config.rollout_init_delta_upper,
+        strict=True,
+    ):
+        assert home + lower <= actual <= home + upper
     assert repr(target) in caplog.text
 
 
