@@ -55,13 +55,13 @@ def test_factory_and_config_protocol() -> None:
     assert get_policy_class("acmt_act") is ACMTACTPolicy
 
 
-def test_v3_accepts_serialized_short_resnet34_weight_name() -> None:
+def test_v3_accepts_serialized_short_resnet50_weight_name() -> None:
     config = ACMTACTConfig(
         device="cpu",
-        pretrained_backbone_weights="IMAGENET1K_V1",
+        pretrained_backbone_weights="IMAGENET1K_V2",
         tactile_source="none",
     )
-    assert config.pretrained_backbone_weights == "IMAGENET1K_V1"
+    assert config.pretrained_backbone_weights == "IMAGENET1K_V2"
 
 
 def test_crop_boxes_are_exact_and_reject_wrong_resolution() -> None:
