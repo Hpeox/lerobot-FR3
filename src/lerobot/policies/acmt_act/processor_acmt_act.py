@@ -170,14 +170,15 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
         self.camera_keys = tuple(self.camera_keys)
         self.camera_names = tuple(self.camera_names)
         self.source_camera_keys = tuple(self.source_camera_keys)
-        if len(self.camera_keys) != 4 or len(set(self.camera_keys)) != 4:
-            raise ValueError("ACMT-ACT camera_keys must contain four distinct cameras")
-        if len(self.camera_names) != 4 or len(set(self.camera_names)) != 4:
-            raise ValueError("ACMT-ACT camera_names must contain four distinct names")
-        if len(self.source_camera_keys) != 4 or len(set(self.source_camera_keys)) != 4:
-            raise ValueError("ACMT-ACT source_camera_keys must contain four distinct cameras")
+        count = len(self.camera_keys)
+        if count == 0 or len(set(self.camera_keys)) != count:
+            raise ValueError("ACMT-ACT camera_keys must contain distinct cameras")
+        if len(self.camera_names) != count or len(set(self.camera_names)) != count:
+            raise ValueError("ACMT-ACT camera_names must match camera_keys and be distinct")
+        if len(self.source_camera_keys) != count or len(set(self.source_camera_keys)) != count:
+            raise ValueError("ACMT-ACT source_camera_keys must match camera_keys and be distinct")
         if set(self.source_camera_keys) != set(self.camera_keys):
-            raise ValueError("ACMT-ACT source_camera_keys must match camera_keys")
+            raise ValueError("ACMT-ACT source_camera_keys must be a permutation of camera_keys")
 
     def get_config(self) -> dict[str, Any]:
         return {
@@ -244,9 +245,16 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
             required = (DQ, TAU_J, FT300, O_T_EE, GRIPPER_GPO)
             missing = [key for key in required if key not in result]
             source_by_target = dict(zip(self.camera_keys, self.source_camera_keys, strict=True))
+            wrist_camera_keys = tuple(
+                camera
+                for camera, camera_name in zip(self.camera_keys, self.camera_names, strict=True)
+                if camera_name in {"wrist_left", "wrist_right"}
+            )
+            if len(wrist_camera_keys) != 2:
+                raise ValueError("ACMT-ACT substitution requires wrist_left and wrist_right cameras")
             missing.extend(
                 depth_key(source_by_target[camera])
-                for camera in self.camera_keys[2:]
+                for camera in wrist_camera_keys
                 if depth_key(source_by_target[camera]) not in result
             )
             if missing:
@@ -259,7 +267,7 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
                         result[depth_key(source_by_target[camera])],
                         depth_key(source_by_target[camera]),
                     )
-                    for camera in self.camera_keys[2:]
+                    for camera in wrist_camera_keys
                 ],
                 dim=1,
             )

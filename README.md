@@ -125,6 +125,14 @@ validation is evaluated every 20,000 steps; after each completed run the launche
 creates `checkpoints/best` pointing to the lowest validation-loss checkpoint while
 leaving `checkpoints/last` as the resume pointer.
 
+The separate `--policy.type=acmt_actv2` experiment keeps the same ACT/tactile
+network but consumes only `camera.cam2`, `camera.cam3` and `camera.cam4`
+(side, left wrist, right wrist).  Its `acmt_actv2.v1` checkpoint schema is
+incompatible with the four-camera `acmt_act.v3` schema.  The existing four-way
+Memmap is sliced before batching so the top image is not read or moved to the
+GPU; `scripts/train_acmt_actv2_peg_none_200k.sh` launches the Peg-none
+200k-step comparison run.
+
 | Category                   | Models                                                                                                                                                                                                                                                                                                                                                                                     |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **Imitation Learning**     | [ACT](./docs/source/policy_act_README.md), [Diffusion](./docs/source/policy_diffusion_README.md), [VQ-BeT](./docs/source/policy_vqbet_README.md), [Multitask DiT Policy](./docs/source/policy_multi_task_dit_README.md)                                                                                                                                                                    |

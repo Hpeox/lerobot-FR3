@@ -1,4 +1,4 @@
-"""Run the mandatory physical-batch preflight for ACMT-ACT v3."""
+"""Run the mandatory physical-batch preflight for ACMT-ACT variants."""
 
 from __future__ import annotations
 
@@ -18,18 +18,30 @@ def main() -> None:
     parser.add_argument("--memmap-dir", required=True)
     parser.add_argument("--tactile-source", choices=("none", "real"), required=True)
     parser.add_argument("--task", choices=("peg", "gear"), required=True)
+    parser.add_argument("--policy-type", choices=("acmt_act", "acmt_actv2"), default="acmt_act")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--steps", type=int, default=20)
     args = parser.parse_args()
     if args.batch_size != 16:
-        raise ValueError("ACMT-ACT v3 preflight requires physical batch_size=16")
+        raise ValueError("ACMT-ACT preflight requires physical batch_size=16")
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("preflight requested CUDA but no CUDA device is available")
 
-    dataset = ACMTACTMemmapDataset(args.memmap_dir, split="train", repo_id=f"local/acmt-act-{args.task}")
-    config = ACMTACTConfig(
+    camera_indices = (1, 2, 3) if args.policy_type == "acmt_actv2" else None
+    dataset = ACMTACTMemmapDataset(
+        args.memmap_dir,
+        split="train",
+        repo_id=f"local/acmt-act-{args.task}",
+        camera_indices=camera_indices,
+    )
+    config_cls = ACMTACTConfig
+    if args.policy_type == "acmt_actv2":
+        from lerobot.policies.acmt_actv2.configuration_acmt_actv2 import ACMTACTV2Config
+
+        config_cls = ACMTACTV2Config
+    config = config_cls(
         device=str(device),
         tactile_source=args.tactile_source,
         task_variant=args.task,
