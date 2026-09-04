@@ -14,7 +14,7 @@ from typing import Final
 
 from ..config_fr3 import normalize_realsense_shm_names
 from .aligned_shm import AlignedObservationWriter
-from .cache import CausalAligner, SampleCache
+from .cache import AlignmentRejection, CausalAligner, SampleCache, format_alignment_rejection
 from .readers import FT300SReader, RealSenseReader, TelemetryReader, XenseReader
 from .samples import CameraSample, FTSample, GripperSample, RobotSample, XenseSample
 from .uds import UDSControlServer
@@ -85,12 +85,14 @@ class SensorHubRuntime:
         self.stop_event = Event()
         self.fatal_event = Event()
         self.first_publish_event = Event()
+        self.ready_event = Event()
         self._fatal_lock = Lock()
         self._fatal_message = ""
         self._attach_pending_error: str | None = None
         self._attach_pending_log_monotonic = 0.0
-        self._alignment_pending_reason: str | None = None
+        self._alignment_pending_rejection: AlignmentRejection | None = None
         self._alignment_pending_log_monotonic = 0.0
+        self._last_logged_alignment_rejection: AlignmentRejection | None = None
         self._last_logged_camera_commit_count = 0
         self._threads: list[Thread] = []
         self._readers: list[object] = []
@@ -138,6 +140,7 @@ class SensorHubRuntime:
 
             self._wait_until_ready(startup_deadline)
             self.control.publish("READY", message="first aligned snapshot published")
+            self.ready_event.set()
             self._supervise()
             return 1 if self.fatal_event.is_set() else 0
         except _ParentExited:
@@ -241,6 +244,7 @@ class SensorHubRuntime:
 
     def _alignment_loop(self) -> None:
         next_publish_not_before_ns = 0
+        cadence_gate_checked = True
         while not self.stop_event.is_set():
             try:
                 now_ns = time.monotonic_ns()
@@ -252,21 +256,44 @@ class SensorHubRuntime:
                         )
                     )
                     continue
+                if not cadence_gate_checked:
+                    lateness_ns = now_ns - next_publish_not_before_ns
+                    if lateness_ns >= ALIGNED_PUBLISH_PERIOD_NS:
+                        logger.warning(
+                            "SensorHub alignment publisher late: lateness_ms=%.3f",
+                            lateness_ns / 1_000_000,
+                        )
+                    cadence_gate_checked = True
                 sample = self.aligner.select(time.time_ns(), now_ns)
                 self._log_new_camera_bundle()
                 if sample is None:
-                    if not self.first_publish_event.is_set():
+                    if self.ready_event.is_set():
+                        self._log_alignment_rejected()
+                    elif not self.first_publish_event.is_set():
                         self._log_alignment_pending()
                     time.sleep(0.001)
                     continue
                 assert self.writer is not None
                 self.writer.publish(sample)
+                publish_duration_ns = self.writer.timing_diagnostics.publish_duration_ns
+                if (
+                    publish_duration_ns is not None
+                    and publish_duration_ns >= ALIGNED_PUBLISH_PERIOD_NS
+                ):
+                    logger.warning(
+                        "SensorHub aligned writer slow: duration_ms=%.3f",
+                        publish_duration_ns / 1_000_000,
+                    )
+                if self._last_logged_alignment_rejection is not None:
+                    logger.info("SensorHub alignment recovered")
+                    self._last_logged_alignment_rejection = None
                 self.first_publish_event.set()
                 # Schedule from completion so a delayed iteration does not
                 # immediately publish several queued camera bundles.
                 next_publish_not_before_ns = (
                     time.monotonic_ns() + ALIGNED_PUBLISH_PERIOD_NS
                 )
+                cadence_gate_checked = False
             except Exception as exc:
                 self._fatal(f"AlignmentPublisher failed: {exc}")
                 return
@@ -294,15 +321,26 @@ class SensorHubRuntime:
 
     def _log_alignment_pending(self) -> None:
         """Log the startup alignment rejection on change or once per second."""
-        reason = self.aligner.last_rejection_reason or "unknown alignment rejection"
+        rejection = self.aligner.last_rejection
         now = time.monotonic()
         if (
-            reason != self._alignment_pending_reason
+            rejection != self._alignment_pending_rejection
             or now - self._alignment_pending_log_monotonic >= 1.0
         ):
-            logger.warning("SensorHub alignment pending before READY: %s", reason)
-            self._alignment_pending_reason = reason
+            logger.warning(
+                "SensorHub alignment pending before READY: %s",
+                format_alignment_rejection(rejection),
+            )
+            self._alignment_pending_rejection = rejection
             self._alignment_pending_log_monotonic = now
+
+    def _log_alignment_rejected(self) -> None:
+        rejection = self.aligner.last_rejection
+        if rejection is None:
+            raise RuntimeError("aligner returned no sample without a rejection")
+        if rejection != self._last_logged_alignment_rejection:
+            logger.warning("SensorHub alignment rejected: %s", rejection.value)
+            self._last_logged_alignment_rejection = rejection
 
     def _all_sources_advanced(self) -> bool:
         caches = (

@@ -153,6 +153,7 @@ class WriterTimingDiagnostics:
     sequence: int
     publish_interval_ns: int | None
     same_slot_rewrite_interval_ns: int | None
+    publish_duration_ns: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,7 +182,7 @@ class AlignedObservationWriter:
         self._write_global(ready=0, latest_sequence=0, fatal=0, status_code=0, message="")
         self._last_publish_monotonic_ns: int | None = None
         self._last_slot_publish_monotonic_ns: list[int | None] = [None] * SLOT_COUNT
-        self._timing_diagnostics = WriterTimingDiagnostics(0, None, None)
+        self._timing_diagnostics = WriterTimingDiagnostics(0, None, None, None)
 
     @property
     def timing_diagnostics(self) -> WriterTimingDiagnostics:
@@ -217,6 +218,7 @@ class AlignedObservationWriter:
         )
 
     def publish(self, sample: AlignedSample) -> None:
+        started_ns = time.monotonic_ns()
         if len(sample.cameras) != self.layout.camera_count:
             raise ValueError(
                 f"aligned sample has {len(sample.cameras)} cameras, expected {self.layout.camera_count}"
@@ -290,6 +292,7 @@ class AlignedObservationWriter:
             sequence,
             publish_interval_ns,
             same_slot_rewrite_interval_ns,
+            completed_ns - started_ns,
         )
 
     @staticmethod

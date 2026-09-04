@@ -20,7 +20,7 @@ from lerobot.robots.fr3.sensorhub.aligned_shm import (
     AlignedObservationWriter,
     aligned_observation_layout,
 )
-from lerobot.robots.fr3.sensorhub.cache import CausalAligner, SampleCache
+from lerobot.robots.fr3.sensorhub.cache import AlignmentRejection, CausalAligner, SampleCache
 from lerobot.robots.fr3.sensorhub.readers import (
     FT_SLOT_HEADER,
     FT_SLOT_STRIDE,
@@ -180,6 +180,7 @@ def test_camera_bootstrap_over_hard_gate_does_not_commit_and_can_retry():
     camera_caches[1].append(camera(1, 3, source_ns=70_000_000))
     camera_caches[1].append(camera(2, 4, source_ns=80_000_000))
     assert aligner.initialize_cameras() is None
+    assert aligner.last_rejection is AlignmentRejection.CAMERA_BOOTSTRAP_HARD_SKEW
     assert not aligner.cameras_initialized
     assert aligner.camera_frontiers is None
     camera_caches[0].append(camera(3, 5, source_ns=90_000_000))
@@ -211,7 +212,7 @@ def test_normal_staggered_camera_arrivals_commit_only_one_bundle(arrival_order):
     assert sum(sample is not None for sample in publishes) == 1
     assert aligner.camera_commit_count == 2
     assert aligner.select(10, 50_000_000) is None
-    assert "unchanged" in aligner.last_rejection_reason
+    assert aligner.last_rejection is AlignmentRejection.CAMERA_TUPLE_UNCHANGED
 
 
 def test_camera_source_time_controls_coherence_and_ingest_only_controls_wait():
@@ -234,7 +235,7 @@ def test_camera_degraded_candidate_waits_then_commits_after_timeout():
     camera_caches[0].append(camera(3, 30_000_000, source_ns=130_000_000))
     camera_caches[1].append(camera(3, 31_000_000, source_ns=155_000_000))
     assert aligner.select(2, 40_000_000) is None
-    assert "awaiting timeout" in aligner.last_rejection_reason
+    assert aligner.last_rejection is AlignmentRejection.CAMERA_DEGRADED_AWAITING_TIMEOUT
     aligned = aligner.select(3, 56_000_000)
     assert aligned is not None
     assert aligner.last_camera_bundle.degraded
@@ -254,7 +255,7 @@ def test_camera_hard_reject_and_stalled_camera_stop_progression():
 
     camera_caches[1].append(camera(20, 60_000_000, source_ns=166_000_000))
     assert aligner.select(3, 90_000_000) is None
-    assert "hard gate" in aligner.last_rejection_reason
+    assert aligner.last_rejection is AlignmentRejection.CAMERA_HARD_SKEW
     assert aligner.camera_commit_count == 2
 
     camera_caches[0].append(camera(30, 91_000_000, source_ns=167_000_000))
@@ -315,7 +316,7 @@ def test_latest_non_camera_values_are_used_once_per_camera_commit():
     assert aligner.select(2, 22_000_000) is None
 
 
-def test_missing_bootstrap_assembly_does_not_roll_back_camera_frontier():
+def test_committed_camera_bundle_survives_non_camera_failure_and_new_bundle_wins():
     camera_caches = tuple(SampleCache[CameraSample](0.5) for _ in range(2))
     empty_xense = SampleCache[XenseSample](0.5)
     _xense, ft, robot, gripper = _required_caches()
@@ -333,7 +334,7 @@ def test_missing_bootstrap_assembly_does_not_roll_back_camera_frontier():
     assert bootstrap is not None
     frontiers = aligner.camera_frontiers
     assert aligner.select(1, 21_000_000) is None
-    assert aligner.last_rejection_reason == "missing required samples: xense"
+    assert aligner.last_rejection is AlignmentRejection.XENSE_MISSING
     assert aligner.camera_frontiers == frontiers
     assert aligner.camera_commit_count == 1
 
@@ -344,14 +345,179 @@ def test_missing_bootstrap_assembly_does_not_roll_back_camera_frontier():
 
     field = np.zeros((35, 20, 3), dtype=np.float32)
     empty_xense.append(XenseSample(1, 1, 32_000_000, field, field))
-    assert aligner.select(3, 33_000_000) is None
+    aligned = aligner.select(3, 33_000_000)
+    assert aligned is not None
+    assert [sample.sequence for sample in aligned.cameras] == [3, 3]
     assert aligner.camera_commit_count == 2
 
-    for index, cache in enumerate(camera_caches):
-        cache.append(camera(4, 40_000_000 + index, source_ns=166_000_000 + index))
-    aligned = aligner.select(4, 41_000_000)
+
+def test_pending_retry_does_not_commit_or_bypass_camera_wait():
+    camera_caches = tuple(SampleCache[CameraSample](0.5) for _ in range(2))
+    empty_xense = SampleCache[XenseSample](0.5)
+    _xense, ft, robot, gripper = _required_caches()
+    aligner = CausalAligner(
+        camera_caches,
+        empty_xense,
+        ft,
+        robot,
+        gripper,
+        camera_max_skew_ms=50,
+        camera_bundle_wait_ms=25,
+        required_sample_max_age_ms=100,
+    )
+    _append_bootstrap(camera_caches)
+    assert aligner.initialize_cameras() is not None
+    assert aligner.select(1, 21_000_000) is None
+    frontiers = aligner.camera_frontiers
+
+    camera_caches[0].append(camera(3, 30_000_000, source_ns=133_000_000))
+    assert aligner.select(2, 40_000_000) is None
+    assert aligner.last_rejection is AlignmentRejection.XENSE_MISSING
+    assert aligner.camera_frontiers == frontiers
+    assert aligner.camera_commit_count == 1
+
+    field = np.zeros((35, 20, 3), dtype=np.float32)
+    empty_xense.append(XenseSample(1, 1, 40_000_000, field, field))
+    aligned = aligner.select(3, 41_000_000)
     assert aligned is not None
-    assert aligner.camera_commit_count == 3
+    assert [sample.sequence for sample in aligned.cameras] == [2, 2]
+    assert aligner.camera_frontiers == frontiers
+    assert aligner.camera_commit_count == 1
+
+
+def test_pending_retry_does_not_bypass_degraded_wait_or_hard_gate():
+    camera_caches = tuple(SampleCache[CameraSample](0.5) for _ in range(2))
+    empty_xense = SampleCache[XenseSample](0.5)
+    _xense, ft, robot, gripper = _required_caches()
+    aligner = CausalAligner(
+        camera_caches,
+        empty_xense,
+        ft,
+        robot,
+        gripper,
+        camera_bundle_span_warn_ms=20,
+        camera_max_skew_ms=50,
+        camera_bundle_wait_ms=25,
+        required_sample_max_age_ms=100,
+    )
+    _append_bootstrap(camera_caches)
+    assert aligner.initialize_cameras() is not None
+    assert aligner.select(1, 21_000_000) is None
+    frontiers = aligner.camera_frontiers
+
+    camera_caches[0].append(camera(3, 30_000_000, source_ns=130_000_000))
+    camera_caches[1].append(camera(3, 31_000_000, source_ns=155_000_000))
+    assert aligner.select(2, 40_000_000) is None
+    assert aligner.last_rejection is AlignmentRejection.XENSE_MISSING
+    assert aligner.camera_frontiers == frontiers
+    assert aligner.camera_commit_count == 1
+
+    camera_caches[0].append(camera(4, 600_000_000, source_ns=300_000_000))
+    camera_caches[1].append(camera(4, 601_000_000, source_ns=400_000_000))
+    field = np.zeros((35, 20, 3), dtype=np.float32)
+    empty_xense.append(XenseSample(1, 1, 601_000_000, field, field))
+    assert aligner.select(3, 602_000_000) is None
+    assert aligner.last_rejection is AlignmentRejection.CAMERA_HARD_SKEW
+    assert aligner.camera_frontiers == frontiers
+    assert aligner.camera_commit_count == 1
+
+
+def test_non_camera_rejections_are_stable_and_source_ordered():
+    camera_caches, aligner = _aligner(max_age_ms=1)
+    _append_bootstrap(camera_caches)
+    assert aligner.initialize_cameras() is not None
+
+    assert aligner.select(1, 100_000_000) is None
+    assert aligner.last_rejection is AlignmentRejection.XENSE_STALE
+    first_rejection = aligner.last_rejection
+    assert aligner.select(2, 200_000_000) is None
+    assert aligner.last_rejection is first_rejection
+    assert "age_ms" not in aligner.last_rejection_reason
+
+
+@pytest.mark.parametrize(
+    ("missing_index", "expected"),
+    [
+        (0, AlignmentRejection.XENSE_MISSING),
+        (1, AlignmentRejection.FT_MISSING),
+        (2, AlignmentRejection.ROBOT_MISSING),
+        (3, AlignmentRejection.GRIPPER_MISSING),
+    ],
+)
+def test_non_camera_missing_rejections_are_per_source(missing_index, expected):
+    camera_caches = tuple(SampleCache[CameraSample](0.5) for _ in range(2))
+    caches = list(_required_caches())
+    caches[missing_index] = SampleCache(0.5)
+    aligner = CausalAligner(
+        camera_caches,
+        *caches,
+        camera_max_skew_ms=50,
+        required_sample_max_age_ms=100,
+    )
+    _append_bootstrap(camera_caches)
+    assert aligner.initialize_cameras() is not None
+
+    assert aligner.select(1, 100_000_000) is None
+    assert aligner.last_rejection is expected
+
+
+@pytest.mark.parametrize(
+    ("stale_index", "expected"),
+    [
+        (0, AlignmentRejection.XENSE_STALE),
+        (1, AlignmentRejection.FT_STALE),
+        (2, AlignmentRejection.ROBOT_STALE),
+        (3, AlignmentRejection.GRIPPER_STALE),
+    ],
+)
+def test_non_camera_stale_rejections_are_per_source(stale_index, expected):
+    ingest_times = [99_000_000] * 4
+    ingest_times[stale_index] = 90_000_000
+    field = np.zeros((35, 20, 3), dtype=np.float32)
+    joints = np.zeros(7, dtype=np.float32)
+    caches = (
+        SampleCache[XenseSample](0.5),
+        SampleCache[FTSample](0.5),
+        SampleCache[RobotSample](0.5),
+        SampleCache[GripperSample](0.5),
+    )
+    caches[0].append(XenseSample(1, 1, ingest_times[0], field, field))
+    caches[1].append(FTSample(1, 1, ingest_times[1], np.zeros(6, dtype=np.float32)))
+    caches[2].append(
+        RobotSample(1, 1, ingest_times[2], joints, joints, joints, transform())
+    )
+    caches[3].append(GripperSample(1, 1, ingest_times[3], 1, 2))
+    camera_caches = tuple(SampleCache[CameraSample](0.5) for _ in range(2))
+    aligner = CausalAligner(
+        camera_caches,
+        *caches,
+        camera_max_skew_ms=50,
+        required_sample_max_age_ms=5,
+    )
+    _append_bootstrap(camera_caches)
+    assert aligner.initialize_cameras() is not None
+
+    assert aligner.select(1, 100_000_000) is None
+    assert aligner.last_rejection is expected
+
+
+def test_non_camera_rejection_uses_deterministic_source_order():
+    camera_caches = tuple(SampleCache[CameraSample](0.5) for _ in range(2))
+    xense, _ft, robot, gripper = _required_caches()
+    aligner = CausalAligner(
+        camera_caches,
+        xense,
+        SampleCache[FTSample](0.5),
+        robot,
+        gripper,
+        camera_max_skew_ms=50,
+        required_sample_max_age_ms=1,
+    )
+    _append_bootstrap(camera_caches)
+    assert aligner.initialize_cameras() is not None
+
+    assert aligner.select(1, 100_000_000) is None
+    assert aligner.last_rejection is AlignmentRejection.XENSE_STALE
 
 
 def _aligned_sample(sequence=1, camera_count=2):
@@ -504,7 +670,16 @@ def test_aligned_shm_fatal_and_stale_detection():
 
 def test_aligned_shm_writer_reports_publish_and_same_slot_intervals(monkeypatch):
     name = f"fr3_timing_{uuid.uuid4().hex}"
-    ticks = iter((1_000_000_000, 1_033_000_000, 1_066_000_000))
+    ticks = iter(
+        (
+            999_000_000,
+            1_000_000_000,
+            1_032_000_000,
+            1_033_000_000,
+            1_065_000_000,
+            1_066_000_000,
+        )
+    )
     monkeypatch.setattr(
         aligned_shm_module,
         "time",
@@ -517,6 +692,7 @@ def test_aligned_shm_writer_reports_publish_and_same_slot_intervals(monkeypatch)
         writer.publish(_aligned_sample(sequence=3, camera_count=1))
         assert writer.timing_diagnostics.publish_interval_ns == 33_000_000
         assert writer.timing_diagnostics.same_slot_rewrite_interval_ns == 66_000_000
+        assert writer.timing_diagnostics.publish_duration_ns == 1_000_000
     finally:
         writer.close()
 

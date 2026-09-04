@@ -8,9 +8,13 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from lerobot.robots.fr3.sensorhub import __main__ as sensorhub_main
 from lerobot.robots.fr3.sensorhub import runtime as runtime_module
-from lerobot.robots.fr3.sensorhub.aligned_shm import AlignedObservationClient, AlignedObservationWriter
-from lerobot.robots.fr3.sensorhub.cache import CausalAligner, SampleCache
+from lerobot.robots.fr3.sensorhub.aligned_shm import (
+    AlignedObservationClient,
+    AlignedObservationWriter,
+)
+from lerobot.robots.fr3.sensorhub.cache import AlignmentRejection, CausalAligner, SampleCache
 from lerobot.robots.fr3.sensorhub.runtime import SensorHubConfig, SensorHubRuntime
 from lerobot.robots.fr3.sensorhub.samples import (
     CameraSample,
@@ -186,14 +190,14 @@ def test_fatal_is_published_and_logged_once_across_concurrent_failures(tmp_path,
 
 def test_alignment_pending_log_is_reason_change_or_one_second_throttled(caplog):
     runtime = object.__new__(SensorHubRuntime)
-    runtime.aligner = SimpleNamespace(last_rejection_reason="missing required samples: robot")
-    runtime._alignment_pending_reason = None
+    runtime.aligner = SimpleNamespace(last_rejection=AlignmentRejection.ROBOT_MISSING)
+    runtime._alignment_pending_rejection = None
     runtime._alignment_pending_log_monotonic = 0.0
     caplog.set_level(logging.WARNING, logger=runtime_module.__name__)
 
     runtime._log_alignment_pending()
     runtime._log_alignment_pending()
-    runtime.aligner.last_rejection_reason = "missing required samples: gripper"
+    runtime.aligner.last_rejection = AlignmentRejection.GRIPPER_MISSING
     runtime._log_alignment_pending()
     runtime._alignment_pending_log_monotonic -= 1.0
     runtime._log_alignment_pending()
@@ -207,6 +211,27 @@ def test_alignment_pending_log_is_reason_change_or_one_second_throttled(caplog):
         "SensorHub alignment pending before READY: missing required samples: robot",
         "SensorHub alignment pending before READY: missing required samples: gripper",
         "SensorHub alignment pending before READY: missing required samples: gripper",
+    ]
+
+
+def test_runtime_alignment_rejection_logs_only_on_change_and_includes_camera(caplog):
+    runtime = object.__new__(SensorHubRuntime)
+    runtime.aligner = SimpleNamespace(last_rejection=AlignmentRejection.ROBOT_STALE)
+    runtime._last_logged_alignment_rejection = None
+    caplog.set_level(logging.WARNING, logger=runtime_module.__name__)
+
+    runtime._log_alignment_rejected()
+    runtime._log_alignment_rejected()
+    runtime.aligner.last_rejection = AlignmentRejection.GRIPPER_MISSING
+    runtime._log_alignment_rejected()
+    runtime.aligner.last_rejection = AlignmentRejection.CAMERA_HARD_SKEW
+    runtime._log_alignment_rejected()
+
+    messages = [record.message for record in caplog.records if "alignment rejected" in record.message]
+    assert messages == [
+        "SensorHub alignment rejected: ROBOT_STALE",
+        "SensorHub alignment rejected: GRIPPER_MISSING",
+        "SensorHub alignment rejected: CAMERA_HARD_SKEW",
     ]
 
 
@@ -239,6 +264,7 @@ def test_run_uses_one_startup_deadline_for_attach_and_ready(monkeypatch, tmp_pat
     runtime.config = _config(tmp_path, f"unused_{uuid.uuid4().hex}")
     runtime.stop_event = Event()
     runtime.fatal_event = Event()
+    runtime.ready_event = Event()
     runtime._threads = []
     runtime._readers = []
     runtime.writer = None
@@ -290,14 +316,19 @@ def test_alignment_pending_logs_stop_after_first_publish(caplog):
     runtime = object.__new__(SensorHubRuntime)
     runtime.stop_event = Event()
     runtime.first_publish_event = Event()
-    runtime._alignment_pending_reason = None
+    runtime.ready_event = Event()
+    runtime._alignment_pending_rejection = None
     runtime._alignment_pending_log_monotonic = 0.0
+    runtime._last_logged_alignment_rejection = None
     published = []
-    runtime.writer = SimpleNamespace(publish=published.append)
+    runtime.writer = SimpleNamespace(
+        publish=published.append,
+        timing_diagnostics=SimpleNamespace(publish_duration_ns=0),
+    )
     runtime._fatal = lambda message: pytest.fail(message)
 
     class Aligner:
-        last_rejection_reason = "missing required samples: robot"
+        last_rejection = AlignmentRejection.ROBOT_MISSING
         calls = 0
 
         def select(self, realtime_ns, monotonic_ns):
@@ -340,14 +371,18 @@ def test_alignment_loop_paces_publications_without_catchup(monkeypatch):
     runtime = object.__new__(SensorHubRuntime)
     runtime.stop_event = Event()
     runtime.first_publish_event = Event()
-    runtime._alignment_pending_reason = None
+    runtime.ready_event = Event()
+    runtime._alignment_pending_rejection = None
     runtime._alignment_pending_log_monotonic = 0.0
+    runtime._last_logged_alignment_rejection = None
     runtime._log_new_camera_bundle = lambda: None
     runtime._fatal = lambda message: pytest.fail(message)
 
     published_at = []
 
     class Writer:
+        timing_diagnostics = SimpleNamespace(publish_duration_ns=0)
+
         def publish(self, sample):
             published_at.append(clock.monotonic_ns())
             if len(published_at) == 2:
@@ -356,7 +391,7 @@ def test_alignment_loop_paces_publications_without_catchup(monkeypatch):
     runtime.writer = Writer()
 
     class Aligner:
-        last_rejection_reason = ""
+        last_rejection = AlignmentRejection.CAMERA_TUPLE_UNCHANGED
 
         def __init__(self):
             self.samples = iter(("first", "second", "third"))
@@ -384,6 +419,192 @@ def test_alignment_loop_paces_publications_without_catchup(monkeypatch):
     )
     assert published_at[2] - published_at[1] >= 100_000_000 + runtime_module.ALIGNED_PUBLISH_PERIOD_NS
     assert aligner.select_at[:3] == published_at
+
+
+def test_alignment_recovery_logs_after_successful_publish(monkeypatch, caplog):
+    runtime = object.__new__(SensorHubRuntime)
+    runtime.stop_event = Event()
+    runtime.first_publish_event = Event()
+    runtime.ready_event = Event()
+    runtime.ready_event.set()
+    runtime._last_logged_alignment_rejection = None
+    runtime._log_new_camera_bundle = lambda: None
+    runtime._fatal = lambda message: pytest.fail(message)
+
+    class Writer:
+        timing_diagnostics = SimpleNamespace(publish_duration_ns=0)
+
+        def publish(self, sample):
+            pass
+
+    runtime.writer = Writer()
+
+    class Aligner:
+        last_rejection = AlignmentRejection.ROBOT_STALE
+        calls = 0
+
+        def select(self, realtime_ns, monotonic_ns):
+            self.calls += 1
+            if self.calls <= 2:
+                return None
+            if self.calls == 3:
+                return "recovered sample"
+            runtime.stop_event.set()
+            return None
+
+    runtime.aligner = Aligner()
+    monkeypatch.setattr(runtime_module, "ALIGNED_PUBLISH_PERIOD_NS", 1_000_000)
+    caplog.set_level(logging.INFO, logger=runtime_module.__name__)
+
+    runtime._alignment_loop()
+
+    messages = [record.message for record in caplog.records]
+    assert messages.count("SensorHub alignment rejected: ROBOT_STALE") == 2
+    assert messages.count("SensorHub alignment recovered") == 1
+
+
+@pytest.mark.parametrize(
+    ("duration_ns", "expects_warning"),
+    [(33_333_333, True), (33_333_332, False)],
+)
+def test_alignment_loop_reports_slow_writer_at_one_period(duration_ns, expects_warning, caplog):
+    runtime = object.__new__(SensorHubRuntime)
+    runtime.stop_event = Event()
+    runtime.first_publish_event = Event()
+    runtime.ready_event = Event()
+    runtime._last_logged_alignment_rejection = None
+    runtime._log_new_camera_bundle = lambda: None
+    runtime._fatal = lambda message: pytest.fail(message)
+
+    class Writer:
+        timing_diagnostics = SimpleNamespace(publish_duration_ns=duration_ns)
+
+        def publish(self, sample):
+            runtime.stop_event.set()
+
+    runtime.writer = Writer()
+    runtime.aligner = SimpleNamespace(
+        select=lambda realtime_ns, monotonic_ns: "sample",
+        last_rejection=None,
+    )
+    caplog.set_level(logging.WARNING, logger=runtime_module.__name__)
+
+    runtime._alignment_loop()
+
+    warnings = ["aligned writer slow" in record.message for record in caplog.records]
+    assert any(warnings) is expects_warning
+
+
+def test_late_cadence_gate_warns_only_once_during_retries(monkeypatch, caplog):
+    class FakeClock:
+        def __init__(self):
+            self.now_ns = 10_000_000_000
+            self.inject_delay = False
+
+        def monotonic_ns(self):
+            return self.now_ns
+
+        def time_ns(self):
+            return self.now_ns
+
+        def sleep(self, seconds):
+            self.now_ns += round(seconds * 1_000_000_000)
+            if self.inject_delay:
+                self.now_ns += 2 * runtime_module.ALIGNED_PUBLISH_PERIOD_NS
+                self.inject_delay = False
+
+    clock = FakeClock()
+    monkeypatch.setattr(runtime_module, "time", clock)
+    runtime = object.__new__(SensorHubRuntime)
+    runtime.stop_event = Event()
+    runtime.first_publish_event = Event()
+    runtime.ready_event = Event()
+    runtime.ready_event.set()
+    runtime._last_logged_alignment_rejection = None
+    runtime._log_new_camera_bundle = lambda: None
+    runtime._fatal = lambda message: pytest.fail(message)
+
+    class Writer:
+        timing_diagnostics = SimpleNamespace(publish_duration_ns=0)
+
+        def publish(self, sample):
+            clock.inject_delay = True
+
+    runtime.writer = Writer()
+
+    class Aligner:
+        last_rejection = AlignmentRejection.ROBOT_STALE
+        calls = 0
+
+        def select(self, realtime_ns, monotonic_ns):
+            self.calls += 1
+            if self.calls == 1:
+                return "first"
+            if self.calls == 5:
+                runtime.stop_event.set()
+            return None
+
+    runtime.aligner = Aligner()
+    caplog.set_level(logging.WARNING, logger=runtime_module.__name__)
+
+    runtime._alignment_loop()
+
+    messages = [record.message for record in caplog.records if "publisher late" in record.message]
+    assert len(messages) == 1
+
+
+def test_on_time_gate_then_prolonged_rejection_does_not_warn_late(monkeypatch, caplog):
+    class FakeClock:
+        def __init__(self):
+            self.now_ns = 10_000_000_000
+
+        def monotonic_ns(self):
+            return self.now_ns
+
+        def time_ns(self):
+            return self.now_ns
+
+        def sleep(self, seconds):
+            self.now_ns += round(seconds * 1_000_000_000)
+
+    clock = FakeClock()
+    monkeypatch.setattr(runtime_module, "time", clock)
+    monkeypatch.setattr(runtime_module, "ALIGNED_PUBLISH_PERIOD_NS", 1_000_000)
+    runtime = object.__new__(SensorHubRuntime)
+    runtime.stop_event = Event()
+    runtime.first_publish_event = Event()
+    runtime.ready_event = Event()
+    runtime.ready_event.set()
+    runtime._last_logged_alignment_rejection = None
+    runtime._log_new_camera_bundle = lambda: None
+    runtime._fatal = lambda message: pytest.fail(message)
+
+    class Writer:
+        timing_diagnostics = SimpleNamespace(publish_duration_ns=0)
+
+        def publish(self, sample):
+            pass
+
+    runtime.writer = Writer()
+
+    class Aligner:
+        last_rejection = AlignmentRejection.ROBOT_STALE
+        calls = 0
+
+        def select(self, realtime_ns, monotonic_ns):
+            self.calls += 1
+            if self.calls == 1:
+                return "first"
+            if self.calls == 50:
+                runtime.stop_event.set()
+            return None
+
+    runtime.aligner = Aligner()
+    caplog.set_level(logging.WARNING, logger=runtime_module.__name__)
+
+    runtime._alignment_loop()
+
+    assert not any("publisher late" in record.message for record in caplog.records)
 
 
 def test_ready_timeout_reports_each_source_progress():
@@ -443,10 +664,35 @@ def _camera_bootstrap_runtime(camera_caches):
     runtime._fatal_message = ""
     runtime._parent_is_alive = lambda: True
     runtime._last_logged_camera_commit_count = 0
-    runtime._alignment_pending_reason = None
+    runtime._alignment_pending_rejection = None
     runtime._alignment_pending_log_monotonic = 0.0
     runtime._log_new_camera_bundle = lambda: None
     return runtime
+
+
+def test_sensorhub_main_uses_lerobot_logging(monkeypatch):
+    calls = []
+    config = object()
+    monkeypatch.setattr(sensorhub_main, "init_logging", lambda: calls.append("logging"))
+    monkeypatch.setattr(
+        sensorhub_main,
+        "SensorHubConfig",
+        SimpleNamespace(from_dict=lambda values: calls.append(values) or config),
+    )
+    monkeypatch.setattr(
+        sensorhub_main,
+        "SensorHubRuntime",
+        lambda parsed_config, parent_pid: SimpleNamespace(
+            run=lambda: calls.append((parsed_config, parent_pid)) or 0
+        ),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        ["sensorhub", "--config-json", "{}", "--parent-pid", "123"],
+    )
+
+    assert sensorhub_main.main() == 0
+    assert calls == ["logging", {}, (config, 123)]
 
 
 def test_camera_bootstrap_is_independent_of_non_camera_readiness():

@@ -27,7 +27,7 @@ def test_init_logging_preserves_source_basename(capsys):
 
     source_name = Path(__file__).name
     assert re.search(
-        rf"INFO \d{{4}}-\d{{2}}-\d{{2}} \d{{2}}:\d{{2}}:\d{{2}} "
+        rf"INFO \d{{4}}-\d{{2}}-\d{{2}} \d{{2}}:\d{{2}}:\d{{2}}\.\d{{3}} "
         rf"{re.escape(source_name)}:\d+ source basename marker",
         output,
     )

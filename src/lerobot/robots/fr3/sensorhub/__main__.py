@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import logging
+
+from lerobot.utils.utils import init_logging
 
 from .runtime import SensorHubConfig, SensorHubRuntime
 
@@ -17,7 +18,7 @@ def main() -> int:
     parser.add_argument("--config-json", required=True)
     parser.add_argument("--parent-pid", required=True, type=int)
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO)
+    init_logging()
     config = SensorHubConfig.from_dict(json.loads(args.config_json))
     return SensorHubRuntime(config, args.parent_pid).run()
 
