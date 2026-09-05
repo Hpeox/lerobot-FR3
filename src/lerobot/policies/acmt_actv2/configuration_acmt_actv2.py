@@ -24,7 +24,11 @@ from lerobot.policies.acmt_act.configuration_acmt_act import (
 
 CAMERA_KEYS = ("camera.cam2", "camera.cam3", "camera.cam4")
 CAMERA_NAMES = ("side", "wrist_left", "wrist_right")
+# Training Memmap samples already use semantic camera keys.  The FR3 runtime
+# publishes physical camera IDs, so deployment may opt into this explicit
+# source mapping while retaining the same target/model keys.
 DEFAULT_SOURCE_CAMERA_KEYS = CAMERA_KEYS
+FR3_SOURCE_CAMERA_KEYS = ("camera.cam3", "camera.cam1", "camera.cam2")
 DEFAULT_CROP_PARAMS = {
     "side": (140, 60, 320, 580),
     "wrist_left": (80, 30, 320, 580),
@@ -59,6 +63,8 @@ class ACMTACTV2Config(ACMTACTConfig):
     checkpoint_schema_version: int = 1
     camera_keys: tuple[str, ...] = CAMERA_KEYS
     camera_names: tuple[str, ...] = CAMERA_NAMES
+    # Keep identity mapping for training artifacts.  FR3 deployment can set
+    # ``FR3_SOURCE_CAMERA_KEYS`` while preserving the model's target keys.
     source_camera_keys: tuple[str, ...] = DEFAULT_SOURCE_CAMERA_KEYS
     crop_params: dict[str, tuple[int, int, int, int]] = field(
         default_factory=lambda: dict(DEFAULT_CROP_PARAMS)
@@ -149,12 +155,11 @@ class ACMTACTV2Config(ACMTACTConfig):
             raise ValueError("ACMT-ACTv2 fixes a four-frame causal ACMT ring at 30 Hz")
         if self.camera_keys != CAMERA_KEYS or self.camera_names != CAMERA_NAMES:
             raise ValueError("ACMT-ACTv2 camera order must be side, wrist_left, wrist_right")
-        if (
-            len(self.source_camera_keys) != len(self.camera_keys)
-            or len(set(self.source_camera_keys)) != len(self.source_camera_keys)
-            or set(self.source_camera_keys) != set(self.camera_keys)
-        ):
-            raise ValueError("ACMT-ACTv2 source_camera_keys must match the three camera keys")
+        if self.source_camera_keys not in {DEFAULT_SOURCE_CAMERA_KEYS, FR3_SOURCE_CAMERA_KEYS}:
+            raise ValueError(
+                "ACMT-ACTv2 source_camera_keys must use training identity mapping "
+                "or the fixed FR3 deployment mapping"
+            )
         if set(self.crop_params) != set(CAMERA_NAMES):
             raise ValueError(f"crop_params must contain exactly {sorted(CAMERA_NAMES)}")
         for name, crop in self.crop_params.items():
@@ -214,5 +219,6 @@ __all__ = [
     "CAMERA_KEYS",
     "CAMERA_NAMES",
     "DEFAULT_SOURCE_CAMERA_KEYS",
+    "FR3_SOURCE_CAMERA_KEYS",
     "DEFAULT_CROP_PARAMS",
 ]

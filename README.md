@@ -128,10 +128,15 @@ leaving `checkpoints/last` as the resume pointer.
 The separate `--policy.type=acmt_actv2` experiment keeps the same ACT/tactile
 network but consumes only `camera.cam2`, `camera.cam3` and `camera.cam4`
 (side, left wrist, right wrist).  Its `acmt_actv2.v1` checkpoint schema is
-incompatible with the four-camera `acmt_act.v3` schema.  The existing four-way
-Memmap is sliced before batching so the top image is not read or moved to the
-GPU; `scripts/train_acmt_actv2_peg_none_200k.sh` launches the Peg-none
-200k-step comparison run.
+incompatible with the four-camera `acmt_act.v3` schema.  Training Memmap
+samples use the identity source mapping.  For FR3 deployment, keep
+MainController's raw camera IDs and set `source_camera_keys` to
+`["camera.cam3", "camera.cam1", "camera.cam2"]`, yielding
+`side <- cam3`, `wrist_left <- cam1`, and `wrist_right <- cam2`; the shared
+postprocessor maps policy gripper opening `0/1` to wire `gPO=255/3`.  The
+existing four-way Memmap is sliced before batching so the top image is not
+read or moved to the GPU; `scripts/train_acmt_actv2_peg_none_200k.sh` launches
+the Peg-none 200k-step comparison run.
 
 | Category                   | Models                                                                                                                                                                                                                                                                                                                                                                                     |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |

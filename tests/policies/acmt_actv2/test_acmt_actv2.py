@@ -3,18 +3,22 @@ from __future__ import annotations
 import json
 
 import numpy as np
+import pytest
 import torch
 
 from lerobot.datasets.acmt_act_memmap import ARRAY_SPECS, ACMTACTMemmapDataset, MEMMAP_VERSION
-from lerobot.policies.acmt_act.configuration_acmt_act import XENSE0, XENSE1
+from lerobot.policies.acmt_act.configuration_acmt_act import XENSE0, XENSE1, rgb_key
 from lerobot.policies.acmt_act.processor_acmt_act import ACMTACTObservationProcessorStep
 from lerobot.policies.acmt_actv2.configuration_acmt_actv2 import (
     CAMERA_KEYS,
     CAMERA_NAMES,
     ACMTACTV2Config,
+    FR3_SOURCE_CAMERA_KEYS,
 )
+from lerobot.policies.acmt_dp.gripper_mapping import ACMTDPGripperGPOProcessorStep
 from lerobot.policies.acmt_actv2.modeling_acmt_actv2 import ACMTACTV2Policy
-from lerobot.policies.factory import get_policy_class, make_policy_config
+from lerobot.policies.factory import get_policy_class, make_policy_config, make_pre_post_processors
+from lerobot.processor import PolicyProcessorPipeline
 from lerobot.utils.constants import OBS_STATE
 
 
@@ -89,6 +93,97 @@ def test_processor_has_no_top_and_preserves_three_camera_crops() -> None:
     actual = side[0, :, 0, 0] * std[:, 0, 0] + mean[:, 0, 0]
     torch.testing.assert_close(actual, torch.tensor([140, 60, 0]) / 255)
     assert side.shape == (1, 3, 320, 580)
+
+
+def test_fr3_deployment_mapping_reads_raw_camera_ids_without_cyclic_overwrite() -> None:
+    config = ACMTACTV2Config(
+        device="cpu",
+        pretrained_backbone_weights=None,
+        source_camera_keys=FR3_SOURCE_CAMERA_KEYS,
+    )
+    processor = ACMTACTObservationProcessorStep(
+        camera_keys=config.camera_keys,
+        camera_names=config.camera_names,
+        source_camera_keys=config.source_camera_keys,
+        crop_params=config.crop_params,
+    )
+    raw = {OBS_STATE: np.zeros(8, dtype=np.float32)}
+    for camera_index in range(1, 5):
+        raw[rgb_key(f"camera.cam{camera_index}")] = np.full(
+            (480, 640, 3), camera_index * 16, dtype=np.uint8
+        )
+
+    result = processor.observation(raw)
+
+    expected = {
+        "camera.cam2": 48,  # side <- runtime cam3
+        "camera.cam3": 16,  # wrist_left <- runtime cam1
+        "camera.cam4": 32,  # wrist_right <- runtime cam2
+    }
+    mean = torch.tensor(config.image_mean).view(3, 1, 1)
+    std = torch.tensor(config.image_std).view(3, 1, 1)
+    for target_camera, source_value in expected.items():
+        processed = result[rgb_key(target_camera)]
+        restored = processed[0, :, 0, 0] * std[:, 0, 0] + mean[:, 0, 0]
+        torch.testing.assert_close(
+            restored,
+            torch.full((3,), source_value / 255.0),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+        assert processed.shape == (1, 3, 320, 580)
+    assert processor.get_config()["source_camera_keys"] == list(FR3_SOURCE_CAMERA_KEYS)
+
+
+def test_acmt_actv2_accepts_only_identity_or_fixed_fr3_source_mapping() -> None:
+    assert (
+        ACMTACTV2Config(device="cpu", pretrained_backbone_weights=None).source_camera_keys
+        == CAMERA_KEYS
+    )
+    assert (
+        ACMTACTV2Config(
+            device="cpu",
+            pretrained_backbone_weights=None,
+            source_camera_keys=FR3_SOURCE_CAMERA_KEYS,
+        ).source_camera_keys
+        == FR3_SOURCE_CAMERA_KEYS
+    )
+    with pytest.raises(ValueError, match="training identity mapping"):
+        ACMTACTV2Config(
+            device="cpu",
+            pretrained_backbone_weights=None,
+            source_camera_keys=("camera.cam1", "camera.cam2", "camera.cam3"),
+        )
+
+
+def test_fr3_source_mapping_round_trips_through_processor_pipeline(tmp_path) -> None:
+    config = ACMTACTV2Config(
+        device="cpu",
+        pretrained_backbone_weights=None,
+        source_camera_keys=FR3_SOURCE_CAMERA_KEYS,
+    )
+    preprocessor, _ = make_pre_post_processors(config)
+    preprocessor.save_pretrained(tmp_path)
+
+    restored = PolicyProcessorPipeline.from_pretrained(
+        tmp_path,
+        config_filename="policy_preprocessor.json",
+    )
+    step = next(item for item in restored.steps if isinstance(item, ACMTACTObservationProcessorStep))
+    assert step.source_camera_keys == FR3_SOURCE_CAMERA_KEYS
+
+
+def test_acmt_actv2_gripper_adapter_preserves_joints_and_maps_gpo_endpoints() -> None:
+    action = torch.tensor(
+        [
+            [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.0],
+            [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 1.0],
+        ]
+    )
+    processed = ACMTDPGripperGPOProcessorStep().action(action)
+
+    torch.testing.assert_close(processed[:, :7], action[:, :7])
+    torch.testing.assert_close(processed[:, 7], torch.tensor([1.0, 3.0 / 255.0]))
 
 
 def test_memmap_camera_view_excludes_top(tmp_path) -> None:

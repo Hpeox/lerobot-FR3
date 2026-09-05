@@ -176,9 +176,7 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
         if len(self.camera_names) != count or len(set(self.camera_names)) != count:
             raise ValueError("ACMT-ACT camera_names must match camera_keys and be distinct")
         if len(self.source_camera_keys) != count or len(set(self.source_camera_keys)) != count:
-            raise ValueError("ACMT-ACT source_camera_keys must match camera_keys and be distinct")
-        if set(self.source_camera_keys) != set(self.camera_keys):
-            raise ValueError("ACMT-ACT source_camera_keys must be a permutation of camera_keys")
+            raise ValueError("ACMT-ACT source_camera_keys must contain the same number of distinct cameras")
 
     def get_config(self) -> dict[str, Any]:
         return {
