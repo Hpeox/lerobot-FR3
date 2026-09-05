@@ -55,7 +55,17 @@ def _make_acmt_act_memmap_dataset(cfg: TrainPipelineConfig, split: str):
     canonical = Path(root).resolve() / "splits.json"
     if split_file.resolve() != canonical:
         raise ValueError(f"backend='acmt_act_memmap' requires split_file={canonical}")
-    return ACMTACTMemmapDataset(root, split=split, repo_id=str(cfg.dataset.repo_id))
+    # acmt_actv2 removes top from the policy data path as well as from the
+    # model.  The source memmap remains four-way so the v3 comparison can use
+    # it unchanged; selecting indices here avoids materializing top in a
+    # training sample or transferring it to the GPU.
+    camera_indices = (1, 2, 3) if getattr(cfg.policy, "type", None) == "acmt_actv2" else None
+    return ACMTACTMemmapDataset(
+        root,
+        split=split,
+        repo_id=str(cfg.dataset.repo_id),
+        camera_indices=camera_indices,
+    )
 
 
 def resolve_delta_timestamps(

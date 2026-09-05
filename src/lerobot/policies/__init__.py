@@ -32,6 +32,8 @@ from .acmt_dp.processor_acmt_dp_v5 import make_acmt_dp_v5_pre_post_processors as
 from .acmt_act.configuration_acmt_act import ACMTACTConfig as ACMTACTConfig
 from .acmt_act.modeling_acmt_act import ACMTACTPolicy as ACMTACTPolicy
 from .acmt_act.processor_acmt_act import make_acmt_act_pre_post_processors as make_acmt_act_pre_post_processors
+from .acmt_actv2.configuration_acmt_actv2 import ACMTACTV2Config as ACMTACTV2Config
+from .acmt_actv2.modeling_acmt_actv2 import ACMTACTV2Policy as ACMTACTV2Policy
 from .act.configuration_act import ACTConfig as ACTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
 from .eo1.configuration_eo1 import EO1Config as EO1Config
@@ -75,6 +77,8 @@ __all__ = [
     "ACMTACTConfig",
     "ACMTACTPolicy",
     "make_acmt_act_pre_post_processors",
+    "ACMTACTV2Config",
+    "ACMTACTV2Policy",
     "ACTConfig",
     "DiffusionConfig",
     "EO1Config",

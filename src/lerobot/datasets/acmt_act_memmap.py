@@ -442,14 +442,28 @@ class ACMTActMemmapStore:
 class ACMTActMemmapMetadata:
     """Small metadata facade consumed by LeRobot's policy/training factory."""
 
-    def __init__(self, store: ACMTActMemmapStore, selected_indices: list[int], repo_id: str):
+    def __init__(
+        self,
+        store: ACMTActMemmapStore,
+        selected_indices: list[int],
+        repo_id: str,
+        camera_indices: tuple[int, ...] | None = None,
+    ):
         from lerobot.policies.acmt_act.configuration_acmt_act import XENSE0, XENSE1, rgb_key
 
         self.repo_id = repo_id
         self.root = store.root
         self.fps = 30
         self.robot_type = "fr3"
-        self.camera_keys = [rgb_key(f"camera.cam{i}") for i in range(1, 5)]
+        self.camera_indices = tuple(range(4) if camera_indices is None else camera_indices)
+        if not self.camera_indices or any(index < 0 or index >= 4 for index in self.camera_indices):
+            raise ValueError(
+                "camera_indices must select distinct entries from the four-way memmap, "
+                f"got {self.camera_indices}"
+            )
+        if len(set(self.camera_indices)) != len(self.camera_indices):
+            raise ValueError(f"camera_indices must be distinct, got {self.camera_indices}")
+        self.camera_keys = [rgb_key(f"camera.cam{index + 1}") for index in self.camera_indices]
         self.depth_keys: list[str] = []
         self.features = {
             **{key: {"dtype": "image", "shape": [480, 640, 3], "names": ["height", "width", "channel"]} for key in self.camera_keys},
@@ -495,7 +509,15 @@ class ACMTActMemmapMetadata:
 class ACMTACTMemmapDataset(Dataset):
     """Map-style training dataset with fixed episode split and causal chunks."""
 
-    def __init__(self, root: str | os.PathLike[str], *, split: str, repo_id: str = "local/acmt-act", episodes: list[int] | None = None):
+    def __init__(
+        self,
+        root: str | os.PathLike[str],
+        *,
+        split: str,
+        repo_id: str = "local/acmt-act",
+        episodes: list[int] | None = None,
+        camera_indices: tuple[int, ...] | None = None,
+    ):
         self.store = ACMTActMemmapStore(root)
         split_payload = _read_json(self.store.root / "splits.json")
         names = _read_json(self.store.root / "episode_names.json")
@@ -510,7 +532,8 @@ class ACMTACTMemmapDataset(Dataset):
         if not selected_indices:
             raise ValueError(f"ACMT-ACT memmap split {split!r} is empty")
         self._selected_indices = selected_indices
-        self.meta = ACMTActMemmapMetadata(self.store, selected_indices, repo_id)
+        self.camera_indices = tuple(range(4) if camera_indices is None else camera_indices)
+        self.meta = ACMTActMemmapMetadata(self.store, selected_indices, repo_id, self.camera_indices)
         self.episodes = list(range(len(selected_indices)))
         self.num_frames = self.meta.total_frames
         self.num_episodes = self.meta.total_episodes
@@ -552,10 +575,6 @@ class ACMTACTMemmapDataset(Dataset):
             # Memmaps are read-only by design.  Materialize each sample before
             # creating a Tensor so callers cannot trigger undefined writes on a
             # non-writable NumPy view (and worker warnings stay silent).
-            rgb_key("camera.cam1"): torch.from_numpy(np.array(rgb[0], copy=True)),
-            rgb_key("camera.cam2"): torch.from_numpy(np.array(rgb[1], copy=True)),
-            rgb_key("camera.cam3"): torch.from_numpy(np.array(rgb[2], copy=True)),
-            rgb_key("camera.cam4"): torch.from_numpy(np.array(rgb[3], copy=True)),
             "observation.state": torch.from_numpy(np.array(self.store.state[global_index], dtype=np.float32, copy=True)),
             XENSE0: torch.from_numpy(np.array(self.store.tactile[global_index, 0], dtype=np.float32, copy=True)),
             XENSE1: torch.from_numpy(np.array(self.store.tactile[global_index, 1], dtype=np.float32, copy=True)),
@@ -566,6 +585,10 @@ class ACMTACTMemmapDataset(Dataset):
             # policy feature selection.
             "_acmt_act.precropped": torch.tensor(True),
         }
+        for camera_index in self.camera_indices:
+            result[rgb_key(f"camera.cam{camera_index + 1}")] = torch.from_numpy(
+                np.array(rgb[camera_index], copy=True)
+            )
         return result
 
 

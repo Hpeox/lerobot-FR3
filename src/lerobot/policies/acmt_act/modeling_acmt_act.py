@@ -428,7 +428,12 @@ class ACMTACTPolicy(PreTrainedPolicy):
 
     def _model_batch(self, window: Mapping[str, Tensor], *, include_target: bool = False) -> dict[str, Tensor]:
         model_batch: dict[str, Tensor] = {OBS_STATE: window["state"], TACTILE: window["tactile"][:, -1]}
-        model_batch[OBS_IMAGES] = [window["rgb"][:, index] for index in range(4)]
+        # The v3 policy supplies four streams and acmt_actv2 supplies the
+        # side plus two wrist streams.  Keep the batch adapter generic while
+        # preserving the serialized v3 module layout.
+        model_batch[OBS_IMAGES] = [
+            window["rgb"][:, index] for index in range(len(self.config.image_features))
+        ]
         if include_target:
             model_batch[ACTION] = window[ACTION]
             if "action_is_pad" in window:
