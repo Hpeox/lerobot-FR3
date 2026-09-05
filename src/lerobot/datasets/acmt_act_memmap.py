@@ -28,6 +28,9 @@ from tqdm.auto import tqdm
 
 
 MEMMAP_VERSION = "acmt_act_memmap_v1"
+TARGETS_VERSION = "acmt_act_targets_v1"
+GOAL_XYZ = "observation.acmt_act.goal_xyz"
+GOAL_VALID = "observation.acmt_act.goal_valid"
 CAMERA_NAMES = ("top", "side", "wrist_left", "wrist_right")
 CROP_PARAMS = {
     "top": (80, 30, 320, 580),
@@ -54,6 +57,186 @@ ARRAY_SPECS = {
     "sample_valid.npy": {"dtype": "bool", "tail_shape": []},
     "episode_ends.npy": {"dtype": "int64", "tail_shape": []},
 }
+
+
+def _targets_manifest_path(root: Path) -> Path:
+    return root / "acmt_act_targets_manifest.json"
+
+
+def _targets_npz_path(root: Path) -> Path:
+    return root / "acmt_act_targets.npz"
+
+
+def _first_grasp_rise(gpo: np.ndarray) -> int | None:
+    """Return the first physical closing transition, never a later re-grasp."""
+
+    values = np.asarray(gpo, dtype=np.int16).reshape(-1)
+    indices = np.flatnonzero((values[:-1] == 3) & (values[1:] > 3))
+    if indices.size:
+        return int(indices[0])
+    # A few old recordings use a slightly different quantization.  Accept the
+    # monotone equivalent, but keep the first transition only.
+    indices = np.flatnonzero((values[:-1] <= 3) & (values[1:] > 3))
+    return int(indices[0]) if indices.size else None
+
+
+def build_acmt_act_targets(
+    data_dir: str | os.PathLike[str],
+    memmap_dir: str | os.PathLike[str],
+    *,
+    split_file: str | os.PathLike[str] | None = None,
+    force: bool = False,
+) -> Path:
+    """Build the small action/goal sidecar used by the corrected ACMT-ACT.
+
+    RGB and force arrays remain in the existing Memmap.  This command reads
+    the source H5 once to add the fields absent from that training-only
+    format, and writes atomically so an interrupted run cannot be consumed.
+    """
+
+    data_root = Path(data_dir).resolve()
+    root = Path(memmap_dir).resolve()
+    names_payload = _read_json(root / "episode_names.json")
+    if not isinstance(names_payload, list) or not names_payload:
+        raise ValueError(f"missing episode_names.json in {root}")
+    names = [Path(str(name)).name for name in names_payload]
+    if split_file is not None:
+        splits = _normalise_splits(Path(split_file), names)
+    else:
+        raw_splits = _read_json(root / "splits.json")
+        splits = raw_splits.get("splits", raw_splits) if isinstance(raw_splits, dict) else {}
+    source_inventory = _source_inventory(data_root, names)
+    source_hash = _hash_json(source_inventory)
+    manifest_path = _targets_manifest_path(root)
+    final_npz = _targets_npz_path(root)
+    expected = {
+        "targets_version": TARGETS_VERSION,
+        "source_hash": source_hash,
+        "names": names,
+        "splits_hash": _hash_json(splits),
+    }
+    if not force and manifest_path.is_file() and final_npz.is_file():
+        previous = _read_json(manifest_path)
+        if isinstance(previous, dict) and all(previous.get(key) == value for key, value in expected.items()):
+            return final_npz
+
+    store = ACMTActMemmapStore(root)
+    if len(store.episode_ends) != len(names):
+        raise ValueError("targets and Memmap episode counts do not match")
+    total = len(store.rgb)
+    goal = np.zeros((total, 3), dtype=np.float32)
+    valid = np.zeros((total,), dtype=np.bool_)
+    phase = np.zeros((total,), dtype=np.int8)
+    grasp_frame = np.full((len(names),), -1, dtype=np.int64)
+    tmp_npz = final_npz.with_suffix(".npz.partial")
+    try:
+        for episode_index, name in enumerate(names):
+            start, end = store.bounds(episode_index)
+            with h5py.File(data_root / name, "r") as handle:
+                if "observations/robot_state/O_T_EE" not in handle:
+                    raise KeyError(f"{name} is missing observations/robot_state/O_T_EE required for goal labels")
+                gpo = np.asarray(handle["observations/gripper/gPO"], dtype=np.uint8)
+                ee = np.asarray(handle["observations/robot_state/O_T_EE"], dtype=np.float32)
+            if len(gpo) != end - start or ee.shape != (end - start, 4, 4):
+                raise ValueError(f"{name}: source and Memmap lengths/shapes do not match")
+            onset = _first_grasp_rise(gpo)
+            if onset is None:
+                continue
+            grasp_frame[episode_index] = onset
+            grasp_goal = ee[onset, :3, 3]
+            goal[start:end] = grasp_goal
+            valid[start:end] = True
+            local = np.arange(end - start)
+            phase[start:end] = np.where(
+                local < onset - 8,
+                0,
+                np.where(local <= onset + 8, 1, 2),
+            ).astype(np.int8)
+        with open(tmp_npz, "wb") as stream:
+            np.savez(stream, goal_xyz=goal, goal_valid=valid, phase=phase, grasp_frame=grasp_frame)
+        os.replace(tmp_npz, final_npz)
+        manifest = dict(expected)
+        manifest.update({"complete": True, "frames": total, "episode_count": len(names)})
+        _atomic_json(manifest_path, manifest)
+    finally:
+        tmp_npz.unlink(missing_ok=True)
+    return final_npz
+
+
+def build_acmt_act_policy_stats(
+    memmap_dir: str | os.PathLike[str],
+    *,
+    split: str = "train",
+    force: bool = False,
+) -> Path:
+    """Compute statistics for residual joint targets and physical gripper labels."""
+
+    root = Path(memmap_dir).resolve()
+    output = root / "acmt_act_policy_stats.json"
+    if output.is_file() and not force:
+        return output
+    store = ACMTActMemmapStore(root)
+    payload = _read_json(root / "splits.json") or {}
+    splits = payload.get("splits", payload)
+    names = _read_json(root / "episode_names.json") or []
+    name_to_index = {str(name): i for i, name in enumerate(names)}
+    selected = [name_to_index[Path(str(name)).name] for name in splits.get(split, [])]
+    if not selected:
+        raise ValueError(f"no episodes in split {split!r}")
+
+    count = 0
+    total = np.zeros(8, np.float64)
+    total_sq = np.zeros(8, np.float64)
+    minimum = np.full(8, np.inf, np.float64)
+    maximum = np.full(8, -np.inf, np.float64)
+    goals: list[np.ndarray] = []
+    for episode_index in selected:
+        start, end = store.bounds(episode_index)
+        q = np.asarray(store.state[start:end, :7], dtype=np.float32)
+        raw_action = np.asarray(store.action[start:end], dtype=np.float32)
+        length = end - start
+        anchors = np.arange(length, dtype=np.int64)
+        for horizon in range(16):
+            target = np.minimum(anchors + horizon, length - 1)
+            mask = anchors + horizon < length
+            values = np.empty((length, 8), dtype=np.float32)
+            values[:, :7] = raw_action[target, :7] - q
+            values[:, 7] = 1.0 - raw_action[target, 7]
+            values = values[mask]
+            if values.size:
+                count += int(values.shape[0])
+                total += values.sum(0, dtype=np.float64)
+                total_sq += np.square(values, dtype=np.float64).sum(0)
+                minimum = np.minimum(minimum, values.min(0))
+                maximum = np.maximum(maximum, values.max(0))
+        if store.targets is not None and bool(store.targets["goal_valid"][start]):
+            goals.append(np.asarray(store.targets["goal_xyz"][start], dtype=np.float32))
+    if count == 0:
+        raise ValueError("no valid action targets available for policy statistics")
+    mean = total / count
+    std = np.sqrt(np.maximum(total_sq / count - np.square(mean), 1e-12))
+    stats: dict[str, Any] = {
+        "action": {
+            "count": count,
+            "mean": mean.tolist(),
+            "std": std.tolist(),
+            "min": minimum.tolist(),
+            "max": maximum.tolist(),
+        }
+    }
+    if goals:
+        goal_values = np.stack(goals)
+        stats["goal"] = {
+            "count": int(len(goals)),
+            "mean": goal_values.mean(0).tolist(),
+            "std": np.maximum(goal_values.std(0), 1e-4).tolist(),
+            "min": goal_values.min(0).tolist(),
+            "max": goal_values.max(0).tolist(),
+        }
+    temporary = output.with_suffix(output.suffix + f".tmp.{os.getpid()}")
+    temporary.write_text(json.dumps(stats, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, output)
+    return output
 
 
 def _atomic_json(path: Path, payload: Any) -> None:
@@ -417,6 +600,27 @@ class ACMTActMemmapStore:
         self.action = self._load("action.npy", np.float32)
         self.sample_valid = self._load("sample_valid.npy", np.bool_)
         self.episode_ends = self._load("episode_ends.npy", np.int64)
+        targets_path = _targets_npz_path(self.root)
+        targets_manifest = _read_json(_targets_manifest_path(self.root))
+        if targets_path.is_file() and isinstance(targets_manifest, dict) and targets_manifest.get("complete"):
+            # Do not retain NumPy's NpzFile object here.  It owns one shared
+            # ZipFile handle; with DataLoader workers forked from the parent,
+            # concurrent indexed reads can corrupt the shared cursor and
+            # raise ``BadZipFile: Overlapped entries``.  The sidecar is tiny
+            # compared with the RGB Memmap, so materialize it once and let
+            # workers inherit ordinary read-only arrays.
+            with np.load(targets_path, allow_pickle=False) as loaded:
+                required = {"goal_xyz", "goal_valid", "phase", "grasp_frame"}
+                if set(loaded.files) != required:
+                    raise ValueError(f"invalid ACMT-ACT targets sidecar keys in {targets_path}")
+                copied = {name: np.array(loaded[name], copy=True) for name in required}
+            if copied["goal_xyz"].shape != (len(self.rgb), 3) or copied["goal_valid"].shape != (len(self.rgb),):
+                raise ValueError(f"invalid ACMT-ACT goal sidecar shape in {targets_path}")
+            if copied["phase"].shape != (len(self.rgb),) or copied["grasp_frame"].ndim != 1:
+                raise ValueError(f"invalid ACMT-ACT phase sidecar shape in {targets_path}")
+            self.targets = copied
+        else:
+            self.targets = None
         expected = manifest["arrays"]
         for name, value in (("rgb.npy", self.rgb), ("state.npy", self.state), ("tactile.npy", self.tactile), ("action.npy", self.action)):
             if tuple(value.shape[1:]) != tuple(expected[name]["tail_shape"]):
@@ -442,14 +646,25 @@ class ACMTActMemmapStore:
 class ACMTActMemmapMetadata:
     """Small metadata facade consumed by LeRobot's policy/training factory."""
 
-    def __init__(self, store: ACMTActMemmapStore, selected_indices: list[int], repo_id: str):
+    def __init__(
+        self,
+        store: ACMTActMemmapStore,
+        selected_indices: list[int],
+        repo_id: str,
+        camera_indices: tuple[int, ...] | None = None,
+    ):
         from lerobot.policies.acmt_act.configuration_acmt_act import XENSE0, XENSE1, rgb_key
 
         self.repo_id = repo_id
         self.root = store.root
         self.fps = 30
         self.robot_type = "fr3"
-        self.camera_keys = [rgb_key(f"camera.cam{i}") for i in range(1, 5)]
+        self.camera_indices = tuple(range(4) if camera_indices is None else camera_indices)
+        if not self.camera_indices or any(index < 0 or index >= 4 for index in self.camera_indices):
+            raise ValueError(f"camera_indices must select distinct entries from the four-way memmap, got {self.camera_indices}")
+        if len(set(self.camera_indices)) != len(self.camera_indices):
+            raise ValueError(f"camera_indices must be distinct, got {self.camera_indices}")
+        self.camera_keys = [rgb_key(f"camera.cam{index + 1}") for index in self.camera_indices]
         self.depth_keys: list[str] = []
         self.features = {
             **{key: {"dtype": "image", "shape": [480, 640, 3], "names": ["height", "width", "channel"]} for key in self.camera_keys},
@@ -459,6 +674,12 @@ class ACMTActMemmapMetadata:
             "action": {"dtype": "float32", "shape": [8], "names": [*(f"joint_{i}" for i in range(7)), "gripper"]},
         }
         raw_stats = _read_json(store.root / "stats.json") or {}
+        corrected_stats = _read_json(store.root / "acmt_act_policy_stats.json") or {}
+        if isinstance(corrected_stats, dict) and isinstance(corrected_stats.get("action"), dict):
+            raw_stats = dict(raw_stats)
+            raw_stats["action"] = corrected_stats["action"]
+            if isinstance(corrected_stats.get("goal"), dict):
+                raw_stats[GOAL_XYZ] = corrected_stats["goal"]
         self.stats = {
             key: {name: torch.as_tensor(value, dtype=torch.float32) if name != "count" else value for name, value in values.items()}
             for key, values in raw_stats.items()
@@ -495,7 +716,15 @@ class ACMTActMemmapMetadata:
 class ACMTACTMemmapDataset(Dataset):
     """Map-style training dataset with fixed episode split and causal chunks."""
 
-    def __init__(self, root: str | os.PathLike[str], *, split: str, repo_id: str = "local/acmt-act", episodes: list[int] | None = None):
+    def __init__(
+        self,
+        root: str | os.PathLike[str],
+        *,
+        split: str,
+        repo_id: str = "local/acmt-act",
+        episodes: list[int] | None = None,
+        camera_indices: tuple[int, ...] | None = None,
+    ):
         self.store = ACMTActMemmapStore(root)
         split_payload = _read_json(self.store.root / "splits.json")
         names = _read_json(self.store.root / "episode_names.json")
@@ -510,7 +739,8 @@ class ACMTACTMemmapDataset(Dataset):
         if not selected_indices:
             raise ValueError(f"ACMT-ACT memmap split {split!r} is empty")
         self._selected_indices = selected_indices
-        self.meta = ACMTActMemmapMetadata(self.store, selected_indices, repo_id)
+        self.camera_indices = tuple(range(4) if camera_indices is None else camera_indices)
+        self.meta = ACMTActMemmapMetadata(self.store, selected_indices, repo_id, self.camera_indices)
         self.episodes = list(range(len(selected_indices)))
         self.num_frames = self.meta.total_frames
         self.num_episodes = self.meta.total_episodes
@@ -552,10 +782,6 @@ class ACMTACTMemmapDataset(Dataset):
             # Memmaps are read-only by design.  Materialize each sample before
             # creating a Tensor so callers cannot trigger undefined writes on a
             # non-writable NumPy view (and worker warnings stay silent).
-            rgb_key("camera.cam1"): torch.from_numpy(np.array(rgb[0], copy=True)),
-            rgb_key("camera.cam2"): torch.from_numpy(np.array(rgb[1], copy=True)),
-            rgb_key("camera.cam3"): torch.from_numpy(np.array(rgb[2], copy=True)),
-            rgb_key("camera.cam4"): torch.from_numpy(np.array(rgb[3], copy=True)),
             "observation.state": torch.from_numpy(np.array(self.store.state[global_index], dtype=np.float32, copy=True)),
             XENSE0: torch.from_numpy(np.array(self.store.tactile[global_index, 0], dtype=np.float32, copy=True)),
             XENSE1: torch.from_numpy(np.array(self.store.tactile[global_index, 1], dtype=np.float32, copy=True)),
@@ -566,6 +792,19 @@ class ACMTACTMemmapDataset(Dataset):
             # policy feature selection.
             "_acmt_act.precropped": torch.tensor(True),
         }
+        # The source H5 stores the Gello wire command as 1=open/0=closed;
+        # expose the physical policy convention 0=open/1=closed.
+        result["action"][:, 7] = 1.0 - result["action"][:, 7]
+        if self.store.targets is not None:
+            result[GOAL_XYZ] = torch.from_numpy(
+                np.array(self.store.targets["goal_xyz"][global_index], dtype=np.float32, copy=True)
+            )
+            result[GOAL_VALID] = torch.tensor(bool(self.store.targets["goal_valid"][global_index]))
+            result["_acmt_act.phase"] = torch.tensor(int(self.store.targets["phase"][global_index]), dtype=torch.int64)
+        for camera_index in self.camera_indices:
+            result[rgb_key(f"camera.cam{camera_index + 1}")] = torch.from_numpy(
+                np.array(rgb[camera_index], copy=True)
+            )
         return result
 
 
@@ -574,6 +813,8 @@ __all__ = [
     "ACMTActMemmapMetadata",
     "ACMTActMemmapStore",
     "ARRAY_SPECS",
+    "build_acmt_act_policy_stats",
+    "build_acmt_act_targets",
     "CAMERA_NAMES",
     "CROP_PARAMS",
     "MEMMAP_VERSION",

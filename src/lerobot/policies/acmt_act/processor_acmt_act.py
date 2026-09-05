@@ -24,6 +24,7 @@ from lerobot.processor import (
     policy_action_to_transition,
     transition_to_policy_action,
 )
+from lerobot.processor.relative_action_processor import AbsoluteActionsProcessorStep, RelativeActionsProcessorStep
 from lerobot.processor.pipeline import ObservationProcessorStep, ProcessorStepRegistry
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
@@ -222,13 +223,20 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
         if self.tactile_source == "substitution":
             required = (DQ, TAU_J, FT300, O_T_EE, GRIPPER_GPO)
             missing = [key for key in required if key not in result]
-            missing.extend(depth_key(camera) for camera in self.camera_keys[2:] if depth_key(camera) not in result)
+            wrist_camera_keys = tuple(
+                camera
+                for camera, camera_name in zip(self.camera_keys, self.camera_names, strict=True)
+                if camera_name in {"wrist_left", "wrist_right"}
+            )
+            if len(wrist_camera_keys) != 2:
+                raise ValueError("ACMT-ACT substitution requires wrist_left and wrist_right cameras")
+            missing.extend(depth_key(camera) for camera in wrist_camera_keys if depth_key(camera) not in result)
             if missing:
                 raise KeyError(f"substitution ACMT-ACT observation is missing {sorted(set(missing))}")
             left, right = (rgb_values["wrist_left"], rgb_values["wrist_right"])
             result[GEN_RGB] = torch.stack([left, right], dim=1)
             result[GEN_DEPTH] = torch.stack(
-                [_depth_bchw(result[depth_key(camera)], depth_key(camera)) for camera in self.camera_keys[2:]],
+                [_depth_bchw(result[depth_key(camera)], depth_key(camera)) for camera in wrist_camera_keys],
                 dim=1,
             )
             q = state[:, :7]
@@ -261,6 +269,11 @@ def make_acmt_act_pre_post_processors(
         raise ValueError("ACMT-ACT config features must be initialized before building processors")
     normalize_keys = set(config.image_features) | {"observation.state"}
     features = {**config.input_features, **config.output_features}
+    relative_step = RelativeActionsProcessorStep(
+        enabled=True,
+        exclude_joints=["gripper"],
+        action_names=list(config.action_feature_names),
+    )
     preprocessor = PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
         steps=[
             RenameObservationsProcessorStep(rename_map={}),
@@ -273,6 +286,7 @@ def make_acmt_act_pre_post_processors(
                 image_mean=config.image_mean,
                 image_std=config.image_std,
             ),
+            relative_step,
             DeviceProcessorStep(device=config.device),
             NormalizerProcessorStep(
                 features=features,
@@ -291,6 +305,7 @@ def make_acmt_act_pre_post_processors(
                 norm_map=config.normalization_mapping,
                 stats=dataset_stats,
             ),
+            AbsoluteActionsProcessorStep(enabled=True, relative_step=relative_step),
             DeviceProcessorStep(device="cpu"),
         ],
         name=POLICY_POSTPROCESSOR_DEFAULT_NAME,

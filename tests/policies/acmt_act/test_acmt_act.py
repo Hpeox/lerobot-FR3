@@ -198,7 +198,9 @@ def test_substitution_uses_only_actual_action_and_keeps_generator_external() -> 
     window = policy.observe(batch)
     policy.notify_action_executed(torch.arange(8, dtype=torch.float32).reshape(1, 8), window)
     assert len(fake.calls) == 1
-    torch.testing.assert_close(fake.calls[0][2], torch.arange(8, dtype=torch.float32).reshape(1, 8))
+    expected_generator_action = torch.arange(8, dtype=torch.float32).reshape(1, 8)
+    expected_generator_action[:, 7] = 1.0 - expected_generator_action[:, 7]
+    torch.testing.assert_close(fake.calls[0][2], expected_generator_action)
     assert policy._generator_runtime is fake
     assert not any(key.startswith("_generator_runtime") for key in policy.state_dict())
     assert policy._latest_window["tactile"].shape == (1, 4, 2, 3, 35, 20)

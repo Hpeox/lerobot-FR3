@@ -350,6 +350,12 @@ class ACMTDPInferenceEngine(InferenceEngine):
             action = self._policy._plan(window)  # type: ignore[attr-defined]
         if tuple(action.shape) != (1, PREDICTION_HORIZON, ACTION_DIM):
             raise RuntimeError(f"ACMT-DP policy must return [1,16,8], got {tuple(action.shape)}")
+        # Unnormalize and, for ACMT-ACT, restore absolute joint targets while
+        # the relative-action processor still holds this plan's anchor state.
+        # Doing this at plan creation is essential: applying the postprocessor
+        # when each queued action is popped would use a later q and shift the
+        # whole chunk toward a moving state.
+        action = self._postprocessor(action)
         return ActionPlan(plan_id, action[0].cpu(), start_time=start_time)
 
     def _maybe_install_future(self) -> None:
@@ -459,10 +465,8 @@ class ACMTDPInferenceEngine(InferenceEngine):
                     # After the eighth action is popped, this is exactly the
                     # timestamp of the old plan's first reserve action.
                     self._boundary_start_time = self._queue.next_target_time()
-            action_batch = action.to(self._device).unsqueeze(0)
-            processed = self._postprocessor(action_batch)
-            action_tensor = processed.squeeze(0).cpu()
-            action_dict = make_robot_action(action_tensor, self._dataset_features)
+            # Plans are already unnormalized and absolute from _plan_now.
+            action_dict = make_robot_action(action, self._dataset_features)
             return torch.tensor([action_dict[key] for key in self._ordered_action_keys])
 
     def notify_action_executed(self, action: torch.Tensor, observation: dict | None = None) -> None:

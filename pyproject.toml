@@ -365,6 +365,7 @@ lerobot-convert-acmt-dp-checkpoint="lerobot.scripts.convert_acmt_dp_checkpoint:m
 lerobot-convert-acmt-dp-v5-checkpoint="lerobot.scripts.convert_acmt_dp_v5_checkpoint:main"
 lerobot-acmt-act-convert-memmap="lerobot.scripts.acmt_act_convert_memmap:main"
 lerobot-acmt-act-preflight="lerobot.scripts.acmt_act_preflight:main"
+lerobot-acmt-act-build-targets="lerobot.scripts.acmt_act_build_targets:main"
 
 # ---------------- Tool Configurations ----------------
 

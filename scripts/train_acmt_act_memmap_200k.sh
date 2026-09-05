@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ACMT-ACT v3: four independent ResNet50 backbones, physical/effective
-# batch-size 16, no gradient accumulation, 200k optimizer updates per run.
+# ACMT-ACT: four independent ResNet50 backbones with residual joint targets,
+# physical gripper semantics and visual-goal supervision. Physical/effective
+# batch-size is 16, with no gradient accumulation and 200k optimizer updates.
 # The four runs are intentionally serialized so one 5090 is never shared by
 # competing jobs.  A completed run is skipped; an interrupted run resumes
 # from its last LeRobot checkpoint after validating the schema/task/mode.
@@ -42,6 +43,8 @@ run_one() {
   fi
   [[ -f "${root}/manifest.json" ]] || { echo "missing memmap: ${root}" >&2; return 1; }
   [[ -f "${root}/splits.json" ]] || { echo "missing split file: ${root}/splits.json" >&2; return 1; }
+  [[ -f "${root}/acmt_act_targets.npz" ]] || { echo "missing ACMT-ACT target sidecar: ${root}/acmt_act_targets.npz" >&2; return 1; }
+  [[ -f "${root}/acmt_act_policy_stats.json" ]] || { echo "missing ACMT-ACT residual stats: ${root}/acmt_act_policy_stats.json" >&2; return 1; }
 
   local preflight_dir="${LOG_ROOT}/preflight/${task}_${source}"
   mkdir -p "${preflight_dir}"
@@ -83,6 +86,7 @@ run_one() {
     --policy.task_variant="${task}" \
     --policy.checkpoint_schema=acmt_act.v3 \
     --policy.checkpoint_schema_version=3 \
+    --policy.training_contract=residual_joint_physical_gripper_visual_goal_v1 \
     --policy.camera_backbone_mode=independent \
     --policy.vision_backbone=resnet50 \
     --policy.pretrained_backbone_weights=ResNet50_Weights.IMAGENET1K_V2 \
@@ -136,4 +140,4 @@ run_one peg none "${OUTPUT_PEG}/none/independent_resnet50/seed42"
 run_one gear none "${OUTPUT_GEAR}/none/independent_resnet50/seed42"
 run_one peg real "${OUTPUT_PEG}/real/independent_resnet50/seed42"
 run_one gear real "${OUTPUT_GEAR}/real/independent_resnet50/seed42"
-echo "[DONE] all ACMT-ACT v3 runs" | tee -a "${LOG_ROOT}/all_train.log"
+echo "[DONE] all ACMT-ACT runs" | tee -a "${LOG_ROOT}/all_train.log"

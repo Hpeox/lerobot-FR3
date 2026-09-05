@@ -31,6 +31,8 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 from .configuration_acmt_act import (
+    GOAL_VALID,
+    GOAL_XYZ,
     XENSE0,
     XENSE1,
     ACMTACTConfig,
@@ -174,10 +176,44 @@ class ACMTACT(ACT):
         self.tactile_encoder = ACMTACTileEncoder(config.force_mean, config.force_std)
         self.encoder_tactile_input_proj = nn.Linear(config.tactile_feature_dim, config.dim_model)
 
+        # The target branch is visual-only.  It forces the shared Transformer
+        # condition to carry a scene-relative grasp location instead of
+        # allowing q alone to select a memorised waypoint.
+        self.goal_query = nn.Parameter(torch.randn(config.dim_model) * 0.02)
+        self.goal_head = nn.Sequential(
+            nn.LayerNorm(config.dim_model),
+            nn.Linear(config.dim_model, config.dim_model),
+            nn.GELU(),
+            nn.Linear(config.dim_model, 3),
+        )
+        self.goal_token_proj = nn.Linear(3, config.dim_model)
+        self.action_head = nn.Linear(config.dim_model, 7)
+        self.gripper_head = nn.Linear(config.dim_model, 1)
+        self.register_buffer(
+            "goal_mean",
+            torch.as_tensor(config.goal_mean, dtype=torch.float32).view(1, 1, 3),
+            persistent=True,
+        )
+        self.register_buffer(
+            "goal_std",
+            torch.as_tensor(config.goal_std, dtype=torch.float32).clamp_min(1e-6).view(1, 1, 3),
+            persistent=True,
+        )
+        self.register_buffer(
+            "action_mean",
+            torch.as_tensor(config.action_mean, dtype=torch.float32).view(1, 1, 8),
+            persistent=True,
+        )
+        self.register_buffer(
+            "action_std",
+            torch.as_tensor(config.action_std, dtype=torch.float32).clamp_min(1e-6).view(1, 1, 8),
+            persistent=True,
+        )
+
         # ACT has latent (+ state) 1-D positions.  Extend this same position
         # table with the tactile token, preserving the learned ACT positions.
         old_position = self.encoder_1d_feature_pos_embed
-        self.encoder_1d_feature_pos_embed = nn.Embedding(3, config.dim_model)
+        self.encoder_1d_feature_pos_embed = nn.Embedding(4, config.dim_model)
         with torch.no_grad():
             self.encoder_1d_feature_pos_embed.weight[: old_position.num_embeddings].copy_(
                 old_position.weight
@@ -224,14 +260,24 @@ class ACMTACT(ACT):
                 device=batch[OBS_STATE].device,
             )
 
+        state = batch[OBS_STATE]
+        if self.training and self.config.state_noise_std > 0:
+            state = state + torch.randn_like(state) * self.config.state_noise_std
+        if self.training and self.config.state_token_dropout > 0:
+            drop = torch.rand((batch_size, 1), device=state.device) < self.config.state_token_dropout
+            state = state.masked_fill(drop, 0.0)
+
         tactile = batch[TACTILE]
         tactile_features = self.tactile_encoder(tactile)
         encoder_in_tokens = [
             self.encoder_latent_input_proj(latent_sample),
-            self.encoder_robot_state_input_proj(batch[OBS_STATE]),
+            self.encoder_robot_state_input_proj(state),
             self.encoder_tactile_input_proj(tactile_features),
         ]
-        encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
+        # Latent/state/tactile are present before the visual goal token is
+        # computed; append the goal position immediately below.
+        encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight[:3].unsqueeze(1))
+        visual_tokens: list[Tensor] = []
 
         if images:
             if len(images) != len(self.backbone):
@@ -239,13 +285,39 @@ class ACMTACT(ACT):
             for image, backbone, image_proj in zip(
                 images, self.backbone, self.encoder_img_feat_input_proj, strict=True
             ):
+                # Small photometric perturbations are deliberately applied
+                # after the fixed ImageNet normalization and only while the
+                # module is in training mode.  This improves robustness to
+                # the exposure/white-balance difference between recorded H5
+                # frames and the live camera stream without changing geometry
+                # or the deployment preprocessing path.
+                if self.training:
+                    brightness = torch.empty(
+                        (image.shape[0], 1, 1, 1), device=image.device, dtype=image.dtype
+                    ).uniform_(-0.04, 0.04)
+                    contrast = torch.empty(
+                        (image.shape[0], 1, 1, 1), device=image.device, dtype=image.dtype
+                    ).uniform_(0.94, 1.06)
+                    image = (image * contrast + brightness).clamp(-4.0, 4.0)
                 cam_features = backbone(image)["feature_map"]
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = image_proj(cam_features)
                 cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
                 cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
+                visual_tokens.extend(list(cam_features))
                 encoder_in_tokens.extend(list(cam_features))
                 encoder_in_pos_embed.extend(list(cam_pos_embed))
+
+        if not visual_tokens:
+            raise RuntimeError("ACMT-ACT visual goal branch requires at least one camera")
+        visual = torch.stack(visual_tokens, axis=0).transpose(0, 1)  # [B,N,D]
+        query = self.goal_query.to(dtype=visual.dtype, device=visual.device).view(1, 1, -1)
+        weights = torch.softmax((visual * query).sum(-1) / (visual.shape[-1] ** 0.5), dim=1)
+        visual_goal = (visual * weights.unsqueeze(-1)).sum(1)
+        goal_xyz_hat = self.goal_head(visual_goal).unsqueeze(1)
+        goal_token = self.goal_token_proj(goal_xyz_hat.squeeze(1))
+        encoder_in_tokens.insert(3, goal_token)
+        encoder_in_pos_embed.insert(3, self.encoder_1d_feature_pos_embed.weight[3].unsqueeze(0))
 
         encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
         encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
@@ -261,7 +333,16 @@ class ACMTACT(ACT):
             encoder_pos_embed=encoder_in_pos_embed,
             decoder_pos_embed=self.decoder_pos_embed.weight.unsqueeze(1),
         )
-        actions = self.action_head(decoder_out.transpose(0, 1))
+        decoder_features = decoder_out.transpose(0, 1)
+        joint_actions = self.action_head(decoder_features)
+        gripper_logits = self.gripper_head(decoder_features)
+        gripper_physical = torch.sigmoid(gripper_logits)
+        grip_mean = self.action_mean.to(gripper_physical)[..., 7:8]
+        grip_std = self.action_std.to(gripper_physical)[..., 7:8]
+        gripper_normalized = (gripper_physical - grip_mean) / grip_std
+        actions = torch.cat([joint_actions, gripper_normalized], dim=-1)
+        self.last_goal_xyz_hat = goal_xyz_hat.squeeze(1)
+        self.last_gripper_logits = gripper_logits.squeeze(-1)
         return actions, (mu, log_sigma_x2)
 
 
@@ -343,6 +424,18 @@ class ACMTACTPolicy(PreTrainedPolicy):
                 config.force_std = tuple(
                     torch.stack([value[:3] for value in stds]).mean(0).clamp_min(1e-6).tolist()
                 )
+            action_stats = dataset_stats.get(ACTION)
+            if isinstance(action_stats, Mapping) and "mean" in action_stats and "std" in action_stats:
+                config.action_mean = tuple(float(v) for v in torch.as_tensor(action_stats["mean"]).flatten()[:8])
+                config.action_std = tuple(
+                    float(v) for v in torch.as_tensor(action_stats["std"]).flatten()[:8].clamp_min(1e-6)
+                )
+            goal_stats = dataset_stats.get(GOAL_XYZ)
+            if isinstance(goal_stats, Mapping) and "mean" in goal_stats and "std" in goal_stats:
+                config.goal_mean = tuple(float(v) for v in torch.as_tensor(goal_stats["mean"]).flatten()[:3])
+                config.goal_std = tuple(
+                    float(v) for v in torch.as_tensor(goal_stats["std"]).flatten()[:3].clamp_min(1e-6)
+                )
         self.model = ACMTACT(config)
         # Runtime-only state.  `_ACMTGeneratorRuntime` is not an nn.Module, so
         # no generator weights appear in `named_parameters()` or checkpoints.
@@ -372,6 +465,8 @@ class ACMTACTPolicy(PreTrainedPolicy):
                 raise ValueError("ACMT-ACT loader refuses non-acmt_act checkpoints")
             if raw.get("checkpoint_schema") != "acmt_act.v3" or raw.get("checkpoint_schema_version") != 3:
                 raise ValueError("checkpoint is not ACMT-ACT schema acmt_act.v3")
+            if raw.get("training_contract") != "residual_joint_physical_gripper_visual_goal_v1":
+                raise ValueError("checkpoint uses the legacy absolute-action ACMT-ACT contract")
             source = (config.tactile_source if config is not None else raw.get("tactile_source", "none"))
             checkpoint_source = raw.get("checkpoint_tactile_source", source)
             checkpoint_task = raw.get("checkpoint_task_variant", raw.get("task_variant", "peg"))
@@ -427,12 +522,24 @@ class ACMTACTPolicy(PreTrainedPolicy):
         return torch.zeros(batch_size, 2, 3, 35, 20, device=device, dtype=torch.float32)
 
     def _model_batch(self, window: Mapping[str, Tensor], *, include_target: bool = False) -> dict[str, Tensor]:
-        model_batch: dict[str, Tensor] = {OBS_STATE: window["state"], TACTILE: window["tactile"][:, -1]}
-        model_batch[OBS_IMAGES] = [window["rgb"][:, index] for index in range(4)]
+        model_batch: dict[str, Tensor] = {
+            OBS_STATE: window["state"],
+            TACTILE: window["tactile"][:, -1],
+        }
+        # Keep the network generic over the configured camera count.  v3 still
+        # supplies four streams, while acmt_actv2 supplies side + two wrists;
+        # no parameter or checkpoint layout changes for v3 result from this.
+        model_batch[OBS_IMAGES] = [
+            window["rgb"][:, index] for index in range(len(self.config.image_features))
+        ]
         if include_target:
             model_batch[ACTION] = window[ACTION]
             if "action_is_pad" in window:
                 model_batch["action_is_pad"] = window["action_is_pad"]
+            if GOAL_XYZ in window:
+                model_batch[GOAL_XYZ] = window[GOAL_XYZ]
+            if GOAL_VALID in window:
+                model_batch[GOAL_VALID] = window[GOAL_VALID]
         return model_batch
 
     @torch.no_grad()
@@ -528,17 +635,52 @@ class ACMTACTPolicy(PreTrainedPolicy):
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(model_batch)
         abs_err = F.l1_loss(batch[ACTION], actions_hat, reduction="none")
         valid_mask = ~batch["action_is_pad"].unsqueeze(-1)
-        num_valid = valid_mask.sum() * abs_err.shape[-1]
-        l1_loss = (abs_err * valid_mask).sum() / num_valid.clamp_min(1)
-        loss_dict: dict[str, float] = {"l1_loss": float(l1_loss.detach())}
+        joint_loss = (abs_err[..., :7] * valid_mask[..., :7]).sum() / (
+            valid_mask[..., :7].sum() * 7
+        ).clamp_min(1)
+        grip_mean = self.model.action_mean[..., 7].to(batch[ACTION])
+        grip_std = self.model.action_std[..., 7].to(batch[ACTION])
+        grip_target = (batch[ACTION][..., 7] * grip_std + grip_mean).clamp(0.0, 1.0)
+        transition = torch.zeros_like(grip_target)
+        if grip_target.shape[1] > 1:
+            transition[:, 1:] = (grip_target[:, 1:] - grip_target[:, :-1]).abs()
+        grip_weight = 1.0 + 3.0 * (transition > 0.05).float()
+        grip_bce = F.binary_cross_entropy_with_logits(
+            self.model.last_gripper_logits,
+            grip_target,
+            weight=grip_weight * valid_mask[..., 0].float(),
+            reduction="sum",
+        ) / (valid_mask[..., 0].float().sum().clamp_min(1))
+        l1_loss = joint_loss + self.config.gripper_loss_weight * grip_bce
+        goal_loss = torch.zeros((), device=actions_hat.device, dtype=actions_hat.dtype)
+        goal_valid = batch.get(GOAL_VALID)
+        goal_target = batch.get(GOAL_XYZ)
+        if goal_target is not None and goal_valid is not None:
+            if goal_valid.ndim == 0:
+                goal_valid = goal_valid.unsqueeze(0)
+            goal_valid = goal_valid.bool().reshape(-1)
+            normalized_goal = (goal_target.float() - self.model.goal_mean.squeeze(1)) / self.model.goal_std.squeeze(1)
+            goal_error = F.smooth_l1_loss(
+                self.model.last_goal_xyz_hat,
+                normalized_goal,
+                reduction="none",
+            ).mean(-1)
+            if goal_valid.any():
+                goal_loss = goal_error[goal_valid].mean()
+        loss_dict: dict[str, float] = {
+            "l1_loss": float(joint_loss.detach()),
+            "joint_loss": float(joint_loss.detach()),
+            "gripper_bce": float(grip_bce.detach()),
+            "goal_loss": float(goal_loss.detach()),
+        }
         if self.config.use_vae and log_sigma_x2_hat is not None:
             mean_kld = (
                 (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - log_sigma_x2_hat.exp())).sum(-1).mean()
             )
             loss_dict["kld_loss"] = float(mean_kld.detach())
-            loss = l1_loss + mean_kld * self.config.kl_weight
+            loss = l1_loss + self.config.goal_loss_weight * goal_loss + mean_kld * self.config.kl_weight
         else:
-            loss = l1_loss
+            loss = l1_loss + self.config.goal_loss_weight * goal_loss
         return loss, loss_dict
 
     @torch.no_grad()
@@ -572,7 +714,12 @@ class ACMTACTPolicy(PreTrainedPolicy):
             action = action[:, 0]
         if action.ndim != 2 or tuple(action.shape[1:]) != (8,):
             raise ValueError(f"executed ACMT-ACT action must be [B,8], got {tuple(action.shape)}")
-        generated = self._generator_runtime.predict_next(generator_observation, pose, action)
+        # ACMTv4 checkpoints retain the historical Gello wire convention
+        # (1=open, 0=closed), whereas ACMT-ACT and the FR3 protocol expose
+        # physical gripper openness (0=open, 1=closed).
+        generator_action = action.clone()
+        generator_action[:, 7] = 1.0 - generator_action[:, 7]
+        generated = self._generator_runtime.predict_next(generator_observation, pose, generator_action)
         self._generated_tactile = generated.permute(0, 1, 4, 2, 3).contiguous().float()
         self._tactile_history.append(self._generated_tactile)
         if self._latest_window is not None:
