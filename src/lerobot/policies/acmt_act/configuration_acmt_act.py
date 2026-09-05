@@ -17,6 +17,8 @@ TAU_J = "observation.fr3.tau_J"
 FT300 = "observation.ft300s.wrench"
 O_T_EE = "observation.fr3.O_T_EE"
 GRIPPER_GPO = "observation.gripper.gPO"
+GOAL_XYZ = "observation.acmt_act.goal_xyz"
+GOAL_VALID = "observation.acmt_act.goal_valid"
 
 
 def rgb_key(camera: str) -> str:
@@ -84,6 +86,10 @@ class ACMTACTConfig(ACTConfig):
     # silently load an older ResNet18/shared-backbone checkpoint.
     checkpoint_schema: str = "acmt_act.v3"
     checkpoint_schema_version: int = 3
+    # The policy name/schema remains ``acmt_act.v3`` for deployment discovery,
+    # while this contract hash prevents an old absolute-action checkpoint from
+    # being resumed as the residual/physical-gripper policy.
+    training_contract: str = "residual_joint_physical_gripper_visual_goal_v1"
     camera_backbone_mode: str = "independent"
     vision_backbone: str = "resnet50"
     pretrained_backbone_weights: str | None = "ResNet50_Weights.IMAGENET1K_V2"
@@ -122,6 +128,14 @@ class ACMTACTConfig(ACTConfig):
     force_std: tuple[float, float, float] = (1.0, 1.0, 1.0)
     image_mean: tuple[float, float, float] = (0.485, 0.456, 0.406)
     image_std: tuple[float, float, float] = (0.229, 0.224, 0.225)
+    goal_mean: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    goal_std: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    action_mean: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5)
+    action_std: tuple[float, ...] = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5)
+    state_noise_std: float = 0.005
+    state_token_dropout: float = 0.10
+    goal_loss_weight: float = 0.5
+    gripper_loss_weight: float = 0.25
 
     action_feature_names: list[str] = field(
         default_factory=lambda: [*(f"fr3_joint{i}.pos" for i in range(1, 8)), "gripper.pos"]
@@ -162,6 +176,10 @@ class ACMTACTConfig(ACTConfig):
         self.force_std = tuple(float(v) for v in self.force_std)
         self.image_mean = tuple(float(v) for v in self.image_mean)
         self.image_std = tuple(float(v) for v in self.image_std)
+        self.goal_mean = tuple(float(v) for v in self.goal_mean)
+        self.goal_std = tuple(float(v) for v in self.goal_std)
+        self.action_mean = tuple(float(v) for v in self.action_mean)
+        self.action_std = tuple(float(v) for v in self.action_std)
         self.input_features = _coerce_features(self.input_features)
         self.output_features = _coerce_features(self.output_features)
 
@@ -197,6 +215,8 @@ class ACMTACTConfig(ACTConfig):
 
         if self.checkpoint_schema != "acmt_act.v3" or self.checkpoint_schema_version != 3:
             raise ValueError("ACMT-ACT checkpoint schema must be acmt_act.v3")
+        if self.training_contract != "residual_joint_physical_gripper_visual_goal_v1":
+            raise ValueError("ACMT-ACT training_contract is incompatible with this implementation")
         if self.camera_backbone_mode != "independent":
             raise ValueError("ACMT-ACT v3 requires four independent camera backbones")
         if self.vision_backbone != "resnet50":
@@ -249,10 +269,19 @@ class ACMTACTConfig(ACTConfig):
             raise ValueError("image_mean and image_std must contain three values")
         if any(v <= 0 for v in self.image_std):
             raise ValueError("image_std values must be positive")
+        if len(self.goal_mean) != 3 or len(self.goal_std) != 3 or any(v <= 0 for v in self.goal_std):
+            raise ValueError("goal_mean and goal_std must contain three finite values with positive std")
+        if len(self.action_mean) != 8 or len(self.action_std) != 8 or any(v <= 0 for v in self.action_std):
+            raise ValueError("action_mean and action_std must contain eight values with positive std")
+        if self.state_noise_std < 0 or not 0 <= self.state_token_dropout < 1:
+            raise ValueError("invalid state regularization probabilities")
+        if self.goal_loss_weight < 0 or self.gripper_loss_weight < 0:
+            raise ValueError("auxiliary loss weights must be non-negative")
 
     def _default_input_features(self) -> dict[str, PolicyFeature]:
         features: dict[str, PolicyFeature] = {
             OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(8,)),
+            GOAL_XYZ: PolicyFeature(type=FeatureType.STATE, shape=(3,)),
             XENSE0: PolicyFeature(type=FeatureType.STATE, shape=(3, 35, 20)),
             XENSE1: PolicyFeature(type=FeatureType.STATE, shape=(3, 35, 20)),
         }
@@ -290,6 +319,8 @@ __all__ = [
     "DQ",
     "FT300",
     "GRIPPER_GPO",
+    "GOAL_VALID",
+    "GOAL_XYZ",
     "O_T_EE",
     "TAU_J",
     "XENSE0",

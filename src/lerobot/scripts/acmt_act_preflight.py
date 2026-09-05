@@ -28,6 +28,16 @@ def main() -> None:
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("preflight requested CUDA but no CUDA device is available")
+    if args.policy_type == "acmt_act":
+        required_sidecars = (
+            Path(args.memmap_dir) / "acmt_act_targets.npz",
+            Path(args.memmap_dir) / "acmt_act_policy_stats.json",
+        )
+        missing_sidecars = [str(path) for path in required_sidecars if not path.is_file()]
+        if missing_sidecars:
+            raise FileNotFoundError(
+                "corrected ACMT-ACT requires goal/residual sidecars; missing: " + ", ".join(missing_sidecars)
+            )
 
     camera_indices = (1, 2, 3) if args.policy_type == "acmt_actv2" else None
     dataset = ACMTACTMemmapDataset(

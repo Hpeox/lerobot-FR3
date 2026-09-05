@@ -24,6 +24,7 @@ from lerobot.processor import (
     policy_action_to_transition,
     transition_to_policy_action,
 )
+from lerobot.processor.relative_action_processor import AbsoluteActionsProcessorStep, RelativeActionsProcessorStep
 from lerobot.processor.pipeline import ObservationProcessorStep, ProcessorStepRegistry
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
@@ -299,6 +300,11 @@ def make_acmt_act_pre_post_processors(
         raise ValueError("ACMT-ACT config features must be initialized before building processors")
     normalize_keys = set(config.image_features) | {"observation.state"}
     features = {**config.input_features, **config.output_features}
+    relative_step = RelativeActionsProcessorStep(
+        enabled=True,
+        exclude_joints=["gripper"],
+        action_names=list(config.action_feature_names),
+    )
     preprocessor = PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
         steps=[
             RenameObservationsProcessorStep(rename_map={}),
@@ -312,6 +318,7 @@ def make_acmt_act_pre_post_processors(
                 image_mean=config.image_mean,
                 image_std=config.image_std,
             ),
+            relative_step,
             DeviceProcessorStep(device=config.device),
             NormalizerProcessorStep(
                 features=features,
@@ -330,6 +337,7 @@ def make_acmt_act_pre_post_processors(
                 norm_map=config.normalization_mapping,
                 stats=dataset_stats,
             ),
+            AbsoluteActionsProcessorStep(enabled=True, relative_step=relative_step),
             DeviceProcessorStep(device="cpu"),
             ACMTDPGripperGPOProcessorStep(),
         ],

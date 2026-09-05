@@ -17,6 +17,7 @@ import torch
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import make_robot_action, prepare_observation_for_inference
 from lerobot.processor import PolicyProcessorPipeline
+from lerobot.processor.relative_action_processor import AbsoluteActionsProcessorStep
 
 from .base import InferenceEngine
 
@@ -263,6 +264,21 @@ class ACMTDPInferenceEngine(InferenceEngine):
         self._failure: BaseException | None = None
         self._stopped = False
         self._first_action_diagnostic_emitted = False
+        self._current_action_anchor_state: torch.Tensor | None = None
+        self._absolute_action_step = next(
+            (
+                step
+                for step in getattr(self._postprocessor, "steps", ())
+                if isinstance(step, AbsoluteActionsProcessorStep) and step.enabled
+            ),
+            None,
+        )
+        self._relative_action_step = (
+            None if self._absolute_action_step is None else self._absolute_action_step.relative_step
+        )
+        self._plan_postprocess = self._absolute_action_step is not None
+        if self._plan_postprocess and self._relative_action_step is None:
+            raise ValueError("ACMT-ACT plan postprocessing requires a paired relative action step")
 
         config = getattr(policy, "config", None)
         if config is None or getattr(config, "control_hz", 30.0) != CONTROL_HZ:
@@ -323,6 +339,7 @@ class ACMTDPInferenceEngine(InferenceEngine):
                 self._tactile_future.cancel()
             self._tactile_future = None
             self._current_action_window = None
+            self._current_action_anchor_state = None
             self._last_hold_log = 0.0
             self._plan_started_at = None
             self._failure = None
@@ -396,7 +413,35 @@ class ACMTDPInferenceEngine(InferenceEngine):
         )
         return self._preprocessor(observation)
 
-    def _plan_now(self, window: dict, plan_id: int, generation: int | None = None) -> ActionPlan:
+    def _capture_action_anchor(self) -> torch.Tensor | None:
+        if self._relative_action_step is None:
+            return None
+        state = self._relative_action_step.get_cached_state()
+        return None if state is None else state.detach().clone()
+
+    def _postprocess_plan(self, action: torch.Tensor, anchor_state: torch.Tensor | None) -> torch.Tensor:
+        if not self._plan_postprocess:
+            return action
+        if self._relative_action_step is None or anchor_state is None:
+            raise RuntimeError("ACMT-ACT plan is missing its relative-action anchor state")
+        # The deserialized AbsoluteActionsProcessorStep points at the mutable
+        # preprocessor RelativeActionsProcessorStep.  Serialize access to its
+        # cached state so later observations cannot re-anchor this plan.
+        with self._policy_state_lock:
+            previous_state = self._relative_action_step._last_state
+            self._relative_action_step._last_state = anchor_state
+            try:
+                return self._postprocessor(action)
+            finally:
+                self._relative_action_step._last_state = previous_state
+
+    def _plan_now(
+        self,
+        window: dict,
+        plan_id: int,
+        generation: int | None = None,
+        anchor_state: torch.Tensor | None = None,
+    ) -> ActionPlan:
         with self._plan_lock, torch.inference_mode():
             if generation is not None and generation != self._generation:
                 raise RuntimeError("ACMT-DP plan belongs to a reset episode")
@@ -405,6 +450,11 @@ class ACMTDPInferenceEngine(InferenceEngine):
                 raise RuntimeError("ACMT-DP plan belongs to a reset episode")
         if tuple(action.shape) != (1, PREDICTION_HORIZON, ACTION_DIM):
             raise RuntimeError(f"ACMT-DP policy must return [1,16,8], got {tuple(action.shape)}")
+        if self._plan_postprocess:
+            # ACMT-ACT relative actions must be converted to absolute targets
+            # once, using the state captured for this plan.  Legacy ACMT-DP
+            # policies retain their per-action postprocessing below.
+            action = self._postprocess_plan(action, anchor_state)
         return ActionPlan(plan_id, action[0].cpu())
 
     def _maybe_install_future(self) -> None:
@@ -443,7 +493,11 @@ class ACMTDPInferenceEngine(InferenceEngine):
         self._future_generation = None
         self._boundary_in_flight = False
 
-    def _submit_plan(self, window: dict | None = None) -> None:
+    def _submit_plan(
+        self,
+        window: dict | None = None,
+        anchor_state: torch.Tensor | None = None,
+    ) -> None:
         if self._future is not None:
             return
         plan_id = self._next_plan_id
@@ -451,6 +505,7 @@ class ACMTDPInferenceEngine(InferenceEngine):
         generation = self._generation
         tactile_future = self._tactile_future
         submitted_window = window
+        submitted_anchor_state = None if anchor_state is None else anchor_state.detach().clone()
         self._plan_started_at = time.monotonic()
 
         def wait_tactile_and_plan() -> ActionPlan:
@@ -468,7 +523,12 @@ class ACMTDPInferenceEngine(InferenceEngine):
                     plan_window = _clone_tree(self._policy._latest_window)  # type: ignore[attr-defined]
             if plan_window is None:
                 raise RuntimeError("ACMT-DP planner has no observation window")
-            return self._plan_now(plan_window, plan_id, generation=generation)
+            return self._plan_now(
+                plan_window,
+                plan_id,
+                generation=generation,
+                anchor_state=submitted_anchor_state,
+            )
 
         self._future = self._planner.submit(wait_tactile_and_plan)
         self._future_generation = generation
@@ -477,8 +537,9 @@ class ACMTDPInferenceEngine(InferenceEngine):
         if obs_frame is None:
             return None
         with self._lock, torch.inference_mode():
-            observation = self._prepare(obs_frame)
             with self._policy_state_lock:
+                observation = self._prepare(obs_frame)
+                anchor_state = self._capture_action_anchor()
                 self._policy.observe(observation)  # type: ignore[attr-defined]
                 if getattr(self._policy, "_observed_batch_size", 1) != 1:
                     raise ValueError("Native-DP v4 online rollout requires batch size 1")
@@ -511,6 +572,7 @@ class ACMTDPInferenceEngine(InferenceEngine):
                             current_window,
                             plan_id,
                             generation=self._generation,
+                            anchor_state=anchor_state,
                         )
                     )
                     logger.info("ACMT-DP initial plan ready: id=%d queue=%d", plan_id, len(self._queue))
@@ -524,17 +586,22 @@ class ACMTDPInferenceEngine(InferenceEngine):
                     # before a feedback callback arrived, still request a
                     # replacement from the latest completed causal state.
                     self._boundary_in_flight = True
-                    self._submit_plan(current_window)
+                    self._submit_plan(current_window, anchor_state)
                 return None
             self._current_action_window = current_window
+            self._current_action_anchor_state = anchor_state
             if len(self._queue) <= EXECUTION_HORIZON:
                 self._boundary_in_flight = True
-            # ACMT-DP's postprocessor is CPU-owned.  The queue already holds
-            # CPU actions, so avoid a per-tick CUDA round trip while the
-            # planner is using the GPU.
-            action_batch = action.unsqueeze(0)
-            processed = self._postprocessor(action_batch)
-            action_tensor = processed.squeeze(0)
+            if self._plan_postprocess:
+                # ACMT-ACT plans are already unnormalized, absolute and
+                # gripper-adapted from _plan_now.
+                action_tensor = action
+            else:
+                # Legacy ACMT-DP's postprocessor is CPU-owned.  The queue
+                # already holds CPU actions, so keep this conversion local to
+                # the compatibility path.
+                processed = self._postprocessor(action.unsqueeze(0))
+                action_tensor = processed.squeeze(0)
             action_dict = make_robot_action(action_tensor, self._dataset_features)
             return torch.tensor([action_dict[key] for key in self._ordered_action_keys])
 
@@ -545,7 +612,9 @@ class ACMTDPInferenceEngine(InferenceEngine):
             if tuple(action.shape) != (1, ACTION_DIM):
                 raise ValueError(f"executed ACMT-DP action must be [1,8], got {tuple(action.shape)}")
             current_window = getattr(self, "_current_action_window", None)
+            current_anchor_state = getattr(self, "_current_action_anchor_state", None)
             self._current_action_window = None
+            self._current_action_anchor_state = None
             generation = self._generation
             if getattr(self._policy.config, "tactile_source", None) in {"tactigen", "substitution"}:
                 self._tactile_future = self._tactile_worker.submit(
@@ -555,7 +624,7 @@ class ACMTDPInferenceEngine(InferenceEngine):
                     generation,
                 )
             if self._boundary_in_flight:
-                self._submit_plan(current_window)
+                self._submit_plan(current_window, current_anchor_state)
 
     def _notify_tactile(self, action: torch.Tensor, window: dict | None, generation: int) -> None:
         # Hold the engine lock while taking the policy lock. Reset uses the

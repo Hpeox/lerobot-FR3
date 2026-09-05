@@ -107,17 +107,22 @@ This fork also registers `--policy.type=acmt_act`, a four-camera LeRobot ACT
 policy with a current two-wrist force-field token.  In schema `acmt_act.v3`,
 each camera owns an independent trainable ImageNet ResNet50 and 1x1 projection
 (the visual encoders are initialized identically but never share parameters).
-It predicts a 16-step, 8-dimensional absolute joint/gripper chunk and executes
-the first eight steps.  Use `tactile_source=none` or `real` for training;
-`substitution` loads the same real checkpoint and supplies causal, frozen ACMT
-force fields at runtime.  The processor enforces 480x640 raw input and the
-fixed, no-resize top/side/wrist 320x580 crops, while preserving raw wrist RGB-D
-only for the external generator.
+It predicts a 16-step chunk of joint residuals relative to the real q at plan
+creation plus a physical gripper command (`0=open`, `1=closed`), and executes
+the first eight steps.  The deployment processor restores absolute joint
+targets before they reach the FR3 protocol.  Use `tactile_source=none` or
+`real` for training; `substitution` loads the same real checkpoint and supplies
+causal, frozen ACMT force fields at runtime.  A visual-only grasp-goal head
+adds a supervised end-effector XYZ token to the ACT condition.  The processor
+enforces 480x640 raw input and the fixed, no-resize top/side/wrist 320x580
+crops, while preserving raw wrist RGB-D only for the external generator.
 
 For the ACMT-ACT training datasets, convert the source H5 files once with
 `lerobot-acmt-act-convert-memmap`.  The resulting `acmt_act_memmap_v1` backend
 contains only the cropped RGB, state, tactile and action arrays; training never
-opens H5 files and deployment never reads the training Memmap.  The provided
+opens H5 files and deployment never reads the training Memmap.  Run
+`python -m lerobot.scripts.acmt_act_build_targets` once per task to create the
+small H5-derived goal/phase sidecar and residual-action statistics.  The provided
 `scripts/train_acmt_act_memmap_200k.sh` runs the mandatory physical-batch-16
 preflight and serializes Peg none, Gear none, Peg real and Gear real runs, each
 for exactly 200,000 optimizer updates, resuming from `checkpoints/last`.  Held-out
