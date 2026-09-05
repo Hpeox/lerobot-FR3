@@ -55,7 +55,17 @@ def _make_acmt_act_memmap_dataset(cfg: TrainPipelineConfig, split: str):
     canonical = Path(root).resolve() / "splits.json"
     if split_file.resolve() != canonical:
         raise ValueError(f"backend='acmt_act_memmap' requires split_file={canonical}")
-    return ACMTACTMemmapDataset(root, split=split, repo_id=str(cfg.dataset.repo_id))
+    # acmt_actv2 deliberately removes top from the data path as well as from
+    # the policy feature list.  The source memmap remains four-way so v3 can
+    # continue using it unchanged; slicing here avoids loading/transferring
+    # the unused top image for every sample.
+    camera_indices = (1, 2, 3) if getattr(cfg.policy, "type", None) == "acmt_actv2" else None
+    return ACMTACTMemmapDataset(
+        root,
+        split=split,
+        repo_id=str(cfg.dataset.repo_id),
+        camera_indices=camera_indices,
+    )
 
 
 def resolve_delta_timestamps(

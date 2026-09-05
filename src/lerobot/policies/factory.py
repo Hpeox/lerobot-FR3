@@ -47,6 +47,7 @@ from lerobot.utils.feature_utils import dataset_to_policy_features
 from .acmt_dp.configuration_acmt_dp import ACMTDPConfig
 from .acmt_dp.configuration_acmt_dp_v5 import ACMTDPV5Config
 from .acmt_act.configuration_acmt_act import ACMTACTConfig
+from .acmt_actv2.configuration_acmt_actv2 import ACMTACTV2Config
 from .act.configuration_act import ACTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig
 from .eo1.configuration_eo1 import EO1Config
@@ -128,6 +129,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .acmt_act.modeling_acmt_act import ACMTACTPolicy
 
         return ACMTACTPolicy
+    elif name == "acmt_actv2":
+        from .acmt_actv2.modeling_acmt_actv2 import ACMTACTV2Policy
+
+        return ACMTACTV2Policy
     elif name == "multi_task_dit":
         from .multi_task_dit.modeling_multi_task_dit import MultiTaskDiTPolicy
 
@@ -230,6 +235,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return ACTConfig(**kwargs)
     elif policy_type == "acmt_act":
         return ACMTACTConfig(**kwargs)
+    elif policy_type == "acmt_actv2":
+        return ACMTACTV2Config(**kwargs)
     elif policy_type == "multi_task_dit":
         return MultiTaskDiTConfig(**kwargs)
     elif policy_type == "vqbet":
