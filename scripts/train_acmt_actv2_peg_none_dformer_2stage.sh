@@ -60,6 +60,10 @@ run_preflight() {
 
 run_train() {
   local phase="$1" steps="$2" batch="$3" accumulation="$4" output="$5" log="$6" extra=()
+  local cadence=20000
+  if [[ "${phase}" == "stage3" ]]; then
+    cadence=5000
+  fi
   mkdir -p "${output}"
   if [[ "${phase}" == "stage3" ]]; then
     extra+=("--policy.path=${FROZEN_OUTPUT}/checkpoints/best/pretrained_model")
@@ -86,7 +90,7 @@ run_train() {
     --dataset.eval_split=0.05 \
     --batch_size="${batch}" \
     --gradient_accumulation_steps="${accumulation}" \
-    --steps="${steps}" --eval_steps=20000 --save_freq=20000 --log_freq=100 \
+    --steps="${steps}" --eval_steps="${cadence}" --save_freq="${cadence}" --log_freq=100 \
     --env_eval_freq=0 --num_workers=4 --prefetch_factor=2 --persistent_workers=true \
     --seed=42 --output_dir="${output}" --wandb.enable=false \
     "${extra[@]}" >"${log}" 2>&1
