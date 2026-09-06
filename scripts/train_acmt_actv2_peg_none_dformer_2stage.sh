@@ -64,7 +64,11 @@ run_train() {
   if [[ "${phase}" == "stage3" ]]; then
     cadence=5000
   fi
-  mkdir -p "${output}"
+  # Do not create a fresh output directory here.  lerobot_train validates that
+  # a non-resume run points to a path that does not exist, then creates it
+  # itself.  Creating it in the launcher would make every fresh phase fail
+  # before the first optimizer step.
+  mkdir -p "$(dirname "${output}")"
   if [[ "${phase}" == "stage3" ]]; then
     extra+=("--policy.path=${FROZEN_OUTPUT}/checkpoints/best/pretrained_model")
   fi
