@@ -341,6 +341,12 @@ class ACMTACT(ACT):
             phase = getattr(self.config, "dformer_training_phase", "frozen")
             for backbone in self.backbone:
                 backbone.set_phase(phase)
+                # ``set_phase("stage3")`` enables gradients and training-time
+                # stochastic depth.  The outer ACT ``eval()`` call must still
+                # force every DFormer block into deterministic evaluation
+                # mode for validation and deployment.
+                if not mode:
+                    backbone.eval()
         return self
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor | None, Tensor | None]]:
