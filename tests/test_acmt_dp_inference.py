@@ -20,6 +20,7 @@ from lerobot.rollout.inference.acmt_dp import (
 from lerobot.rollout.inference.acmt_act import ACMTACTInferenceEngine
 from lerobot.rollout.inference.factory import SyncInferenceConfig, create_inference_engine
 from lerobot.rollout.strategies.core import send_next_action
+from lerobot.processor.relative_action_processor import AbsoluteActionsProcessorStep, RelativeActionsProcessorStep
 from lerobot.utils.action_interpolator import ActionInterpolator
 from lerobot.utils.constants import ACTION
 
@@ -314,6 +315,89 @@ def test_action_postprocessing_stays_on_cpu_while_planner_device_is_cuda(
     try:
         assert engine.get_action(_observation(0)) is not None
         assert postprocessor.devices == [torch.device("cpu")]
+    finally:
+        engine.stop()
+
+
+class _AnchorPreprocessor(_IdentityProcessor):
+    def __init__(self, relative_step: RelativeActionsProcessorStep) -> None:
+        self.relative_step = relative_step
+        self.steps = [relative_step]
+
+    def __call__(self, value):
+        self.relative_step._last_state = value["anchor"].detach().clone()
+        return value
+
+    def reset(self) -> None:
+        self.relative_step._last_state = None
+
+
+class _AnchorPostprocessor(_IdentityProcessor):
+    def __init__(self, relative_step: RelativeActionsProcessorStep) -> None:
+        self.relative_step = relative_step
+        self.steps = [AbsoluteActionsProcessorStep(enabled=True, relative_step=relative_step)]
+        self.calls = 0
+
+    def __call__(self, action):
+        self.calls += 1
+        anchor = self.relative_step.get_cached_state()
+        assert anchor is not None
+        result = action.clone()
+        result[..., :7] += anchor[..., :7].unsqueeze(-2)
+        return result
+
+
+class _AnchorPolicy(_FakePolicy):
+    def __init__(self) -> None:
+        super().__init__("none", schema_version=3)
+        self.name = "acmt_act"
+        self.config.checkpoint_schema = "acmt_act.v3"
+
+    def _plan(self, _window: dict[str, torch.Tensor]) -> torch.Tensor:
+        return torch.full((1, PREDICTION_HORIZON, ACTION_DIM), 0.5)
+
+
+def test_acmt_act_plan_is_postprocessed_once_with_its_observation_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    monkeypatch.setattr(acmt_dp.time, "monotonic", clock.monotonic)
+    names = [f"action_{index}" for index in range(ACTION_DIM)]
+    relative_step = RelativeActionsProcessorStep(
+        enabled=True,
+        exclude_joints=["gripper"],
+        action_names=names,
+    )
+    preprocessor = _AnchorPreprocessor(relative_step)
+    postprocessor = _AnchorPostprocessor(relative_step)
+    policy = _AnchorPolicy()
+    engine = ACMTDPInferenceEngine(
+        policy=policy,
+        preprocessor=preprocessor,
+        postprocessor=postprocessor,
+        dataset_features={ACTION: {"names": names}},
+        ordered_action_keys=names,
+        task="test",
+        device="cpu",
+        robot_type="fr3",
+    )
+    engine._prepare = lambda observation: preprocessor(observation)  # type: ignore[method-assign]
+    engine.reset()
+    engine.start()
+    try:
+        first = engine.get_action(
+            {"sequence": torch.tensor(0), "anchor": torch.ones(1, ACTION_DIM)}
+        )
+        assert first is not None
+        torch.testing.assert_close(first[:7], torch.full((7,), 1.5))
+
+        clock.value += 1.0 / CONTROL_HZ
+        second = engine.get_action(
+            {"sequence": torch.tensor(1), "anchor": torch.full((1, ACTION_DIM), 10.0)}
+        )
+        assert second is not None
+        torch.testing.assert_close(second[:7], torch.full((7,), 1.5))
+        assert postprocessor.calls == 1
     finally:
         engine.stop()
 
