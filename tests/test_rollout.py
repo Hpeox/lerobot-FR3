@@ -257,8 +257,9 @@ def test_create_inference_engine_sync():
     assert isinstance(engine, SyncInferenceEngine)
 
 
-def test_create_inference_engine_acmt_dp_uses_inline_sync_backend():
-    from lerobot.rollout import SyncInferenceConfig, SyncInferenceEngine, create_inference_engine
+def test_create_inference_engine_acmt_dp_uses_rolling_backend():
+    from lerobot.rollout import SyncInferenceConfig, create_inference_engine
+    from lerobot.rollout.inference.acmt_dp import ACMTDPInferenceEngine
 
     policy = SimpleNamespace(
         name="acmt_dp",
@@ -278,8 +279,9 @@ def test_create_inference_engine_acmt_dp_uses_inline_sync_backend():
         fps=30.0,
         device="cpu",
     )
-    assert type(engine) is SyncInferenceEngine
-    assert not hasattr(engine, "_queue")
+    assert type(engine) is ACMTDPInferenceEngine
+    assert hasattr(engine, "_queue")
+    engine.stop()
 
 
 def test_sync_engine_forwards_acmt_action_feedback():
