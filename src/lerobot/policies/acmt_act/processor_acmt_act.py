@@ -88,7 +88,7 @@ def _rgb_bchw(value: Any, key: str, *, allow_precropped: bool = False) -> torch.
     return tensor.clamp(0.0, 1.0).contiguous()
 
 
-def _depth_bchw(value: Any, key: str) -> torch.Tensor:
+def _depth_bchw(value: Any, key: str, *, allow_precropped: bool = False) -> torch.Tensor:
     tensor = _tensor(value, key)
     if tensor.ndim == 2:
         tensor = tensor.unsqueeze(0).unsqueeze(0)
@@ -108,8 +108,10 @@ def _depth_bchw(value: Any, key: str) -> torch.Tensor:
             raise ValueError(f"{key} must be BCHW or BHWC depth, got {tuple(tensor.shape)}")
     else:
         raise ValueError(f"{key} must be a 2D/3D/4D depth tensor, got {tuple(tensor.shape)}")
-    if tuple(tensor.shape[-2:]) != (480, 640):
-        raise ValueError(f"{key} must be 480x640, got {tuple(tensor.shape[-2:])}")
+    if tuple(tensor.shape[-2:]) != (480, 640) and not (
+        allow_precropped and tuple(tensor.shape[-2:]) == (320, 580)
+    ):
+        raise ValueError(f"{key} must be 480x640 (or an exact 320x580 memmap crop), got {tuple(tensor.shape[-2:])}")
     return tensor.to(dtype=torch.float32).contiguous()
 
 
@@ -161,6 +163,7 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
     camera_names: tuple[str, ...]
     crop_params: dict[str, tuple[int, int, int, int]]
     tactile_source: str = "none"
+    use_depth: bool = False
     image_mean: tuple[float, float, float] = _IMAGENET_MEAN
     image_std: tuple[float, float, float] = _IMAGENET_STD
 
@@ -170,6 +173,7 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
             "camera_names": list(self.camera_names),
             "crop_params": {key: list(value) for key, value in self.crop_params.items()},
             "tactile_source": self.tactile_source,
+            "use_depth": self.use_depth,
             "image_mean": list(self.image_mean),
             "image_std": list(self.image_std),
         }
@@ -177,6 +181,7 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
     def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
         result = dict(observation)
         rgb_values: dict[str, torch.Tensor] = {}
+        depth_values: dict[str, torch.Tensor] = {}
         for camera, name in zip(self.camera_keys, self.camera_names, strict=True):
             key = rgb_key(camera)
             if key not in result:
@@ -195,6 +200,22 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
             mean = cropped.new_tensor(self.image_mean).view(1, 3, 1, 1)
             std = cropped.new_tensor(self.image_std).view(1, 3, 1, 1)
             result[key] = (cropped - mean) / std
+            if self.use_depth:
+                depth_key_name = depth_key(camera)
+                if depth_key_name not in result:
+                    raise KeyError(f"ACMT-ACT DFormer mode is missing {depth_key_name}")
+                raw_depth = _depth_bchw(
+                    result[depth_key_name],
+                    depth_key_name,
+                    allow_precropped=self.tactile_source != "substitution",
+                )
+                if self.tactile_source == "substitution" and name in {"wrist_left", "wrist_right"}:
+                    depth_values[name] = raw_depth
+                if tuple(raw_depth.shape[-2:]) == (480, 640):
+                    y, x, height, width = self.crop_params[name]
+                    result[depth_key_name] = raw_depth[..., y : y + height, x : x + width]
+                else:
+                    result[depth_key_name] = raw_depth
 
         state = _vector(result.get("observation.state"), "observation.state", 8)
         # FR3's canonical state ABI stores the seventh joint followed by the
@@ -235,10 +256,15 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
                 raise KeyError(f"substitution ACMT-ACT observation is missing {sorted(set(missing))}")
             left, right = (rgb_values["wrist_left"], rgb_values["wrist_right"])
             result[GEN_RGB] = torch.stack([left, right], dim=1)
-            result[GEN_DEPTH] = torch.stack(
-                [_depth_bchw(result[depth_key(camera)], depth_key(camera)) for camera in wrist_camera_keys],
-                dim=1,
-            )
+            if self.use_depth:
+                result[GEN_DEPTH] = torch.stack(
+                    [depth_values[name] for name in ("wrist_left", "wrist_right")], dim=1
+                )
+            else:
+                result[GEN_DEPTH] = torch.stack(
+                    [_depth_bchw(result[depth_key(camera)], depth_key(camera)) for camera in wrist_camera_keys],
+                    dim=1,
+                )
             q = state[:, :7]
             dq = _vector(result[DQ], DQ, 7)
             tau = _vector(result[TAU_J], TAU_J, 7)
@@ -255,6 +281,8 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
         observations = transformed.setdefault(PipelineFeatureType.OBSERVATION, {})
         for camera, name in zip(self.camera_keys, self.camera_names, strict=True):
             observations[rgb_key(camera)] = PolicyFeature(type=FeatureType.VISUAL, shape=(3, 320, 580))
+            if self.use_depth:
+                observations[depth_key(camera)] = PolicyFeature(type=FeatureType.STATE, shape=(1, 320, 580))
         observations[XENSE0] = PolicyFeature(type=FeatureType.STATE, shape=(3, 35, 20))
         observations[XENSE1] = PolicyFeature(type=FeatureType.STATE, shape=(3, 35, 20))
         return transformed
@@ -283,6 +311,7 @@ def make_acmt_act_pre_post_processors(
                 camera_names=config.camera_names,
                 crop_params=config.crop_params,
                 tactile_source=config.tactile_source,
+                use_depth=getattr(config, "use_dformer_depth", False),
                 image_mean=config.image_mean,
                 image_std=config.image_std,
             ),

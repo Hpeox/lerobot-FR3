@@ -130,13 +130,16 @@ validation is evaluated every 20,000 steps; after each completed run the launche
 creates `checkpoints/best` pointing to the lowest validation-loss checkpoint while
 leaving `checkpoints/last` as the resume pointer.
 
-The separate `--policy.type=acmt_actv2` experiment keeps the same ACT/tactile
-network and ResNet50 design but consumes only `camera.cam2`, `camera.cam3` and
-`camera.cam4` (side, left wrist, right wrist).  Its `acmt_actv2.v1` checkpoint
-schema is incompatible with the four-camera `acmt_act.v3` schema.  The existing
-four-way Memmap is sliced before batching so the top image is not read or moved
-to the GPU; `scripts/train_acmt_actv2_peg_none_200k.sh` launches the Peg-none
-200k-step comparison run.
+The current `--policy.type=acmt_actv2` experiment uses all four RGB-D streams
+(`top`, `side`, `wrist_left`, `wrist_right`).  Each stream owns an independent
+pretrained DFormerv2-S Stage-3 encoder; its `20x37` map is projected to ACT
+tokens without global pooling.  The RGB Memmap remains unchanged and the
+training-only depth sidecar is produced by
+`scripts/convert_acmt_act_depth_peg.sh`.  The DFormer spatial schema is
+incompatible with the old ResNet50 `acmt_actv2.v1` checkpoints.  The
+two-stage Peg-none launcher uses frozen DFormer training first and a 20k-step
+Stage-3 fine-tune second; deployment consumes live RGB-D and never reads either
+Memmap.
 
 | Category                   | Models                                                                                                                                                                                                                                                                                                                                                                                     |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |

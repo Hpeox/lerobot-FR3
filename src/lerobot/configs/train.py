@@ -99,6 +99,10 @@ class TrainPipelineConfig(HubMixin):
     # Number of workers for the dataloader.
     num_workers: int = 4
     batch_size: int = 8
+    # Number of physical micro-batches per optimizer update.  The default
+    # keeps all existing policies unchanged; ACMT-ACTv2 uses this to fit its
+    # four dense DFormer token streams on a single GPU.
+    gradient_accumulation_steps: int = 1
     prefetch_factor: int = 4
     persistent_workers: bool = True
     steps: int = 100_000
@@ -213,6 +217,9 @@ class TrainPipelineConfig(HubMixin):
 
     def validate(self) -> None:
         self._resolve_pretrained_from_cli()
+
+        if self.gradient_accumulation_steps < 1:
+            raise ValueError("gradient_accumulation_steps must be >= 1")
 
         if self.policy is None and self.reward_model is None:
             raise ValueError(

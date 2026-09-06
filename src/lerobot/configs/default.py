@@ -50,6 +50,10 @@ class DatasetConfig:
     # reads immutable .npy memmaps and never opens the source H5 files.
     backend: str = "lerobot"
     split_file: str | None = None
+    # Optional immutable depth sidecar used by the ACMT-ACTv2 RGB-D backend.
+    # It is deliberately separate from ``root`` so the existing RGB Memmap
+    # remains backward compatible and deployment never depends on it.
+    depth_root: str | None = None
 
     def __post_init__(self) -> None:
         if self.backend not in {"lerobot", "acmt_act_memmap"}:

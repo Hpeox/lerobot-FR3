@@ -64,6 +64,7 @@ else:
     from .sampler import EpisodeAwareSampler, compute_sampler_state
 
 from .sampler import EpisodeAwareSampler, compute_sampler_state
+from .acmt_act_depth_memmap import ACMTActDepthMemmapStore, convert_h5_to_depth_memmap
 from .acmt_act_memmap import ACMTACTMemmapDataset, ACMTActMemmapStore, convert_h5_to_memmap
 from .factory import make_dataset, make_train_eval_datasets, resolve_delta_timestamps
 
@@ -94,8 +95,10 @@ __all__ = [
     "aggregate_stats",
     "ACMTACTMemmapDataset",
     "ACMTActMemmapStore",
+    "ACMTActDepthMemmapStore",
     "convert_image_to_video_dataset",
     "convert_h5_to_memmap",
+    "convert_h5_to_depth_memmap",
     "create_initial_features",
     "compute_sampler_state",
     "create_lerobot_dataset_card",

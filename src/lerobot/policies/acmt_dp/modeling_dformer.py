@@ -666,6 +666,23 @@ class dformerv2(nn.Module):
                 # trick: eval have effect on BatchNorm only
                 if isinstance(m, nn.BatchNorm2d):
                     m.eval()
+        return self
+
+    def forward_stage3(self, rgb: torch.Tensor, depth: torch.Tensor) -> torch.Tensor:
+        """Return the Stage-3 spatial map without constructing Stage-4.
+
+        ACMT-ACT uses Stage-3 (the third backbone stage, index 2) as a dense
+        spatial token map.  The original segmentation forward continues into
+        Stage-4 even when only Stage-3 is requested, which wastes both memory
+        and compute during policy training.
+        """
+        x = self.patch_embed(rgb)
+        x_e = depth[:, 0].unsqueeze(1)
+        x_out = x
+        for layer_idx in range(3):
+            x_out, x = self.layers[layer_idx](x, x_e)
+        x_out = self.extra_norms[1](x_out)
+        return x_out.permute(0, 3, 1, 2).contiguous()
 
 
 def DFormerv2_S(pretrained=False, **kwargs):
