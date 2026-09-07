@@ -27,6 +27,7 @@ from torchvision.ops.misc import FrozenBatchNorm2d
 from lerobot.policies.act.modeling_act import (
     ACT,
 )
+from lerobot.policies.acmt_dp.modeling_dformer import DFormerv2_S
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
@@ -36,10 +37,12 @@ from .configuration_acmt_act import (
     XENSE0,
     XENSE1,
     ACMTACTConfig,
+    depth_key,
 )
 from .processor_acmt_act import GEN_DEPTH, GEN_LOWDIM, GEN_POSE, GEN_RGB
 
 TACTILE = "_acmt_act.tactile"
+OBS_DEPTH = "_acmt_act.depth"
 _GENERATOR_MODEL_CONFIG_KEYS = {
     "force_mean",
     "force_std",
@@ -123,56 +126,166 @@ class ACMTACTileEncoder(nn.Module):
         return self.norm(encoded.reshape(batch_size, 160))
 
 
+class DFormerSpatialBackbone(nn.Module):
+    """One independent DFormerv2-S Stage-3 RGB-D encoder.
+
+    The four instances are deliberately owned by the policy as separate
+    modules.  ``frozen`` is the fast Phase-A path; ``stage3`` keeps the
+    patch/stage-1/stage-2 representation fixed and trains only the spatial
+    Stage-3 blocks and its output normalization.
+    """
+
+    def __init__(self, checkpoint: str, phase: str = "frozen", require_checkpoint: bool = True) -> None:
+        super().__init__()
+        self.backbone = DFormerv2_S(out_indices=(2,))
+        if Path(checkpoint).is_file():
+            self.backbone.init_weights(checkpoint)
+        elif require_checkpoint:
+            raise FileNotFoundError(f"DFormer checkpoint not found: {checkpoint}")
+        else:
+            print(
+                f"[acmt_act] DFormer pretraining file is absent; loading policy weights from the checkpoint: {checkpoint}",
+                flush=True,
+            )
+        self.phase = "frozen"
+        self.set_phase(phase)
+
+    @staticmethod
+    def _freeze_batch_norm(module: nn.Module) -> None:
+        for child in module.modules():
+            if isinstance(child, nn.modules.batchnorm._BatchNorm):
+                child.eval()
+
+    def set_phase(self, phase: str) -> None:
+        if phase not in {"frozen", "stage3"}:
+            raise ValueError(f"unsupported DFormer training phase: {phase}")
+        self.phase = phase
+        for parameter in self.backbone.parameters():
+            parameter.requires_grad_(False)
+        if phase == "stage3":
+            for parameter in self.backbone.layers[2].parameters():
+                parameter.requires_grad_(True)
+            for parameter in self.backbone.extra_norms[1].parameters():
+                parameter.requires_grad_(True)
+            self.backbone.train(True)
+        else:
+            self.backbone.eval()
+        self._freeze_batch_norm(self.backbone)
+
+    def _stage3_with_grad(self, rgb: Tensor, depth: Tensor) -> Tensor:
+        # The early representation is fixed in the fine-tune phase.  Keeping
+        # it outside autograd is what makes four independent Stage-3 branches
+        # fit on a 32-GiB RTX 5090.
+        with torch.no_grad():
+            x = self.backbone.patch_embed(rgb)
+            x_e = self._normalize_depth(depth)[:, 0].unsqueeze(1)
+            for layer_idx in range(2):
+                _, x = self.backbone.layers[layer_idx](x, x_e)
+        x_out, _ = self.backbone.layers[2](x.detach(), x_e)
+        x_out = self.backbone.extra_norms[1](x_out)
+        return x_out.permute(0, 3, 1, 2).contiguous()
+
+    def forward(self, rgb: Tensor, depth: Tensor) -> Tensor:
+        if self.phase == "stage3":
+            return self._stage3_with_grad(rgb, depth)
+        with torch.no_grad():
+            return self.backbone.forward_stage3(rgb, self._normalize_depth(depth))
+
+    @staticmethod
+    def _normalize_depth(depth: Tensor) -> Tensor:
+        meters = depth.float() / 1000.0
+        valid = (depth > 0) & (depth < 65535) & (meters >= 0.05) & (meters <= 2.0)
+        normalized = ((meters - 0.05) / 1.95).clamp(0.0, 1.0)
+        return torch.where(valid, normalized, torch.ones_like(normalized))
+
+
 class ACMTACT(ACT):
     """Reference ACT network plus a single tactile conditioning token."""
 
     def __init__(self, config: ACMTACTConfig):
+        visual_mode = getattr(config, "visual_encoder_mode", "resnet")
         # Resolve the serialized torchvision enum before ACT.__init__ builds
         # camera 0. The remaining three cameras below receive this same enum,
         # so all four streams use exactly the same ImageNet initialization.
         pretrained = config.pretrained_backbone_weights
-        if isinstance(pretrained, str):
+        if visual_mode == "resnet" and isinstance(pretrained, str):
             enum_name = config.vision_backbone.replace("resnet", "ResNet") + "_Weights"
             enum_cls = getattr(torchvision.models, enum_name, None)
             if enum_cls is None:
                 raise ValueError(f"Unknown torchvision weights enum for {config.vision_backbone}")
             pretrained = getattr(enum_cls, pretrained.rsplit(".", 1)[-1])
             config.pretrained_backbone_weights = pretrained
-        super().__init__(config)
-
-        # ACT's base class creates one shared ResNet.  v3 deliberately
-        # replaces that module with four separately-owned ResNet50 instances
-        # and four separately-owned 1x1 projections.  They are initialized
-        # from the same ImageNet checkpoint, but no parameter object is shared
-        # between camera streams.
-        if config.camera_backbone_mode != "independent":
-            raise ValueError("ACMT-ACT v3 requires independent camera backbones")
-        def make_backbone() -> IntermediateLayerGetter:
-            backbone_model = getattr(torchvision.models, config.vision_backbone)(
-                replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
-                weights=pretrained,
-                norm_layer=FrozenBatchNorm2d,
-            )
-            return IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
-
-        # Remove the shared projection registered by ACT.__init__.  Reuse the
-        # already-created first ResNet as camera 0 (rather than allocating a
-        # fifth temporary network), then construct three independent peers.
-        first_backbone = self.backbone
-        del self.backbone
-        del self.encoder_img_feat_input_proj
-        self.backbone = nn.ModuleList([first_backbone, *(make_backbone() for _ in config.camera_keys[1:])])
-        last_block = first_backbone.layer4[-1]
-        # ResNet18/34 use BasicBlock (conv2), while larger variants use
-        # Bottleneck (conv3).  v3 is ResNet50, but deriving this from the
-        # actual first backbone keeps the projection robust to config loading.
-        if hasattr(last_block, "conv3"):
-            backbone_channels = last_block.conv3.out_channels
+        if visual_mode == "dformerv2_s_stage3":
+            # ACT's constructor owns all VAE/Transformer wiring but assumes a
+            # torchvision ResNet when allocating its image module.  Use a
+            # parameter-free temporary ResNet configuration, then replace
+            # that module with the four DFormer branches below.
+            original_backbone = config.vision_backbone
+            original_weights = config.pretrained_backbone_weights
+            config.vision_backbone = "resnet18"
+            config.pretrained_backbone_weights = None
+            super().__init__(config)
+            config.vision_backbone = original_backbone
+            config.pretrained_backbone_weights = original_weights
         else:
-            backbone_channels = last_block.conv2.out_channels
-        self.encoder_img_feat_input_proj = nn.ModuleList(
-            [nn.Conv2d(backbone_channels, config.dim_model, kernel_size=1) for _ in config.camera_keys]
-        )
+            super().__init__(config)
+
+        if visual_mode == "dformerv2_s_stage3":
+            first_backbone = self.backbone
+            del first_backbone
+            del self.backbone
+            del self.encoder_img_feat_input_proj
+            checkpoint = getattr(config, "dformer_checkpoint", None)
+            if not checkpoint:
+                raise ValueError("DFormer ACMT-ACT requires dformer_checkpoint")
+            phase = getattr(config, "dformer_training_phase", "frozen")
+            require_checkpoint = getattr(config, "require_dformer_checkpoint", True)
+            self.backbone = nn.ModuleList(
+                [
+                    DFormerSpatialBackbone(checkpoint, phase=phase, require_checkpoint=require_checkpoint)
+                    for _ in config.camera_keys
+                ]
+            )
+            self.encoder_img_feat_input_proj = nn.ModuleList(
+                [nn.Conv2d(256, config.dim_model, kernel_size=1) for _ in config.camera_keys]
+            )
+        elif visual_mode == "resnet":
+            # ACT's base class creates one shared ResNet.  v3 deliberately
+            # replaces that module with four separately-owned ResNet50 instances
+            # and four separately-owned 1x1 projections.  They are initialized
+            # from the same ImageNet checkpoint, but no parameter object is shared
+            # between camera streams.
+            if config.camera_backbone_mode != "independent":
+                raise ValueError("ACMT-ACT v3 requires independent camera backbones")
+
+            def make_backbone() -> IntermediateLayerGetter:
+                backbone_model = getattr(torchvision.models, config.vision_backbone)(
+                    replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
+                    weights=pretrained,
+                    norm_layer=FrozenBatchNorm2d,
+                )
+                return IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+
+            # Remove the shared projection registered by ACT.__init__.  Reuse the
+            # already-created first ResNet as camera 0 (rather than allocating a
+            # fifth temporary network), then construct three independent peers.
+            first_backbone = self.backbone
+            del self.backbone
+            del self.encoder_img_feat_input_proj
+            self.backbone = nn.ModuleList([first_backbone, *(make_backbone() for _ in config.camera_keys[1:])])
+            last_block = first_backbone.layer4[-1]
+            # ResNet18/34 use BasicBlock (conv2), while larger variants use
+            # Bottleneck (conv3).  v3 is ResNet50, but deriving this from the
+            # actual first backbone keeps the projection robust to config loading.
+            if hasattr(last_block, "conv3"):
+                backbone_channels = last_block.conv3.out_channels
+            else:
+                backbone_channels = last_block.conv2.out_channels
+            self.encoder_img_feat_input_proj = nn.ModuleList(
+                [nn.Conv2d(backbone_channels, config.dim_model, kernel_size=1) for _ in config.camera_keys]
+            )
+        else:
+            raise ValueError(f"unsupported ACMT-ACT visual_encoder_mode: {visual_mode}")
         self.tactile_encoder = ACMTACTileEncoder(config.force_mean, config.force_std)
         self.encoder_tactile_input_proj = nn.Linear(config.tactile_feature_dim, config.dim_model)
 
@@ -221,6 +334,20 @@ class ACMTACT(ACT):
             nn.init.normal_(
                 self.encoder_1d_feature_pos_embed.weight[old_position.num_embeddings :], std=0.02
             )
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if getattr(self.config, "visual_encoder_mode", "resnet") == "dformerv2_s_stage3":
+            phase = getattr(self.config, "dformer_training_phase", "frozen")
+            for backbone in self.backbone:
+                backbone.set_phase(phase)
+                # ``set_phase("stage3")`` enables gradients and training-time
+                # stochastic depth.  The outer ACT ``eval()`` call must still
+                # force every DFormer block into deterministic evaluation
+                # mode for validation and deployment.
+                if not mode:
+                    backbone.eval()
+        return self
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor | None, Tensor | None]]:
         if self.config.use_vae and self.training:
@@ -279,11 +406,15 @@ class ACMTACT(ACT):
         encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight[:3].unsqueeze(1))
         visual_tokens: list[Tensor] = []
 
+        depths = batch.get(OBS_DEPTH)
         if images:
             if len(images) != len(self.backbone):
                 raise ValueError(f"ACMT-ACT expects {len(self.backbone)} camera images, got {len(images)}")
-            for image, backbone, image_proj in zip(
-                images, self.backbone, self.encoder_img_feat_input_proj, strict=True
+            if getattr(self.config, "visual_encoder_mode", "resnet") == "dformerv2_s_stage3":
+                if depths is None or len(depths) != len(images):
+                    raise ValueError("DFormer ACMT-ACT requires one depth map for every camera")
+            for camera_index, (image, backbone, image_proj) in enumerate(
+                zip(images, self.backbone, self.encoder_img_feat_input_proj, strict=True)
             ):
                 # Small photometric perturbations are deliberately applied
                 # after the fixed ImageNet normalization and only while the
@@ -299,7 +430,11 @@ class ACMTACT(ACT):
                         (image.shape[0], 1, 1, 1), device=image.device, dtype=image.dtype
                     ).uniform_(0.94, 1.06)
                     image = (image * contrast + brightness).clamp(-4.0, 4.0)
-                cam_features = backbone(image)["feature_map"]
+                if getattr(self.config, "visual_encoder_mode", "resnet") == "dformerv2_s_stage3":
+                    depth = depths[camera_index]
+                    cam_features = backbone(image, depth)
+                else:
+                    cam_features = backbone(image)["feature_map"]
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = image_proj(cam_features)
                 cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
@@ -522,10 +657,14 @@ class ACMTACTPolicy(PreTrainedPolicy):
         return torch.zeros(batch_size, 2, 3, 35, 20, device=device, dtype=torch.float32)
 
     def _model_batch(self, window: Mapping[str, Tensor], *, include_target: bool = False) -> dict[str, Tensor]:
-        model_batch: dict[str, Tensor] = {OBS_STATE: window["state"], TACTILE: window["tactile"][:, -1]}
-        # The v3 policy supplies four streams and acmt_actv2 supplies the
-        # side plus two wrist streams.  Keep the batch adapter generic while
-        # preserving the serialized v3 module layout.
+        model_batch: dict[str, Tensor] = {
+            OBS_STATE: window["state"],
+            TACTILE: window["tactile"][:, -1],
+        }
+        # Keep the network generic over the configured camera count.  The
+        # ResNet contract and the DFormer-v2 contract both provide four
+        # streams; the latter additionally supplies one aligned depth map per
+        # stream.
         model_batch[OBS_IMAGES] = [
             window["rgb"][:, index] for index in range(len(self.config.image_features))
         ]
@@ -544,6 +683,8 @@ class ACMTACTPolicy(PreTrainedPolicy):
         """Record one current observation and maintain the ACMT causal ring."""
 
         required = [OBS_STATE, *self.config.image_features]
+        if getattr(self.config, "visual_encoder_mode", "resnet") == "dformerv2_s_stage3":
+            required.extend(depth_key(camera) for camera in self.config.camera_keys)
         missing = [key for key in required if key not in batch]
         if self.config.tactile_source == "real":
             missing.extend(key for key in (XENSE0, XENSE1) if key not in batch)
@@ -559,6 +700,9 @@ class ACMTACTPolicy(PreTrainedPolicy):
             raise ValueError("ACMT-ACT stateful inference requires a fixed batch size")
         self._observed_batch_size = batch_size
         rgb = torch.stack([batch[key].float() for key in self.config.image_features], dim=1)
+        depth = None
+        if getattr(self.config, "visual_encoder_mode", "resnet") == "dformerv2_s_stage3":
+            depth = torch.stack([batch[depth_key(camera)].float() for camera in self.config.camera_keys], dim=1)
         tactile = self._current_tactile(batch, batch_size, state.device)
         if not self._tactile_history:
             self._tactile_history.extend(tactile.clone() for _ in range(self.config.tactile_history))
@@ -578,6 +722,8 @@ class ACMTACTPolicy(PreTrainedPolicy):
             "state": state,
             "tactile": torch.stack(list(self._tactile_history), dim=1),
         }
+        if depth is not None:
+            window["depth"] = depth
         if self.config.tactile_source == "substitution":
             window.update({key: torch.stack(list(values), dim=1) for key, values in self._gen_history.items()})
         self._latest_window = window
@@ -612,6 +758,8 @@ class ACMTACTPolicy(PreTrainedPolicy):
         model_batch = dict(batch)
         if self.config.image_features:
             model_batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+        if getattr(self.config, "visual_encoder_mode", "resnet") == "dformerv2_s_stage3":
+            model_batch[OBS_DEPTH] = [batch[depth_key(camera)] for camera in self.config.camera_keys]
         if self.config.tactile_source == "real":
             if XENSE0 not in batch or XENSE1 not in batch:
                 raise KeyError("real ACMT-ACT training requires both Xense force fields")
@@ -728,4 +876,4 @@ class ACMTACTPolicy(PreTrainedPolicy):
         return action_chunk[..., :8, :]
 
 
-__all__ = ["ACMTACT", "ACMTACTileEncoder", "ACMTACTPolicy", "TACTILE"]
+__all__ = ["ACMTACT", "ACMTACTileEncoder", "ACMTACTPolicy", "DFormerSpatialBackbone", "OBS_DEPTH", "TACTILE"]

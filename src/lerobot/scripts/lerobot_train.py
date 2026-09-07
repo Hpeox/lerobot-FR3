@@ -19,6 +19,7 @@ Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wand
 """
 
 import dataclasses
+import json
 import logging
 import sys
 import time
@@ -84,6 +85,9 @@ def update_policy(
     lr_scheduler=None,
     lock=None,
     sample_weighter=None,
+    *,
+    optimizer_step: bool = True,
+    loss_scale: float = 1.0,
 ) -> tuple[MetricsTracker, dict | None]:
     """
     Performs a single training step to update the policy's weights.
@@ -144,29 +148,29 @@ def update_policy(
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
 
     # Use accelerator's backward method
-    accelerator.backward(loss)
+    accelerator.backward(loss * loss_scale)
 
-    # Clip gradients if specified
-    if grad_clip_norm > 0:
-        grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+    if optimizer_step:
+        # Clip and update only after all physical micro-batches contribute.
+        if grad_clip_norm > 0:
+            grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                policy.parameters(), float("inf"), error_if_nonfinite=False
+            )
+
+        with lock if lock is not None else nullcontext():
+            optimizer.step()
+        optimizer.zero_grad()
+
+        # Step through pytorch scheduler once per optimizer update.
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+
+        if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
+            accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
     else:
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            policy.parameters(), float("inf"), error_if_nonfinite=False
-        )
-
-    # Optimizer step
-    with lock if lock is not None else nullcontext():
-        optimizer.step()
-
-    optimizer.zero_grad()
-
-    # Step through pytorch scheduler at every batch instead of epoch
-    if lr_scheduler is not None:
-        lr_scheduler.step()
-
-    # Update internal buffers if policy has update method
-    if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
-        accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
+        grad_norm = torch.zeros((), device=loss.device)
 
     train_metrics.loss = loss.item()
     train_metrics.grad_norm = grad_norm.item()
@@ -570,6 +574,21 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         accelerator=accelerator,
     )
 
+    # Keep a real validation-selected checkpoint in addition to the resume
+    # pointer.  The ACMT-ACTv2 two-stage launcher resumes Stage-3 from this
+    # link, while ``last`` remains the newest optimizer state for interruption
+    # recovery.  The tiny JSON sidecar makes the selection survive a restart.
+    best_eval_loss = float("inf")
+    best_eval_step: int | None = None
+    best_eval_state = cfg.output_dir / "checkpoints" / "best_eval.json"
+    if best_eval_state.is_file():
+        try:
+            payload = json.loads(best_eval_state.read_text(encoding="utf-8"))
+            best_eval_loss = float(payload["eval_loss"])
+            best_eval_step = int(payload["step"])
+        except (OSError, KeyError, TypeError, ValueError):
+            logging.warning("Ignoring malformed validation-best metadata: %s", best_eval_state)
+
     if is_main_process:
         progbar = tqdm(
             total=cfg.steps - step,
@@ -579,29 +598,36 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             position=0,
             leave=True,
         )
+        effective_batch_size *= cfg.gradient_accumulation_steps
         logging.info(
-            f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
+            f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size} "
+            f"({cfg.batch_size} x {cfg.gradient_accumulation_steps} micro-batches)"
         )
 
     for _ in range(step, cfg.steps):
-        start_time = time.perf_counter()
-        batch = next(dl_iter)
-        for cam_key in dataset.meta.camera_keys:
-            if cam_key in batch and batch[cam_key].dtype == torch.uint8:
-                batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
-        batch = preprocessor(batch)
-        train_tracker.dataloading_s = time.perf_counter() - start_time
+        optimizer.zero_grad()
+        output_dict = None
+        for micro_step in range(cfg.gradient_accumulation_steps):
+            start_time = time.perf_counter()
+            batch = next(dl_iter)
+            for cam_key in dataset.meta.camera_keys:
+                if cam_key in batch and batch[cam_key].dtype == torch.uint8:
+                    batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
+            batch = preprocessor(batch)
+            train_tracker.dataloading_s = time.perf_counter() - start_time
 
-        train_tracker, output_dict = update_policy(
-            train_tracker,
-            policy,
-            batch,
-            optimizer,
-            cfg.optimizer.grad_clip_norm,
-            accelerator=accelerator,
-            lr_scheduler=lr_scheduler,
-            sample_weighter=sample_weighter,
-        )
+            train_tracker, output_dict = update_policy(
+                train_tracker,
+                policy,
+                batch,
+                optimizer,
+                cfg.optimizer.grad_clip_norm,
+                accelerator=accelerator,
+                lr_scheduler=lr_scheduler,
+                sample_weighter=sample_weighter,
+                optimizer_step=micro_step == cfg.gradient_accumulation_steps - 1,
+                loss_scale=1.0 / cfg.gradient_accumulation_steps,
+            )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
@@ -655,8 +681,16 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
             if is_main_process:
                 logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
+                if eval_loss < best_eval_loss:
+                    best_eval_loss = eval_loss
+                    best_eval_step = step
                 if wandb_logger:
                     wandb_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
+
+        # An eval point must be materialized even when a caller chooses a
+        # sparser save cadence; otherwise it cannot become the best model.
+        if is_eval_step:
+            is_saving_step = True
 
         if cfg.save_checkpoint and is_saving_step:
             # Under FSDP, gathering the full model + optimizer state dicts is a cross-rank collective,
@@ -685,6 +719,18 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     optim_state_dict=optim_state_dict,
                 )
                 update_last_checkpoint(checkpoint_dir)
+                if best_eval_step == step:
+                    best_link = checkpoint_dir.parent / "best"
+                    if best_link.exists() and not best_link.is_symlink():
+                        raise RuntimeError(f"cannot replace non-symlink validation-best path: {best_link}")
+                    if best_link.is_symlink():
+                        best_link.unlink()
+                    best_link.symlink_to(checkpoint_dir.name)
+                    best_eval_state.parent.mkdir(parents=True, exist_ok=True)
+                    best_eval_state.write_text(
+                        json.dumps({"step": step, "eval_loss": best_eval_loss}, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
                 if cfg.save_checkpoint_to_hub:
                     push_checkpoint_to_hub(
                         checkpoint_dir,

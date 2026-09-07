@@ -26,6 +26,8 @@ from numpy.lib.format import open_memmap
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 
+from .acmt_act_depth_memmap import ACMTActDepthMemmapStore
+
 
 MEMMAP_VERSION = "acmt_act_memmap_v1"
 TARGETS_VERSION = "acmt_act_targets_v1"
@@ -652,8 +654,9 @@ class ACMTActMemmapMetadata:
         selected_indices: list[int],
         repo_id: str,
         camera_indices: tuple[int, ...] | None = None,
+        depth_store: ACMTActDepthMemmapStore | None = None,
     ):
-        from lerobot.policies.acmt_act.configuration_acmt_act import XENSE0, XENSE1, rgb_key
+        from lerobot.policies.acmt_act.configuration_acmt_act import XENSE0, XENSE1, depth_key, rgb_key
 
         self.repo_id = repo_id
         self.root = store.root
@@ -661,21 +664,21 @@ class ACMTActMemmapMetadata:
         self.robot_type = "fr3"
         self.camera_indices = tuple(range(4) if camera_indices is None else camera_indices)
         if not self.camera_indices or any(index < 0 or index >= 4 for index in self.camera_indices):
-            raise ValueError(
-                "camera_indices must select distinct entries from the four-way memmap, "
-                f"got {self.camera_indices}"
-            )
+            raise ValueError(f"camera_indices must select distinct entries from the four-way memmap, got {self.camera_indices}")
         if len(set(self.camera_indices)) != len(self.camera_indices):
             raise ValueError(f"camera_indices must be distinct, got {self.camera_indices}")
         self.camera_keys = [rgb_key(f"camera.cam{index + 1}") for index in self.camera_indices]
-        self.depth_keys: list[str] = []
+        self.depth_store = depth_store
+        self.depth_keys = [depth_key(f"camera.cam{index + 1}") for index in self.camera_indices] if depth_store else []
         self.features = {
-            **{key: {"dtype": "image", "shape": [480, 640, 3], "names": ["height", "width", "channel"]} for key in self.camera_keys},
+            **{key: {"dtype": "image", "shape": [320, 580, 3], "names": ["height", "width", "channel"]} for key in self.camera_keys},
             "observation.state": {"dtype": "float32", "shape": [8], "names": [f"state_{i}" for i in range(8)]},
             XENSE0: {"dtype": "float32", "shape": [35, 20, 3], "names": ["height", "width", "channel"]},
             XENSE1: {"dtype": "float32", "shape": [35, 20, 3], "names": ["height", "width", "channel"]},
             "action": {"dtype": "float32", "shape": [8], "names": [*(f"joint_{i}" for i in range(7)), "gripper"]},
         }
+        for key in self.depth_keys:
+            self.features[key] = {"dtype": "float32", "shape": [1, 320, 580], "names": ["channel", "height", "width"]}
         raw_stats = _read_json(store.root / "stats.json") or {}
         corrected_stats = _read_json(store.root / "acmt_act_policy_stats.json") or {}
         if isinstance(corrected_stats, dict) and isinstance(corrected_stats.get("action"), dict):
@@ -727,6 +730,7 @@ class ACMTACTMemmapDataset(Dataset):
         repo_id: str = "local/acmt-act",
         episodes: list[int] | None = None,
         camera_indices: tuple[int, ...] | None = None,
+        depth_root: str | os.PathLike[str] | None = None,
     ):
         self.store = ACMTActMemmapStore(root)
         split_payload = _read_json(self.store.root / "splits.json")
@@ -743,7 +747,16 @@ class ACMTACTMemmapDataset(Dataset):
             raise ValueError(f"ACMT-ACT memmap split {split!r} is empty")
         self._selected_indices = selected_indices
         self.camera_indices = tuple(range(4) if camera_indices is None else camera_indices)
-        self.meta = ACMTActMemmapMetadata(self.store, selected_indices, repo_id, self.camera_indices)
+        self.depth_store = None
+        if depth_root is not None:
+            self.depth_store = ACMTActDepthMemmapStore(
+                depth_root,
+                expected_frames=len(self.store.rgb),
+                expected_episodes=len(self.store.episode_ends),
+            )
+        self.meta = ACMTActMemmapMetadata(
+            self.store, selected_indices, repo_id, self.camera_indices, depth_store=self.depth_store
+        )
         self.episodes = list(range(len(selected_indices)))
         self.num_frames = self.meta.total_frames
         self.num_episodes = self.meta.total_episodes
@@ -772,7 +785,7 @@ class ACMTACTMemmapDataset(Dataset):
         return local_ep, global_ep, global_start + offset, global_end
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        from lerobot.policies.acmt_act.configuration_acmt_act import XENSE0, XENSE1, rgb_key
+        from lerobot.policies.acmt_act.configuration_acmt_act import XENSE0, XENSE1, depth_key, rgb_key
 
         _, global_ep, global_index, global_end = self._locate(int(index))
         global_start, _ = self.store.bounds(global_ep)
@@ -808,6 +821,10 @@ class ACMTACTMemmapDataset(Dataset):
             result[rgb_key(f"camera.cam{camera_index + 1}")] = torch.from_numpy(
                 np.array(rgb[camera_index], copy=True)
             )
+            if self.depth_store is not None:
+                result[depth_key(f"camera.cam{camera_index + 1}")] = torch.from_numpy(
+                    np.array(self.depth_store.depth[global_index, camera_index], copy=True)
+                ).unsqueeze(0)
         return result
 
 

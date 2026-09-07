@@ -204,6 +204,7 @@ def build_rollout_context(
         "acmt_dp_v3",
         "acmt_dp_v5",
         "acmt_act",
+        "acmt_actv2",
     }:
         if cfg.fps != 30.0:
             raise ValueError("ACMT-DP/ACMT-ACT rollout requires fps=30")

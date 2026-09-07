@@ -222,9 +222,10 @@ class ACMTACTConfig(ACTConfig):
         if self.vision_backbone != "resnet50":
             raise ValueError("ACMT-ACT v3 requires vision_backbone=resnet50")
         if isinstance(self.pretrained_backbone_weights, str):
-            # Serialized torchvision enums may be represented by their short
-            # name (``IMAGENET1K_V2``), while a CLI can provide the fully
-            # qualified spelling.  Treat both forms as the same checkpoint.
+            # Draccus serializes torchvision enum values as their short name
+            # (``IMAGENET1K_V2``), while a CLI may provide the fully-qualified
+            # spelling (``ResNet50_Weights.IMAGENET1K_V2``).  Both represent
+            # the same checkpoint and must remain load-compatible.
             short_name = self.pretrained_backbone_weights.rsplit(".", 1)[-1]
             if not (
                 self.pretrained_backbone_weights.startswith("ResNet50_Weights.")
