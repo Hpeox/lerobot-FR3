@@ -33,7 +33,7 @@ from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.processor import PolicyProcessorPipeline
 
 from ..robot_wrapper import ThreadSafeRobot
-from .acmt_act import ACMTACTInferenceEngine
+from .acmt_act import ACMTACTInferenceEngine, ACMTACTV2InferenceEngine
 from .base import InferenceEngine
 from .acmt_dp import ACMTDPInferenceEngine
 from .rtc import RTCInferenceEngine
@@ -101,8 +101,19 @@ def create_inference_engine(
     """Instantiate the appropriate inference engine from a config object."""
     logger.info("Creating inference engine: %s", config.type)
     if isinstance(config, SyncInferenceConfig):
-        if getattr(policy, "name", None) in {"acmt_act", "acmt_actv2"}:
+        if getattr(policy, "name", None) == "acmt_act":
             return ACMTACTInferenceEngine(
+                policy=policy,
+                preprocessor=preprocessor,
+                postprocessor=postprocessor,
+                dataset_features=dataset_features,
+                ordered_action_keys=ordered_action_keys,
+                task=task,
+                device=device,
+                robot_type=robot_wrapper.robot_type,
+            )
+        if getattr(policy, "name", None) == "acmt_actv2":
+            return ACMTACTV2InferenceEngine(
                 policy=policy,
                 preprocessor=preprocessor,
                 postprocessor=postprocessor,

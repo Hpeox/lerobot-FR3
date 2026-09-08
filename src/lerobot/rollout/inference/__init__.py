@@ -18,7 +18,7 @@ Concrete backends (``sync``, ``rtc``, ...) expose the same small interface so
 rollout strategies never branch on which backend is in use.
 """
 
-from .acmt_act import ACMTACTInferenceEngine
+from .acmt_act import ACMTACTInferenceEngine, ACMTACTV2InferenceEngine
 from .acmt_dp import ACMTDPInferenceEngine
 from .base import InferenceEngine
 from .factory import (
@@ -34,6 +34,7 @@ __all__ = [
     "InferenceEngine",
     "ACMTDPInferenceEngine",
     "ACMTACTInferenceEngine",
+    "ACMTACTV2InferenceEngine",
     "InferenceEngineConfig",
     "RTCInferenceConfig",
     "RTCInferenceEngine",

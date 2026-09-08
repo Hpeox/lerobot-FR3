@@ -161,11 +161,22 @@ class SyncInferenceEngine(InferenceEngine):
         ``tactigen`` mode, so preserve that hook without changing other
         synchronous policies.
         """
-        if getattr(self._policy, "name", None) not in {"acmt_dp", "acmt_dp_v5"}:
+        policy_name = getattr(self._policy, "name", None)
+        if policy_name not in {"acmt_dp", "acmt_dp_v5", "acmt_actv2"}:
             return
         feedback = getattr(self._policy, "notify_action_executed", None)
         if callable(feedback):
-            feedback(action.to(self._device), observation)
+            action_for_policy = action.to(self._device)
+            if policy_name == "acmt_actv2" and action_for_policy.shape[-1] >= 8:
+                # The rollout callback receives the accepted FR3 action after
+                # ACMTDPGripperGPOProcessorStep has mapped physical gripper
+                # semantics to normalized gPO direction.  Convert that one
+                # scalar back before the policy hands it to ACMTv4.
+                from lerobot.policies.acmt_dp.gripper_mapping import fr3_pos_to_policy_gripper
+
+                action_for_policy = action_for_policy.clone()
+                action_for_policy[..., 7] = fr3_pos_to_policy_gripper(action_for_policy[..., 7])
+            feedback(action_for_policy, observation)
 
     def get_action(self, obs_frame: dict | None) -> torch.Tensor | None:
         """Run the full inference pipeline on ``obs_frame`` and return an action tensor."""

@@ -24,6 +24,8 @@ def main() -> None:
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--depth-root")
     parser.add_argument("--dformer-training-phase", choices=("frozen", "stage3"), default="frozen")
+    parser.add_argument("--dinov2-checkpoint")
+    parser.add_argument("--dinov2-pretrained", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--steps", type=int, default=20)
     args = parser.parse_args()
     if args.batch_size < 1 or args.gradient_accumulation_steps < 1:
@@ -48,7 +50,9 @@ def main() -> None:
         split="train",
         repo_id=f"local/acmt-act-{args.task}",
         camera_indices=camera_indices,
-        depth_root=args.depth_root if args.policy_type == "acmt_actv2" else None,
+        depth_root=None,
+        chunk_size=100 if args.policy_type == "acmt_actv2" else 16,
+        native_absolute_actions=args.policy_type == "acmt_actv2",
     )
     config_cls = ACMTACTConfig
     if args.policy_type == "acmt_actv2":
@@ -61,7 +65,11 @@ def main() -> None:
         "task_variant": args.task,
     }
     if args.policy_type == "acmt_actv2":
-        config_kwargs["dformer_training_phase"] = args.dformer_training_phase
+        config_kwargs.update(
+            dinov2_checkpoint=args.dinov2_checkpoint,
+            dinov2_pretrained=args.dinov2_pretrained,
+            require_dinov2_checkpoint=bool(args.dinov2_checkpoint),
+        )
     else:
         config_kwargs.update(
             vision_backbone="resnet50",
@@ -92,23 +100,38 @@ def main() -> None:
                 raise FloatingPointError(f"non-finite loss at preflight step {step}: {loss.item()}")
         scaler.step(optimizer)
         scaler.update()
-    for index, backbone in enumerate(policy.model.backbone):
-        trainable = [parameter for parameter in backbone.parameters() if parameter.requires_grad]
-        if args.dformer_training_phase == "stage3" and not any(
-            parameter.grad is not None and torch.isfinite(parameter.grad).all() for parameter in trainable
+    if args.policy_type == "acmt_actv2":
+        if any(parameter.grad is not None for parameter in policy.model.backbone.parameters()):
+            raise RuntimeError("frozen DINOv2 unexpectedly produced gradients")
+        if not any(
+            parameter.grad is not None and torch.isfinite(parameter.grad).all()
+            for parameter in policy.model.encoder_img_feat_input_proj.parameters()
         ):
-            raise RuntimeError(f"camera DFormer {index} Stage-3 produced no finite gradient")
-        if args.dformer_training_phase == "frozen" and any(parameter.grad is not None for parameter in backbone.parameters()):
-            raise RuntimeError(f"frozen camera DFormer {index} unexpectedly produced gradients")
-    for index, projection in enumerate(policy.model.encoder_img_feat_input_proj):
-        if not any(parameter.grad is not None and torch.isfinite(parameter.grad).all() for parameter in projection.parameters()):
-            raise RuntimeError(f"camera projection {index} produced no finite gradient")
+            raise RuntimeError("DINOv2 projection produced no finite gradient")
+        if not any(
+            parameter.grad is not None and torch.isfinite(parameter.grad).all()
+            for parameter in policy.model.camera_embedding.parameters()
+        ):
+            raise RuntimeError("DINOv2 camera embedding produced no finite gradient")
+    else:
+        for index, backbone in enumerate(policy.model.backbone):
+            trainable = [parameter for parameter in backbone.parameters() if parameter.requires_grad]
+            if args.dformer_training_phase == "stage3" and not any(
+                parameter.grad is not None and torch.isfinite(parameter.grad).all() for parameter in trainable
+            ):
+                raise RuntimeError(f"camera DFormer {index} Stage-3 produced no finite gradient")
+            if args.dformer_training_phase == "frozen" and any(parameter.grad is not None for parameter in backbone.parameters()):
+                raise RuntimeError(f"frozen camera DFormer {index} unexpectedly produced gradients")
+        for index, projection in enumerate(policy.model.encoder_img_feat_input_proj):
+            if not any(parameter.grad is not None and torch.isfinite(parameter.grad).all() for parameter in projection.parameters()):
+                raise RuntimeError(f"camera projection {index} produced no finite gradient")
     peak = torch.cuda.max_memory_allocated(device) / (1024**3) if device.type == "cuda" else 0.0
     print(
         f"PREFLIGHT PASS task={args.task} tactile_source={args.tactile_source} "
         f"physical_batch_size={args.batch_size} accumulation={args.gradient_accumulation_steps} "
         f"effective_batch_size={args.batch_size * args.gradient_accumulation_steps} "
-        f"dformer_phase={args.dformer_training_phase} steps={args.steps} peak_memory_gib={peak:.2f}"
+        f"vision={'dinov2_frozen' if args.policy_type == 'acmt_actv2' else f'dformer_{args.dformer_training_phase}'} "
+        f"steps={args.steps} peak_memory_gib={peak:.2f}"
     )
 
 

@@ -655,6 +655,7 @@ class ACMTActMemmapMetadata:
         repo_id: str,
         camera_indices: tuple[int, ...] | None = None,
         depth_store: ACMTActDepthMemmapStore | None = None,
+        native_absolute_actions: bool = False,
     ):
         from lerobot.policies.acmt_act.configuration_acmt_act import XENSE0, XENSE1, depth_key, rgb_key
 
@@ -669,6 +670,7 @@ class ACMTActMemmapMetadata:
             raise ValueError(f"camera_indices must be distinct, got {self.camera_indices}")
         self.camera_keys = [rgb_key(f"camera.cam{index + 1}") for index in self.camera_indices]
         self.depth_store = depth_store
+        self.native_absolute_actions = bool(native_absolute_actions)
         self.depth_keys = [depth_key(f"camera.cam{index + 1}") for index in self.camera_indices] if depth_store else []
         self.features = {
             **{key: {"dtype": "image", "shape": [320, 580, 3], "names": ["height", "width", "channel"]} for key in self.camera_keys},
@@ -681,7 +683,32 @@ class ACMTActMemmapMetadata:
             self.features[key] = {"dtype": "float32", "shape": [1, 320, 580], "names": ["channel", "height", "width"]}
         raw_stats = _read_json(store.root / "stats.json") or {}
         corrected_stats = _read_json(store.root / "acmt_act_policy_stats.json") or {}
-        if isinstance(corrected_stats, dict) and isinstance(corrected_stats.get("action"), dict):
+        if self.native_absolute_actions:
+            # ``action.npy`` stores the historical Gello wire convention for
+            # the final channel (1=open, 0=closed), while the native ACT
+            # contract exposes physical semantics (0=open, 1=closed).  The
+            # dataset flips each sample in __getitem__; mirror that operation
+            # in the statistics so normalization and deployment unnormalizing
+            # are exact inverses.  Joint channels remain absolute values.
+            raw_stats = dict(raw_stats)
+            action_stats = raw_stats.get("action")
+            if isinstance(action_stats, dict):
+                action_stats = dict(action_stats)
+                for key in ("mean", "min", "max"):
+                    values = action_stats.get(key)
+                    if isinstance(values, list) and len(values) >= 8:
+                        values = list(values)
+                        if key == "mean":
+                            values[7] = 1.0 - float(values[7])
+                        elif key == "min":
+                            old_max = float(values[7])
+                            values[7] = 1.0 - old_max
+                        else:
+                            old_min = float(values[7])
+                            values[7] = 1.0 - old_min
+                        action_stats[key] = values
+                raw_stats["action"] = action_stats
+        elif isinstance(corrected_stats, dict) and isinstance(corrected_stats.get("action"), dict):
             raw_stats = dict(raw_stats)
             raw_stats["action"] = corrected_stats["action"]
             if isinstance(corrected_stats.get("goal"), dict):
@@ -731,7 +758,11 @@ class ACMTACTMemmapDataset(Dataset):
         episodes: list[int] | None = None,
         camera_indices: tuple[int, ...] | None = None,
         depth_root: str | os.PathLike[str] | None = None,
+        chunk_size: int = 16,
+        native_absolute_actions: bool = False,
     ):
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
         self.store = ACMTActMemmapStore(root)
         split_payload = _read_json(self.store.root / "splits.json")
         names = _read_json(self.store.root / "episode_names.json")
@@ -747,6 +778,8 @@ class ACMTACTMemmapDataset(Dataset):
             raise ValueError(f"ACMT-ACT memmap split {split!r} is empty")
         self._selected_indices = selected_indices
         self.camera_indices = tuple(range(4) if camera_indices is None else camera_indices)
+        self.chunk_size = int(chunk_size)
+        self.native_absolute_actions = bool(native_absolute_actions)
         self.depth_store = None
         if depth_root is not None:
             self.depth_store = ACMTActDepthMemmapStore(
@@ -755,7 +788,12 @@ class ACMTACTMemmapDataset(Dataset):
                 expected_episodes=len(self.store.episode_ends),
             )
         self.meta = ACMTActMemmapMetadata(
-            self.store, selected_indices, repo_id, self.camera_indices, depth_store=self.depth_store
+            self.store,
+            selected_indices,
+            repo_id,
+            self.camera_indices,
+            depth_store=self.depth_store,
+            native_absolute_actions=self.native_absolute_actions,
         )
         self.episodes = list(range(len(selected_indices)))
         self.num_frames = self.meta.total_frames
@@ -789,10 +827,12 @@ class ACMTACTMemmapDataset(Dataset):
 
         _, global_ep, global_index, global_end = self._locate(int(index))
         global_start, _ = self.store.bounds(global_ep)
-        # The public action target is A[t:t+15].  At an episode tail, repeat
+        # The public action target is A[t:t+chunk_size-1].  At an episode tail, repeat
         # the last recorded action and mark those positions as padding.
-        offsets = np.minimum(np.arange(16, dtype=np.int64) + global_index, global_end - 1)
-        pad = (np.arange(16, dtype=np.int64) + global_index) >= global_end
+        horizon = self.chunk_size
+        relative_offsets = np.arange(horizon, dtype=np.int64)
+        offsets = np.minimum(relative_offsets + global_index, global_end - 1)
+        pad = (relative_offsets + global_index) >= global_end
         rgb = self.store.rgb[global_index]
         result: dict[str, torch.Tensor] = {
             # Memmaps are read-only by design.  Materialize each sample before

@@ -16,19 +16,19 @@ from lerobot.processor import PolicyAction
 from lerobot.processor.pipeline import PolicyActionProcessorStep, ProcessorStepRegistry
 
 
-# Robotiq reports the usable deployed gPO interval as 3..255. ACMT-DP
-# training actions use opening percentage semantics: 0.0 is closed and 1.0
-# is open. FR3's existing policy converter consumes normalized gPO instead.
+# Robotiq reports the usable deployed gPO interval as 3..255. Native
+# ACMT-ACT actions use physical semantics: 0.0 is open and 1.0 is closed.
+# FR3's existing policy converter consumes normalized gPO instead.
 GRIPPER_GPO_MIN = 3.0
 GRIPPER_GPO_MAX = 255.0
 
 
 def policy_gripper_to_fr3_pos(value: Tensor) -> Tensor:
-    """Map an ACMT-DP opening action to FR3's normalized gPO direction.
+    """Map a physical ACMT action to FR3's normalized gPO direction.
 
     The input is clamped to the model's declared ``[0, 1]`` action interval.
     The returned value is normalized so the unchanged FR3 converter emits
-    ``gPO=255`` at input 0 and ``gPO=3`` at input 1.
+    ``gPO=255`` (open) at input 0 and ``gPO=3`` (closed) at input 1.
     """
 
     if not isinstance(value, torch.Tensor):

@@ -17,7 +17,7 @@ from lerobot.rollout.inference.acmt_dp import (
     ActionPlan,
     TimedActionQueue,
 )
-from lerobot.rollout.inference.acmt_act import ACMTACTInferenceEngine
+from lerobot.rollout.inference.acmt_act import ACMTACTInferenceEngine, ACMTACTV2InferenceEngine
 from lerobot.rollout.inference.factory import RTCInferenceConfig, SyncInferenceConfig, create_inference_engine
 from lerobot.rollout.strategies.core import send_next_action
 from lerobot.processor.relative_action_processor import AbsoluteActionsProcessorStep, RelativeActionsProcessorStep
@@ -186,17 +186,19 @@ def test_factory_routes_acmt_act_v3_to_rolling_engine() -> None:
     engine.stop()
 
 
-def test_factory_routes_acmt_actv2_dformer_to_rolling_engine() -> None:
+def test_factory_routes_acmt_actv2_native_to_sync_engine() -> None:
     policy = SimpleNamespace(
         name="acmt_actv2",
         config=SimpleNamespace(
             control_hz=CONTROL_HZ,
-            action_execution_horizon=EXECUTION_HORIZON,
+            action_execution_horizon=1,
             tactile_history=4,
-            pred_horizon=PREDICTION_HORIZON,
+            pred_horizon=100,
             action_dim=ACTION_DIM,
-            checkpoint_schema="acmt_actv2.dformerv2_spatial.v1",
-            checkpoint_schema_version=2,
+            chunk_size=100,
+            n_action_steps=1,
+            checkpoint_schema="acmt_actv2.dinov2_spatial.v1",
+            checkpoint_schema_version=3,
             tactile_source="none",
         ),
     )
@@ -213,25 +215,27 @@ def test_factory_routes_acmt_actv2_dformer_to_rolling_engine() -> None:
         fps=CONTROL_HZ,
         device="cpu",
     )
-    assert isinstance(engine, ACMTACTInferenceEngine)
+    assert isinstance(engine, ACMTACTV2InferenceEngine)
     engine.stop()
 
 
-def test_acmt_actv2_rolling_engine_rejects_other_schema() -> None:
+def test_acmt_actv2_native_engine_rejects_other_schema() -> None:
     policy = SimpleNamespace(
         name="acmt_actv2",
         config=SimpleNamespace(
             control_hz=CONTROL_HZ,
-            action_execution_horizon=EXECUTION_HORIZON,
+            action_execution_horizon=1,
             tactile_history=4,
-            pred_horizon=PREDICTION_HORIZON,
+            pred_horizon=100,
             action_dim=ACTION_DIM,
-            checkpoint_schema="acmt_actv2.v1",
-            checkpoint_schema_version=1,
+            chunk_size=100,
+            n_action_steps=1,
+            checkpoint_schema="acmt_actv2.dformerv2_spatial.v1",
+            checkpoint_schema_version=2,
             tactile_source="none",
         ),
     )
-    with pytest.raises(ValueError, match="acmt_actv2.dformerv2_spatial.v1"):
+    with pytest.raises(ValueError, match="DINOv2 spatial"):
         create_inference_engine(
             SyncInferenceConfig(),
             policy=policy,

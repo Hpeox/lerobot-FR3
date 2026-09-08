@@ -167,6 +167,11 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
     source_camera_keys: tuple[str, ...] = DEFAULT_SOURCE_CAMERA_KEYS
     tactile_source: str = "none"
     use_depth: bool = False
+    # Native ACMT-ACTv2 preprocessing: after the fixed 320x580 camera crop,
+    # pad top/bottom with the ImageNet mean and take the horizontal center
+    # crop, yielding the exact 336x448 DINOv2 input.  No interpolation is
+    # performed in either training or deployment.
+    dinov2_spatial: bool = False
     image_mean: tuple[float, float, float] = _IMAGENET_MEAN
     image_std: tuple[float, float, float] = _IMAGENET_STD
 
@@ -190,6 +195,7 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
             "crop_params": {key: list(value) for key, value in self.crop_params.items()},
             "tactile_source": self.tactile_source,
             "use_depth": self.use_depth,
+            "dinov2_spatial": self.dinov2_spatial,
             "image_mean": list(self.image_mean),
             "image_std": list(self.image_std),
         }
@@ -218,6 +224,22 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
                 # exact crop.  Deployment still supplies the raw 480x640
                 # frame and takes the branch above.
                 cropped = raw
+            if self.dinov2_spatial:
+                if tuple(cropped.shape[-2:]) != (320, 580):
+                    raise ValueError(
+                        f"DINOv2 preprocessing requires a 320x580 crop before padding, got {tuple(cropped.shape[-2:])}"
+                    )
+                # F.pad only accepts one scalar constant.  Constructing the
+                # two bands explicitly preserves each channel's ImageNet mean
+                # exactly, and keeps the operation bitwise identical for H5,
+                # Memmap and live-camera inputs.
+                batch_size, _, _, width = cropped.shape
+                mean_color = cropped.new_tensor(self.image_mean).view(1, 3, 1, 1)
+                pad_band = mean_color.expand(batch_size, -1, 8, width)
+                cropped = torch.cat((pad_band, cropped, pad_band), dim=-2)
+                cropped = cropped[..., :, 66:514]
+                if tuple(cropped.shape[-2:]) != (336, 448):
+                    raise RuntimeError("DINOv2 preprocessing produced an unexpected 336x448 shape")
             mean = cropped.new_tensor(self.image_mean).view(1, 3, 1, 1)
             std = cropped.new_tensor(self.image_std).view(1, 3, 1, 1)
             result[target_key] = (cropped - mean) / std
@@ -311,10 +333,12 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
         transformed = {kind: dict(bucket) for kind, bucket in features.items()}
         observations = transformed.setdefault(PipelineFeatureType.OBSERVATION, {})
+        output_shape = (3, 336, 448) if self.dinov2_spatial else (3, 320, 580)
+        depth_shape = (1, 320, 580)
         for camera, name in zip(self.camera_keys, self.camera_names, strict=True):
-            observations[rgb_key(camera)] = PolicyFeature(type=FeatureType.VISUAL, shape=(3, 320, 580))
+            observations[rgb_key(camera)] = PolicyFeature(type=FeatureType.VISUAL, shape=output_shape)
             if self.use_depth:
-                observations[depth_key(camera)] = PolicyFeature(type=FeatureType.STATE, shape=(1, 320, 580))
+                observations[depth_key(camera)] = PolicyFeature(type=FeatureType.STATE, shape=depth_shape)
         observations[XENSE0] = PolicyFeature(type=FeatureType.STATE, shape=(3, 35, 20))
         observations[XENSE1] = PolicyFeature(type=FeatureType.STATE, shape=(3, 35, 20))
         return transformed
@@ -329,26 +353,36 @@ def make_acmt_act_pre_post_processors(
         raise ValueError("ACMT-ACT config features must be initialized before building processors")
     normalize_keys = set(config.image_features) | {"observation.state"}
     features = {**config.input_features, **config.output_features}
-    relative_step = RelativeActionsProcessorStep(
-        enabled=True,
-        exclude_joints=["gripper"],
-        action_names=list(config.action_feature_names),
+    use_relative_actions = bool(getattr(config, "use_relative_actions", True))
+    relative_step = (
+        RelativeActionsProcessorStep(
+            enabled=True,
+            exclude_joints=["gripper"],
+            action_names=list(config.action_feature_names),
+        )
+        if use_relative_actions
+        else None
     )
-    preprocessor = PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
-        steps=[
-            RenameObservationsProcessorStep(rename_map={}),
-            AddBatchDimensionProcessorStep(),
-            ACMTACTObservationProcessorStep(
-                camera_keys=config.camera_keys,
-                camera_names=config.camera_names,
-                crop_params=config.crop_params,
-                source_camera_keys=config.source_camera_keys,
-                tactile_source=config.tactile_source,
-                use_depth=getattr(config, "use_dformer_depth", False),
-                image_mean=config.image_mean,
-                image_std=config.image_std,
-            ),
-            relative_step,
+    observation_step = ACMTACTObservationProcessorStep(
+        camera_keys=config.camera_keys,
+        camera_names=config.camera_names,
+        crop_params=config.crop_params,
+        source_camera_keys=config.source_camera_keys,
+        tactile_source=config.tactile_source,
+        use_depth=getattr(config, "use_dformer_depth", False),
+        dinov2_spatial=bool(getattr(config, "dinov2_spatial_preprocess", False)),
+        image_mean=config.image_mean,
+        image_std=config.image_std,
+    )
+    pre_steps = [
+        RenameObservationsProcessorStep(rename_map={}),
+        AddBatchDimensionProcessorStep(),
+        observation_step,
+    ]
+    if relative_step is not None:
+        pre_steps.append(relative_step)
+    pre_steps.extend(
+        [
             DeviceProcessorStep(device=config.device),
             NormalizerProcessorStep(
                 features=features,
@@ -357,20 +391,24 @@ def make_acmt_act_pre_post_processors(
                 device=config.device,
                 normalize_observation_keys=normalize_keys,
             ),
-        ],
+        ]
+    )
+    preprocessor = PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
+        steps=pre_steps,
         name=POLICY_PREPROCESSOR_DEFAULT_NAME,
     )
+    post_steps = [
+        UnnormalizerProcessorStep(
+            features=config.output_features,
+            norm_map=config.normalization_mapping,
+            stats=dataset_stats,
+        )
+    ]
+    if relative_step is not None:
+        post_steps.append(AbsoluteActionsProcessorStep(enabled=True, relative_step=relative_step))
+    post_steps.extend([DeviceProcessorStep(device="cpu"), ACMTDPGripperGPOProcessorStep()])
     postprocessor = PolicyProcessorPipeline[PolicyAction, PolicyAction](
-        steps=[
-            UnnormalizerProcessorStep(
-                features=config.output_features,
-                norm_map=config.normalization_mapping,
-                stats=dataset_stats,
-            ),
-            AbsoluteActionsProcessorStep(enabled=True, relative_step=relative_step),
-            DeviceProcessorStep(device="cpu"),
-            ACMTDPGripperGPOProcessorStep(),
-        ],
+        steps=post_steps,
         name=POLICY_POSTPROCESSOR_DEFAULT_NAME,
         to_transition=policy_action_to_transition,
         to_output=transition_to_policy_action,

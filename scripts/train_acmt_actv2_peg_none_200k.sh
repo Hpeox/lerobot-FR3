@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ACMT-ACTv2: side + two wrist cameras, three independent ResNet50 backbones.
-# The four-way source memmap is reused, but the v2 dataset view reads only
-# camera indices 1, 2 and 3 (camera.cam2/3/4); top is never placed in a batch.
+# ACMT-ACTv2 native ACT: four RGB cameras, one frozen DINOv2-S/14 backbone,
+# 100-action prediction and native one-step temporal ensembling at deployment.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON="${PYTHON:-${REPO_ROOT}/.venv/bin/python}"
 export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 export PYTHONUNBUFFERED=1
 MEMMAP="${MEMMAP:-/data2/cym/acmt_act_memmap_v1/16mm-peg-in-hole}"
-OUTPUT="${OUTPUT:-/data2/cym/16mm_peg_in_hole/acmt_actv2/none/independent_resnet50/seed42}"
-LOG_ROOT="${LOG_ROOT:-/data2/cym/acmt_actv2_logs/independent_resnet50_200k}"
+OUTPUT="${OUTPUT:-/data2/cym/16mm_peg_in_hole/acmt_actv2/none/dinov2_spatial/seed42}"
+LOG_ROOT="${LOG_ROOT:-/data2/cym/acmt_actv2_logs/dinov2_spatial_200k}"
+DINO_CHECKPOINT="${DINO_CHECKPOINT:-}"
 STEPS="${STEPS:-200000}"
 mkdir -p "${LOG_ROOT}"
 
@@ -31,14 +31,20 @@ PREFLIGHT_DIR="${LOG_ROOT}/preflight/peg_none"
 mkdir -p "${PREFLIGHT_DIR}"
 if [[ ! -f "${PREFLIGHT_DIR}/preflight.ok" ]]; then
   echo "[PREFLIGHT] acmt_actv2 peg/none" | tee -a "${LOG_ROOT}/all_train.log"
+  PREFLIGHT_DINO_ARGS=()
+  if [[ -n "${DINO_CHECKPOINT}" ]]; then
+    PREFLIGHT_DINO_ARGS+=(--dinov2-checkpoint "${DINO_CHECKPOINT}" --dinov2-pretrained=false)
+  fi
   "${PYTHON}" -u -m lerobot.scripts.acmt_act_preflight \
     --memmap-dir="${MEMMAP}" \
     --tactile-source=none \
     --task=peg \
     --policy-type=acmt_actv2 \
     --device=cuda \
-    --batch-size=16 \
+    --batch-size=8 \
+    --gradient-accumulation-steps=2 \
     --steps=20 \
+    "${PREFLIGHT_DINO_ARGS[@]}" \
     >"${PREFLIGHT_DIR}/preflight.log" 2>&1
   touch "${PREFLIGHT_DIR}/preflight.ok"
 fi
@@ -68,16 +74,28 @@ if [[ "${STEP}" -gt 0 ]]; then
 fi
 
 TRAIN_LOG="${LOG_ROOT}/peg_none.log"
+POLICY_DINO_ARGS=(--policy.dinov2_pretrained=true)
+if [[ -n "${DINO_CHECKPOINT}" ]]; then
+  POLICY_DINO_ARGS+=(--policy.dinov2_checkpoint="${DINO_CHECKPOINT}" --policy.require_dinov2_checkpoint=true)
+fi
 echo "[START] acmt_actv2 peg/none from step ${STEP}" | tee -a "${LOG_ROOT}/all_train.log"
 "${PYTHON}" -u -m lerobot.scripts.lerobot_train \
   --policy.type=acmt_actv2 \
   --policy.tactile_source=none \
   --policy.task_variant=peg \
-  --policy.checkpoint_schema=acmt_actv2.v1 \
-  --policy.checkpoint_schema_version=1 \
-  --policy.camera_backbone_mode=independent \
-  --policy.vision_backbone=resnet50 \
-  --policy.pretrained_backbone_weights=ResNet50_Weights.IMAGENET1K_V2 \
+  --policy.checkpoint_schema=acmt_actv2.dinov2_spatial.v1 \
+  --policy.checkpoint_schema_version=3 \
+  --policy.training_contract=native_absolute_physical_gripper_v1 \
+  --policy.visual_encoder_mode=dinov2_spatial \
+  --policy.camera_backbone_mode=shared \
+  --policy.vision_backbone=dinov2_vits14 \
+  --policy.chunk_size=100 \
+  --policy.pred_horizon=100 \
+  --policy.n_action_steps=1 \
+  --policy.action_execution_horizon=1 \
+  --policy.temporal_ensemble_coeff=0.01 \
+  --policy.optimizer_lr=1e-5 \
+  --policy.optimizer_lr_visual_projection=1e-4 \
   --policy.device=cuda \
   --policy.dtype=float16 \
   --policy.use_amp=true \
@@ -87,7 +105,8 @@ echo "[START] acmt_actv2 peg/none from step ${STEP}" | tee -a "${LOG_ROOT}/all_t
   --dataset.root="${MEMMAP}" \
   --dataset.split_file="${MEMMAP}/splits.json" \
   --dataset.eval_split=0.05 \
-  --batch_size=16 \
+  --batch_size=8 \
+  --gradient_accumulation_steps=2 \
   --steps="${STEPS}" \
   --eval_steps=20000 \
   --save_freq=20000 \
@@ -99,6 +118,7 @@ echo "[START] acmt_actv2 peg/none from step ${STEP}" | tee -a "${LOG_ROOT}/all_t
   --seed=42 \
   --output_dir="${OUTPUT}" \
   --wandb.enable=false \
+  "${POLICY_DINO_ARGS[@]}" \
   "${RESUME_ARGS[@]}" \
   >"${TRAIN_LOG}" 2>&1
 

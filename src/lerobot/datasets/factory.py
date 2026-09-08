@@ -55,15 +55,20 @@ def _make_acmt_act_memmap_dataset(cfg: TrainPipelineConfig, split: str):
     canonical = Path(root).resolve() / "splits.json"
     if split_file.resolve() != canonical:
         raise ValueError(f"backend='acmt_act_memmap' requires split_file={canonical}")
-    # All ACMT-ACTv2 DFormer branches consume the four-way RGB-D ABI.  Older
-    # acmt_act keeps its original RGB-only path.
+    # Native ACMT-ACTv2 consumes the existing four-way RGB Memmap.  Depth is
+    # private to the optional substitution generator and is never part of the
+    # DINO/ACT observation.  The legacy acmt_act path keeps its original RGB
+    # behavior as well.
     camera_indices = None
+    is_native_v2 = getattr(cfg.policy, "type", None) == "acmt_actv2"
     return ACMTACTMemmapDataset(
         root,
         split=split,
         repo_id=str(cfg.dataset.repo_id),
         camera_indices=camera_indices,
-        depth_root=cfg.dataset.depth_root if getattr(cfg.policy, "type", None) == "acmt_actv2" else None,
+        depth_root=None,
+        chunk_size=int(getattr(cfg.policy, "chunk_size", 16)),
+        native_absolute_actions=is_native_v2,
     )
 
 

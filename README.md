@@ -130,16 +130,37 @@ validation is evaluated every 20,000 steps; after each completed run the launche
 creates `checkpoints/best` pointing to the lowest validation-loss checkpoint while
 leaving `checkpoints/last` as the resume pointer.
 
-The current `--policy.type=acmt_actv2` experiment uses all four RGB-D streams
-(`top`, `side`, `wrist_left`, `wrist_right`).  Each stream owns an independent
-pretrained DFormerv2-S Stage-3 encoder; its `20x37` map is projected to ACT
-tokens without global pooling.  The RGB Memmap remains unchanged and the
-training-only depth sidecar is produced by
-`scripts/convert_acmt_act_depth_peg.sh`.  The DFormer spatial schema is
-incompatible with the old ResNet50 `acmt_actv2.v1` checkpoints.  The
-two-stage Peg-none launcher uses frozen DFormer training first and a 20k-step
-Stage-3 fine-tune second; deployment consumes live RGB-D and never reads either
-Memmap.
+The current `--policy.type=acmt_actv2` contract is the native ACT experiment:
+four RGB streams (`top`, `side`, `wrist_left`, `wrist_right`) are passed through
+one shared, frozen DINOv2-S/14.  The existing 320x580 crop is padded by 8
+pixels vertically and center-cropped to 336x448 (no resize), producing 24x32
+patch tokens; CLS is discarded and all 768 spatial tokens from each camera are
+projected to the ACT transformer with camera embeddings.  The model predicts
+100 absolute 8D actions (seven joint targets plus physical gripper
+`0=open, 1=closed`) and uses LeRobot's native temporal ensembler to send
+one action every control tick.  `none` and `real` keep the identical tactile
+token path, while `substitution` loads the real checkpoint and supplies causal
+ACMT force fields outside the policy.  This schema is incompatible with the
+old ResNet50 and DFormerv2 v2 checkpoints.  The existing RGB Memmap is reused;
+the DINO pretraining file can be prepared once with
+`lerobot-acmt-actv2-download-dinov2`, but a saved policy embeds the complete
+backbone and deployment does not read the training file or access the network.
+The Peg-none 200k training launcher is
+`scripts/train_acmt_actv2_peg_none_200k.sh`; it runs the 8×2 preflight,
+reuses the RGB Memmap, and selects `checkpoints/best` from validation without
+changing the physical batch or silently falling back to the old 16/8 contract.
+Before a real-robot run, benchmark a saved checkpoint on the target GPU:
+
+```bash
+lerobot-acmt-actv2-benchmark \
+  --policy /path/to/checkpoints/020000/pretrained_model \
+  --device cuda --iterations 100 --warmup 20 \
+  --output /tmp/acmt_actv2_benchmark.json
+```
+
+The report separates preprocessing, shared DINO, ACT 100-step forward,
+temporal ensembling, postprocessing and (when configured) substitution ACMT
+generation, with P50/P95/P99 latency and the corresponding theoretical Hz.
 
 | Category                   | Models                                                                                                                                                                                                                                                                                                                                                                                     |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
