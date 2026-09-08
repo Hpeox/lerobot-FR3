@@ -450,7 +450,7 @@ def build_rollout_context(
 
     if (
         isinstance(cfg.inference, SyncInferenceConfig)
-        and getattr(policy, "name", None) != "acmt_act"
+        and getattr(policy, "name", None) not in {"acmt_act", "acmt_actv2"}
         and any(
             isinstance(step, RelativeActionsProcessorStep) and step.enabled
             for step in getattr(preprocessor, "steps", ())

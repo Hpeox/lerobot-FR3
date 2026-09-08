@@ -36,6 +36,7 @@ class ACMTACTV2Policy(ACMTACTPolicy):
     @classmethod
     def from_pretrained(cls, pretrained_name_or_path, *, config=None, **kwargs: Any):
         config_path = Path(pretrained_name_or_path) / "config.json"
+        raw: dict[str, Any] | None = None
         if config_path.is_file():
             raw = json.loads(config_path.read_text(encoding="utf-8"))
             if raw.get("type") != "acmt_actv2":
@@ -49,14 +50,22 @@ class ACMTACTV2Policy(ACMTACTPolicy):
         if config is None:
             # The serialized checkpoint contains the complete DFormer weights;
             # the original external pretraining file is not a deployment
-            # dependency.  Ask the config parser to allow its absence while
-            # retaining the hash as provenance metadata.
-            config = ACMTACTV2Config.from_pretrained(
-                pretrained_name_or_path,
-                cli_overrides=["--require_dformer_checkpoint=false"],
-                **kwargs,
-            )
+            # dependency.  Local artifacts need to bypass the first generic
+            # config parse because that parse validates the training-only
+            # DFormer path before CLI overrides are applied.
+            if raw is not None:
+                config_payload = dict(raw)
+                config_payload.pop("type", None)
+                config_payload["require_dformer_checkpoint"] = False
+                config = ACMTACTV2Config(**config_payload)
+            else:
+                config = ACMTACTV2Config.from_pretrained(
+                    pretrained_name_or_path,
+                    cli_overrides=["--require_dformer_checkpoint=false"],
+                )
         else:
+            if not isinstance(config, ACMTACTV2Config):
+                raise TypeError("ACMT-ACTv2 loader requires ACMTACTV2Config")
             config.require_dformer_checkpoint = False
         return PreTrainedPolicy.from_pretrained.__func__(cls, pretrained_name_or_path, config=config, **kwargs)
 

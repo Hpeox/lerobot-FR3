@@ -301,6 +301,13 @@ class ACMTDPInferenceEngine(InferenceEngine):
                 ("acmt_act.v3", 3),
             }:
                 raise ValueError("ACMT-ACT rollout requires checkpoint schema acmt_act.v2 or acmt_act.v3")
+        elif policy_name == "acmt_actv2":
+            checkpoint_schema = getattr(config, "checkpoint_schema", None)
+            if (checkpoint_schema, schema_version) != ("acmt_actv2.dformerv2_spatial.v1", 2):
+                raise ValueError(
+                    "ACMT-ACTv2 rollout requires checkpoint schema "
+                    "acmt_actv2.dformerv2_spatial.v1"
+                )
         elif schema_version not in (3, 4, 5):
             raise ValueError("ACMT-DP rollout requires checkpoint_schema_version=3, 4 or 5")
         if getattr(config, "tactile_source", None) in {"tactigen", "substitution"}:

@@ -101,7 +101,7 @@ def create_inference_engine(
     """Instantiate the appropriate inference engine from a config object."""
     logger.info("Creating inference engine: %s", config.type)
     if isinstance(config, SyncInferenceConfig):
-        if getattr(policy, "name", None) == "acmt_act":
+        if getattr(policy, "name", None) in {"acmt_act", "acmt_actv2"}:
             return ACMTACTInferenceEngine(
                 policy=policy,
                 preprocessor=preprocessor,
@@ -138,7 +138,7 @@ def create_inference_engine(
             robot_type=robot_wrapper.robot_type,
         )
     if isinstance(config, RTCInferenceConfig):
-        if getattr(policy, "name", None) in {"acmt_dp", "acmt_dp_v5", "acmt_act"}:
+        if getattr(policy, "name", None) in {"acmt_dp", "acmt_dp_v5", "acmt_act", "acmt_actv2"}:
             raise ValueError("ACMT-DP/ACMT-ACT supports only --inference.type=sync; RTC is unsupported")
         return RTCInferenceEngine(
             policy=policy,

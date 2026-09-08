@@ -18,7 +18,7 @@ from lerobot.rollout.inference.acmt_dp import (
     TimedActionQueue,
 )
 from lerobot.rollout.inference.acmt_act import ACMTACTInferenceEngine
-from lerobot.rollout.inference.factory import SyncInferenceConfig, create_inference_engine
+from lerobot.rollout.inference.factory import RTCInferenceConfig, SyncInferenceConfig, create_inference_engine
 from lerobot.rollout.strategies.core import send_next_action
 from lerobot.processor.relative_action_processor import AbsoluteActionsProcessorStep, RelativeActionsProcessorStep
 from lerobot.utils.action_interpolator import ActionInterpolator
@@ -184,6 +184,85 @@ def test_factory_routes_acmt_act_v3_to_rolling_engine() -> None:
     )
     assert isinstance(engine, ACMTACTInferenceEngine)
     engine.stop()
+
+
+def test_factory_routes_acmt_actv2_dformer_to_rolling_engine() -> None:
+    policy = SimpleNamespace(
+        name="acmt_actv2",
+        config=SimpleNamespace(
+            control_hz=CONTROL_HZ,
+            action_execution_horizon=EXECUTION_HORIZON,
+            tactile_history=4,
+            pred_horizon=PREDICTION_HORIZON,
+            action_dim=ACTION_DIM,
+            checkpoint_schema="acmt_actv2.dformerv2_spatial.v1",
+            checkpoint_schema_version=2,
+            tactile_source="none",
+        ),
+    )
+    engine = create_inference_engine(
+        SyncInferenceConfig(),
+        policy=policy,
+        preprocessor=_IdentityProcessor(),
+        postprocessor=_IdentityProcessor(),
+        robot_wrapper=SimpleNamespace(robot_type="fr3"),
+        hw_features={},
+        dataset_features={ACTION: {"names": [f"action_{index}" for index in range(ACTION_DIM)]}},
+        ordered_action_keys=[f"action_{index}" for index in range(ACTION_DIM)],
+        task="test",
+        fps=CONTROL_HZ,
+        device="cpu",
+    )
+    assert isinstance(engine, ACMTACTInferenceEngine)
+    engine.stop()
+
+
+def test_acmt_actv2_rolling_engine_rejects_other_schema() -> None:
+    policy = SimpleNamespace(
+        name="acmt_actv2",
+        config=SimpleNamespace(
+            control_hz=CONTROL_HZ,
+            action_execution_horizon=EXECUTION_HORIZON,
+            tactile_history=4,
+            pred_horizon=PREDICTION_HORIZON,
+            action_dim=ACTION_DIM,
+            checkpoint_schema="acmt_actv2.v1",
+            checkpoint_schema_version=1,
+            tactile_source="none",
+        ),
+    )
+    with pytest.raises(ValueError, match="acmt_actv2.dformerv2_spatial.v1"):
+        create_inference_engine(
+            SyncInferenceConfig(),
+            policy=policy,
+            preprocessor=_IdentityProcessor(),
+            postprocessor=_IdentityProcessor(),
+            robot_wrapper=SimpleNamespace(robot_type="fr3"),
+            hw_features={},
+            dataset_features={ACTION: {"names": [f"action_{index}" for index in range(ACTION_DIM)]}},
+            ordered_action_keys=[f"action_{index}" for index in range(ACTION_DIM)],
+            task="test",
+            fps=CONTROL_HZ,
+            device="cpu",
+        )
+
+
+def test_acmt_actv2_rejects_rtc_engine() -> None:
+    policy = SimpleNamespace(name="acmt_actv2")
+    with pytest.raises(ValueError, match="supports only --inference.type=sync"):
+        create_inference_engine(
+            RTCInferenceConfig(),
+            policy=policy,
+            preprocessor=_IdentityProcessor(),
+            postprocessor=_IdentityProcessor(),
+            robot_wrapper=SimpleNamespace(robot_type="fr3"),
+            hw_features={},
+            dataset_features={},
+            ordered_action_keys=[],
+            task="test",
+            fps=CONTROL_HZ,
+            device="cpu",
+        )
 
 
 @pytest.mark.parametrize("mode", ["real", "none"])

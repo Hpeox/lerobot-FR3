@@ -4,6 +4,7 @@ import json
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 import torch
 from torch import nn
 
@@ -18,6 +19,7 @@ from lerobot.policies.acmt_actv2.configuration_acmt_actv2 import (
 )
 from lerobot.policies.acmt_actv2.modeling_acmt_actv2 import ACMTACTV2Policy
 from lerobot.policies.factory import get_policy_class, make_policy_config
+from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import OBS_STATE
 
 
@@ -25,13 +27,19 @@ def _config(mode: str = "none") -> ACMTACTV2Config:
     return ACMTACTV2Config(
         device="cpu",
         pretrained_backbone_weights=None,
+        require_dformer_checkpoint=False,
         tactile_source=mode,
         generator_checkpoint="/tmp/acmt-act-test-generator.pt" if mode == "substitution" else None,
     )
 
 
 def test_factory_and_four_camera_dformer_protocol() -> None:
-    config = make_policy_config("acmt_actv2", device="cpu", pretrained_backbone_weights=None)
+    config = make_policy_config(
+        "acmt_actv2",
+        device="cpu",
+        pretrained_backbone_weights=None,
+        require_dformer_checkpoint=False,
+    )
     assert isinstance(config, ACMTACTV2Config)
     assert config.type == "acmt_actv2"
     assert config.checkpoint_schema == "acmt_actv2.dformerv2_spatial.v1"
@@ -39,6 +47,56 @@ def test_factory_and_four_camera_dformer_protocol() -> None:
     assert config.camera_keys == CAMERA_KEYS
     assert config.camera_names == CAMERA_NAMES
     assert get_policy_class("acmt_actv2") is ACMTACTV2Policy
+
+
+def test_local_artifact_load_does_not_require_training_dformer_file(
+    tmp_path, monkeypatch,
+) -> None:
+    config = _config()
+    config.require_dformer_checkpoint = True
+    config.dformer_checkpoint = "/training-only/DFormerv2_Small_pretrained.pth"
+    config.save_pretrained(tmp_path)
+    captured = {}
+    expected = object()
+
+    def fake_from_pretrained(cls, path, *, config, strict=False, **kwargs):
+        captured["class"] = cls
+        captured["path"] = path
+        captured["config"] = config
+        captured["strict"] = strict
+        captured["kwargs"] = kwargs
+        return expected
+
+    monkeypatch.setattr(PreTrainedPolicy, "from_pretrained", classmethod(fake_from_pretrained))
+
+    loaded = ACMTACTV2Policy.from_pretrained(tmp_path, strict=True)
+
+    assert loaded is expected
+    assert captured["class"] is ACMTACTV2Policy
+    assert captured["path"] == tmp_path
+    assert captured["strict"] is True
+    assert captured["config"].require_dformer_checkpoint is False
+    assert captured["config"].dformer_checkpoint == config.dformer_checkpoint
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("type", "acmt_act", "non-acmt_actv2"),
+        ("checkpoint_schema", "acmt_actv2.v1", "DFormer spatial schema"),
+        ("checkpoint_schema_version", 1, "DFormer spatial schema"),
+    ],
+)
+def test_local_artifact_loader_rejects_other_contracts(tmp_path, field, value, message) -> None:
+    config = _config()
+    config.save_pretrained(tmp_path)
+    config_path = tmp_path / "config.json"
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload[field] = value
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        ACMTACTV2Policy.from_pretrained(tmp_path)
 
 
 def test_four_independent_dformer_backbones_and_output_shape() -> None:
