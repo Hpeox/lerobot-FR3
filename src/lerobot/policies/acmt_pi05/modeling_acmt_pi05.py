@@ -1336,6 +1336,8 @@ class ACMTPi05Policy(PreTrainedPolicy):
             # from openpi preprocess_observation_pytorch: Convert back to [B, C, H, W] format if it was originally channels-first
             if is_channels_first:
                 img = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+            else:
+                img = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
 
             images.append(img)
             # Create mask (all ones for real images)

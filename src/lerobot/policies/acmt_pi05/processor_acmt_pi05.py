@@ -135,6 +135,19 @@ def make_acmt_pi05_pre_post_processors(
         action_names=getattr(config, "action_feature_names", None),
     )
 
+    # Xense force-field tensors are consumed by the private tactile adapter in
+    # ACMTPi05Policy. They are not part of the PI05 state/action normalizer:
+    # the sidecar stores tactile mean/std statistics separately, so passing the
+    # raw xense features through the generic NormalizerProcessorStep makes it
+    # interpret them as state features and fail when q01/q99 quantiles are not
+    # present. Keep these keys in the transition for the policy while
+    # normalizing only the PI05 image/state/action features here.
+    normalized_features = {
+        key: feature
+        for key, feature in {**config.input_features, **config.output_features}.items()
+        if not key.startswith("observation.xense.")
+    }
+
     # OpenPI order: raw → relative → normalize → model → unnormalize → absolute
     input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
@@ -143,7 +156,7 @@ def make_acmt_pi05_pre_post_processors(
         # NOTE: NormalizerProcessorStep MUST come before Pi05PrepareStateTokenizerProcessorStep
         # because the tokenizer step expects normalized state in [-1, 1] range for discretization
         NormalizerProcessorStep(
-            features={**config.input_features, **config.output_features},
+            features=normalized_features,
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
         ),
