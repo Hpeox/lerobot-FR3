@@ -212,6 +212,8 @@ def build_rollout_context(
             raise ValueError("ACMT-DP/ACMT-ACT rollout requires interpolation_multiplier=1")
         if is_rtc:
             raise ValueError("ACMT-DP/ACMT-ACT supports only --inference.type=sync; RTC is unsupported")
+    elif policy_config is not None and policy_config.type == "acmt_pi05" and cfg.fps != 30.0:
+        raise ValueError("ACMT-PI05 rollout requires fps=30")
 
     # --- 1. Policy (heavy I/O, but no hardware yet) -------------------
     logger.info("Loading policy from '%s'...", cfg.policy.pretrained_path)

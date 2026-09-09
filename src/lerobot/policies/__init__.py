@@ -48,6 +48,8 @@ from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig as M
 from .pi0.configuration_pi0 import PI0Config as PI0Config
 from .pi0_fast.configuration_pi0_fast import PI0FastConfig as PI0FastConfig
 from .pi05.configuration_pi05 import PI05Config as PI05Config
+from .acmt_pi05.configuration_acmt_pi05 import ACMTPi05Config as ACMTPi05Config
+from .acmt_pi05.modeling_acmt_pi05 import ACMTPi05Policy as ACMTPi05Policy
 from .pretrained import PreTrainedPolicy as PreTrainedPolicy
 from .smolvla.configuration_smolvla import SmolVLAConfig as SmolVLAConfig
 from .tdmpc.configuration_tdmpc import TDMPCConfig as TDMPCConfig
@@ -92,6 +94,8 @@ __all__ = [
     "PI0Config",
     "PI0FastConfig",
     "PI05Config",
+    "ACMTPi05Config",
+    "ACMTPi05Policy",
     "SmolVLAConfig",
     "TDMPCConfig",
     "VQBeTConfig",

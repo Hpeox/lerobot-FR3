@@ -373,6 +373,8 @@ lerobot-acmt-act-preflight="lerobot.scripts.acmt_act_preflight:main"
 lerobot-acmt-act-build-targets="lerobot.scripts.acmt_act_build_targets:main"
 lerobot-acmt-actv2-download-dinov2="lerobot.scripts.acmt_actv2_download_dinov2:main"
 lerobot-acmt-actv2-benchmark="lerobot.scripts.acmt_actv2_benchmark:main"
+lerobot-acmt-pi05-prepare-memmap="lerobot.scripts.acmt_pi05_prepare_memmap:main"
+lerobot-acmt-pi05-preflight="lerobot.scripts.acmt_pi05_preflight:main"
 
 # ---------------- Tool Configurations ----------------
 

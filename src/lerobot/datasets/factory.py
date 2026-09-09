@@ -61,14 +61,24 @@ def _make_acmt_act_memmap_dataset(cfg: TrainPipelineConfig, split: str):
     # behavior as well.
     camera_indices = None
     is_native_v2 = getattr(cfg.policy, "type", None) == "acmt_actv2"
+    is_acmt_pi05 = getattr(cfg.policy, "type", None) == "acmt_pi05"
+    if is_acmt_pi05:
+        stats_path = Path(root) / "acmt_pi05_stats.json"
+        instructions_path = Path(root) / "episode_instructions.json"
+        if not stats_path.is_file() or not instructions_path.is_file():
+            raise FileNotFoundError(
+                "ACMT-PI05 requires episode_instructions.json and acmt_pi05_stats.json next to the Memmap"
+            )
+        cfg.policy.tactile_stats_path = str(stats_path)
     return ACMTACTMemmapDataset(
         root,
         split=split,
         repo_id=str(cfg.dataset.repo_id),
         camera_indices=camera_indices,
         depth_root=None,
-        chunk_size=int(getattr(cfg.policy, "chunk_size", 16)),
+        chunk_size=int(getattr(cfg.policy, "chunk_size", 50 if is_acmt_pi05 else 16)),
         native_absolute_actions=is_native_v2,
+        policy_kind="acmt_pi05" if is_acmt_pi05 else "acmt_act",
     )
 
 

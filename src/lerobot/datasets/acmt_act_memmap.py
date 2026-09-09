@@ -602,6 +602,22 @@ class ACMTActMemmapStore:
         self.action = self._load("action.npy", np.float32)
         self.sample_valid = self._load("sample_valid.npy", np.bool_)
         self.episode_ends = self._load("episode_ends.npy", np.int64)
+        self.episode_names = _read_json(self.root / "episode_names.json")
+        if not isinstance(self.episode_names, list) or len(self.episode_names) != len(self.episode_ends):
+            raise ValueError("ACMT-ACT memmap episode_names.json is missing or inconsistent")
+        instructions_payload = _read_json(self.root / "episode_instructions.json")
+        self.episode_instructions: dict[str, str] = {}
+        if isinstance(instructions_payload, dict):
+            records = instructions_payload.get("episodes", instructions_payload)
+            if isinstance(records, dict):
+                for name, record in records.items():
+                    if isinstance(record, dict) and record.get("language_instruction") is not None:
+                        self.episode_instructions[Path(str(name)).name] = str(record["language_instruction"])
+        if self.episode_instructions and set(self.episode_instructions) != {
+            Path(str(name)).name for name in self.episode_names
+        }:
+            missing = sorted({Path(str(name)).name for name in self.episode_names} - set(self.episode_instructions))
+            raise ValueError(f"episode_instructions.json does not cover the Memmap: {missing[:3]}")
         targets_path = _targets_npz_path(self.root)
         targets_manifest = _read_json(_targets_manifest_path(self.root))
         if targets_path.is_file() and isinstance(targets_manifest, dict) and targets_manifest.get("complete"):
@@ -735,6 +751,7 @@ class ACMTActMemmapMetadata:
             "tasks": local_tasks,
         }
         self._selected_indices = selected_indices
+        self._has_language_columns = bool(store.episode_instructions)
         self.total_frames = total
         self.total_episodes = len(selected_indices)
         self.total_tasks = 1
@@ -743,7 +760,7 @@ class ACMTActMemmapMetadata:
 
     @property
     def has_language_columns(self) -> bool:
-        return False
+        return self._has_language_columns
 
 
 class ACMTACTMemmapDataset(Dataset):
@@ -760,6 +777,7 @@ class ACMTACTMemmapDataset(Dataset):
         depth_root: str | os.PathLike[str] | None = None,
         chunk_size: int = 16,
         native_absolute_actions: bool = False,
+        policy_kind: str = "acmt_act",
     ):
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
@@ -780,6 +798,7 @@ class ACMTACTMemmapDataset(Dataset):
         self.camera_indices = tuple(range(4) if camera_indices is None else camera_indices)
         self.chunk_size = int(chunk_size)
         self.native_absolute_actions = bool(native_absolute_actions)
+        self.policy_kind = str(policy_kind)
         self.depth_store = None
         if depth_root is not None:
             self.depth_store = ACMTActDepthMemmapStore(
@@ -795,11 +814,22 @@ class ACMTACTMemmapDataset(Dataset):
             depth_store=self.depth_store,
             native_absolute_actions=self.native_absolute_actions,
         )
+        if self.policy_kind == "acmt_pi05":
+            pi05_stats_path = self.store.root / "acmt_pi05_stats.json"
+            pi05_stats = _read_json(pi05_stats_path)
+            if not isinstance(pi05_stats, dict) or pi05_stats.get("schema") != "acmt_pi05.stats.v1":
+                raise ValueError(f"ACMT-PI05 requires a valid training-only stats sidecar: {pi05_stats_path}")
+            self.meta.stats["observation.state"] = pi05_stats["state"]
+            self.meta.stats["action"] = pi05_stats["action_relative"]
         self.episodes = list(range(len(selected_indices)))
         self.num_frames = self.meta.total_frames
         self.num_episodes = self.meta.total_episodes
         self._local_ends = np.asarray(self.meta.episodes["dataset_to_index"], dtype=np.int64)
         self._local_starts = np.asarray(self.meta.episodes["dataset_from_index"], dtype=np.int64)
+        self._instruction_by_global_episode = {
+            index: self.store.episode_instructions.get(Path(str(self.store.episode_names[index])).name)
+            for index in self._selected_indices
+        }
 
     def __len__(self) -> int:
         return self.num_frames
@@ -848,6 +878,9 @@ class ACMTACTMemmapDataset(Dataset):
             # policy feature selection.
             "_acmt_act.precropped": torch.tensor(True),
         }
+        instruction = self._instruction_by_global_episode.get(global_ep)
+        if instruction is not None:
+            result["task"] = instruction
         # The source H5 stores the Gello wire command as 1=open/0=closed;
         # expose the physical policy convention 0=open/1=closed.
         result["action"][:, 7] = 1.0 - result["action"][:, 7]
