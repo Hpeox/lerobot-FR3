@@ -344,6 +344,12 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             },
             "rename_observations_processor": {"rename_map": cfg.rename_map},
         }
+        # PI05 base checkpoints serialize the public Google tokenizer name.
+        # Allow an explicitly configured local tokenizer to override that
+        # processor step, which is required for offline ACMT-PI05 training.
+        tokenizer_name = getattr(active_cfg, "tokenizer_name", None)
+        if tokenizer_name:
+            preprocessor_overrides["tokenizer_processor"] = {"tokenizer_name": tokenizer_name}
         postprocessor_overrides = {
             "unnormalizer_processor": {
                 "stats": dataset.meta.stats,
