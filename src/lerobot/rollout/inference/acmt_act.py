@@ -13,7 +13,19 @@ from .sync import SyncInferenceEngine
 class ACMTACTInferenceEngine(ACMTDPInferenceEngine):
     """Run legacy ``acmt_act`` with its causal 16-predict/8-execute queue."""
 
-    pass
+    def _postprocess_plan(self, action, anchor_state):
+        result = super()._postprocess_plan(action, anchor_state)
+        config = self._policy.config
+        if (
+            self._plan_postprocess
+            and getattr(config, "checkpoint_schema", None) == "acmt_act.v3"
+            and getattr(config, "vision_backbone", None) == "resnet50"
+        ):
+            # Experiment: reverse normalized gPO after the existing processors,
+            # retaining the deployed 3..255 endpoints and joint anchors.
+            result = result.clone()
+            result[..., 7] = (255.0 + 3.0) / 255.0 - result[..., 7]
+        return result
 
 
 class ACMTACTV2InferenceEngine(SyncInferenceEngine):

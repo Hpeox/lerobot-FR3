@@ -485,6 +485,55 @@ def test_acmt_act_plan_is_postprocessed_once_with_its_observation_anchor(
         engine.stop()
 
 
+@pytest.mark.parametrize(
+    "engine_type,backbone,reversed_direction",
+    [(ACMTACTInferenceEngine, "resnet50", True),
+     (ACMTACTInferenceEngine, "dformerv2", False),
+     (ACMTDPInferenceEngine, "resnet50", False)],
+)
+def test_gripper_direction_experiment_preserves_plan_anchors(
+    engine_type, backbone, reversed_direction
+) -> None:
+    from lerobot.policies.acmt_dp.gripper_mapping import ACMTDPGripperGPOProcessorStep
+
+    class Postprocessor(_AnchorPostprocessor):
+        def __call__(self, action):
+            return ACMTDPGripperGPOProcessorStep().action(super().__call__(action))
+
+    names = [f"joint_{i}" for i in range(7)] + ["gripper"]
+    relative = RelativeActionsProcessorStep(
+        enabled=True, exclude_joints=["gripper"], action_names=names
+    )
+    previous = torch.full((1, ACTION_DIM), 9.0)
+    relative._last_state = previous
+    postprocessor = Postprocessor(relative)
+    policy = _AnchorPolicy()
+    policy.config.vision_backbone = backbone
+    engine = engine_type(
+        policy=policy, preprocessor=_AnchorPreprocessor(relative),
+        postprocessor=postprocessor, dataset_features={ACTION: {"names": names}},
+        ordered_action_keys=names, task="test", device="cpu", robot_type="fr3",
+    )
+    actions = torch.full((1, PREDICTION_HORIZON, ACTION_DIM), 0.25)
+    actions[..., 7] = torch.tensor([0.0, 0.25, 0.75, 1.0] * 4)
+    original = actions.clone()
+    anchor = torch.arange(ACTION_DIM, dtype=torch.float32).unsqueeze(0)
+    try:
+        result = engine._postprocess_plan(actions, anchor)
+        expected_gpo = [3, 66, 192, 255] if reversed_direction else [255, 192, 66, 3]
+        torch.testing.assert_close(
+            (result[..., 7] * 255).round(),
+            torch.tensor([expected_gpo * 4], dtype=torch.float32),
+        )
+        torch.testing.assert_close(result[..., :7], actions[..., :7] + anchor[:, None, :7])
+        torch.testing.assert_close(actions, original)
+        assert relative._last_state is previous
+        assert result.shape == (1, 16, 8)
+        assert postprocessor.calls == 1
+    finally:
+        engine.stop()
+
+
 def _joint_values(offset: float) -> dict[str, float]:
     return {f"fr3_joint{index}.pos": offset + index - 1 for index in range(1, 8)}
 
