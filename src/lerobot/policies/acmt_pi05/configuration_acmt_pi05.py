@@ -25,6 +25,16 @@ from ..rtc.configuration_rtc import RTCConfig
 DEFAULT_IMAGE_SIZE = 224
 ACMT_PI05_SCHEMA = "acmt_pi05.tactile.v1"
 TACTILE_SOURCE_CHOICES = ("none", "real", "substitution")
+PI05_CAMERA_KEYS = tuple(f"camera.cam{i}" for i in range(1, 5))
+PI05_CAMERA_NAMES = ("top", "side", "wrist_left", "wrist_right")
+# Training memmaps contain these fixed crops.  Runtime FR3 observations are
+# still the original 480x640 images and are cropped by the policy processor.
+PI05_DEFAULT_CROP_PARAMS = {
+    "top": (80, 30, 320, 580),
+    "side": (140, 60, 320, 580),
+    "wrist_left": (80, 30, 320, 580),
+    "wrist_right": (80, 30, 320, 580),
+}
 
 
 @PreTrainedConfig.register_subclass("acmt_pi05")
@@ -79,6 +89,13 @@ class ACMTPi05Config(PreTrainedConfig):
 
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
     tokenizer_name: str = "google/paligemma-3b-pt-224"
+
+    # The model keys retain the training semantic order.  Deployment may
+    # provide a different, explicitly serialized FR3 camera source order.
+    source_camera_keys: tuple[str, ...] = PI05_CAMERA_KEYS
+    crop_params: dict[str, tuple[int, int, int, int]] = field(
+        default_factory=lambda: dict(PI05_DEFAULT_CROP_PARAMS)
+    )
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -135,6 +152,26 @@ class ACMTPi05Config(PreTrainedConfig):
             raise ValueError(f"ACMT-PI05 requires checkpoint_schema={ACMT_PI05_SCHEMA!r}")
         if self.tactile_feature_dim != 160 or self.tactile_token_dim <= 0:
             raise ValueError("invalid ACMT-PI05 tactile dimensions")
+
+        self.source_camera_keys = tuple(self.source_camera_keys)
+        if (
+            len(self.source_camera_keys) != len(PI05_CAMERA_KEYS)
+            or len(set(self.source_camera_keys)) != len(PI05_CAMERA_KEYS)
+            or set(self.source_camera_keys) != set(PI05_CAMERA_KEYS)
+        ):
+            raise ValueError("ACMT-PI05 source_camera_keys must be a permutation of camera.cam1..camera.cam4")
+        self.crop_params = {
+            str(name): tuple(int(value) for value in crop)
+            for name, crop in self.crop_params.items()
+        }
+        if set(self.crop_params) != set(PI05_CAMERA_NAMES):
+            raise ValueError(f"ACMT-PI05 crop_params must contain exactly {sorted(PI05_CAMERA_NAMES)}")
+        for name, crop in self.crop_params.items():
+            if len(crop) != 4 or any(value < 0 for value in crop):
+                raise ValueError(f"invalid ACMT-PI05 crop for {name}: {crop}")
+            y, x, height, width = crop
+            if y + height > 480 or x + width > 640 or (height, width) != (320, 580):
+                raise ValueError(f"ACMT-PI05 crop for {name} must be inside 480x640 and have size 320x580")
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
@@ -201,4 +238,11 @@ class ACMTPi05Config(PreTrainedConfig):
         return None
 
 
-__all__ = ["ACMTPi05Config", "ACMT_PI05_SCHEMA", "TACTILE_SOURCE_CHOICES"]
+__all__ = [
+    "ACMTPi05Config",
+    "ACMT_PI05_SCHEMA",
+    "PI05_CAMERA_KEYS",
+    "PI05_CAMERA_NAMES",
+    "PI05_DEFAULT_CROP_PARAMS",
+    "TACTILE_SOURCE_CHOICES",
+]

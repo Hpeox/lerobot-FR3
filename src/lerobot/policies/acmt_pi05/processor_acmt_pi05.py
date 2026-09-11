@@ -15,7 +15,7 @@
 # limitations under the License.
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -38,6 +38,7 @@ from lerobot.processor import (
     policy_action_to_transition,
     transition_to_policy_action,
 )
+from lerobot.processor.pipeline import ObservationProcessorStep, PolicyActionProcessorStep
 from lerobot.types import EnvTransition, TransitionKey
 from lerobot.utils.constants import (
     OBS_STATE,
@@ -45,7 +46,177 @@ from lerobot.utils.constants import (
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
 
-from .configuration_acmt_pi05 import ACMTPi05Config
+from .configuration_acmt_pi05 import (
+    ACMTPi05Config,
+    PI05_CAMERA_KEYS,
+    PI05_CAMERA_NAMES,
+)
+
+
+PI05_GPO_MIN = 3.0
+PI05_GPO_MAX = 255.0
+
+
+def pi05_gripper_to_fr3_pos(value: torch.Tensor) -> torch.Tensor:
+    """Map PI05's physical opening/closing scalar to normalized FR3 gPO."""
+
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"PI05 gripper action must be a torch.Tensor, got {type(value).__name__}")
+    clipped = value.clamp(0.0, 1.0)
+    gpo = PI05_GPO_MIN + (PI05_GPO_MAX - PI05_GPO_MIN) * clipped
+    return gpo / 255.0
+
+
+@dataclass
+@ProcessorStepRegistry.register(name="acmt_pi05_gripper_gpo_processor")
+class ACMTPi05GripperGPOProcessorStep(PolicyActionProcessorStep):
+    """Adapt PI05's 0=open, 1=closed action to the FR3 gPO ABI."""
+
+    action_index: int = 7
+
+    def __post_init__(self) -> None:
+        if self.action_index < 0:
+            raise ValueError("ACMT-PI05 gripper action_index must be non-negative")
+
+    def action(self, action: PolicyAction) -> PolicyAction:
+        if action.ndim == 0 or action.shape[-1] <= self.action_index:
+            raise ValueError("PI05 action must contain the gripper at index 7")
+        result = action.clone()
+        result[..., self.action_index] = pi05_gripper_to_fr3_pos(result[..., self.action_index])
+        return result
+
+    def get_config(self) -> dict[str, Any]:
+        return {"action_index": self.action_index}
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
+def _tensor(value: Any, key: str) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        return value
+    return torch.as_tensor(value)
+
+
+def _rgb_bchw(value: Any, key: str) -> torch.Tensor:
+    """Normalize a live or memmap RGB image to float BCHW in [0, 1]."""
+
+    tensor = _tensor(value, key)
+    if tensor.ndim == 3:
+        if tensor.shape[0] == 3:
+            tensor = tensor.unsqueeze(0)
+        elif tensor.shape[-1] == 3:
+            tensor = tensor.permute(2, 0, 1).unsqueeze(0)
+        else:
+            raise ValueError(f"{key} must be CHW or HWC RGB, got {tuple(tensor.shape)}")
+    elif tensor.ndim == 4:
+        if tensor.shape[1] == 3:
+            pass
+        elif tensor.shape[-1] == 3:
+            tensor = tensor.permute(0, 3, 1, 2)
+        else:
+            raise ValueError(f"{key} must be BCHW or BHWC RGB, got {tuple(tensor.shape)}")
+    else:
+        raise ValueError(f"{key} must be a 3D/4D RGB tensor, got {tuple(tensor.shape)}")
+    spatial = tuple(tensor.shape[-2:])
+    if spatial not in {(480, 640), (320, 580)}:
+        raise ValueError(f"{key} must be 480x640 or an exact 320x580 crop, got {spatial}")
+    tensor = tensor.to(dtype=torch.float32)
+    if tensor.numel() and float(tensor.detach().amax()) > 1.5:
+        tensor = tensor / 255.0
+    return tensor.clamp(0.0, 1.0).contiguous()
+
+
+def _rgb_key(camera_key: str) -> str:
+    return f"observation.images.{camera_key}.rgb"
+
+
+@dataclass
+@ProcessorStepRegistry.register(name="acmt_pi05_observation_processor")
+class ACMTPi05ObservationProcessorStep(ObservationProcessorStep):
+    """Map FR3 camera IDs to PI05 semantic cameras and apply train crops."""
+
+    source_camera_keys: tuple[str, ...] = PI05_CAMERA_KEYS
+    camera_keys: tuple[str, ...] = PI05_CAMERA_KEYS
+    camera_names: tuple[str, ...] = PI05_CAMERA_NAMES
+    crop_params: dict[str, tuple[int, int, int, int]] = field(
+        default_factory=lambda: {
+            "top": (80, 30, 320, 580),
+            "side": (140, 60, 320, 580),
+            "wrist_left": (80, 30, 320, 580),
+            "wrist_right": (80, 30, 320, 580),
+        }
+    )
+
+    def __post_init__(self) -> None:
+        self.source_camera_keys = tuple(self.source_camera_keys)
+        self.camera_keys = tuple(self.camera_keys)
+        self.camera_names = tuple(self.camera_names)
+        self.crop_params = {
+            str(name): tuple(int(value) for value in crop)
+            for name, crop in self.crop_params.items()
+        }
+        count = len(self.camera_keys)
+        if count != 4 or self.camera_keys != PI05_CAMERA_KEYS:
+            raise ValueError("ACMT-PI05 camera_keys must be camera.cam1..camera.cam4")
+        if len(self.source_camera_keys) != count or len(set(self.source_camera_keys)) != count:
+            raise ValueError("ACMT-PI05 source_camera_keys must contain four distinct cameras")
+        if set(self.source_camera_keys) != set(self.camera_keys):
+            raise ValueError("ACMT-PI05 source_camera_keys must be a camera permutation")
+        if len(self.camera_names) != count or len(set(self.camera_names)) != count:
+            raise ValueError("ACMT-PI05 camera_names must contain four distinct names")
+        if set(self.crop_params) != set(self.camera_names):
+            raise ValueError("ACMT-PI05 crop_params must match camera_names")
+        for name, crop in self.crop_params.items():
+            if len(crop) != 4 or any(value < 0 for value in crop):
+                raise ValueError(f"invalid ACMT-PI05 crop for {name}: {crop}")
+            y, x, height, width = crop
+            if y + height > 480 or x + width > 640 or (height, width) != (320, 580):
+                raise ValueError(f"ACMT-PI05 crop for {name} must be inside 480x640 and have size 320x580")
+
+    def get_config(self) -> dict[str, Any]:
+        return {
+            "source_camera_keys": list(self.source_camera_keys),
+            "camera_keys": list(self.camera_keys),
+            "camera_names": list(self.camera_names),
+            "crop_params": {key: list(value) for key, value in self.crop_params.items()},
+        }
+
+    def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
+        # Snapshot all sources before writing targets: the deployment mapping
+        # is a permutation and must never overwrite an unread source frame.
+        source = dict(observation)
+        result = dict(observation)
+        for target_camera, source_camera, name in zip(
+            self.camera_keys, self.source_camera_keys, self.camera_names, strict=True
+        ):
+            source_key = _rgb_key(source_camera)
+            target_key = _rgb_key(target_camera)
+            if source_key not in source:
+                raise KeyError(f"ACMT-PI05 observation is missing {source_key}")
+            raw = _rgb_bchw(source[source_key], source_key)
+            if tuple(raw.shape[-2:]) == (480, 640):
+                y, x, height, width = self.crop_params[name]
+                cropped = raw[..., y : y + height, x : x + width]
+            else:
+                cropped = raw
+            if tuple(cropped.shape[-2:]) != (320, 580):
+                raise RuntimeError("ACMT-PI05 crop produced an unexpected 320x580 shape")
+            result[target_key] = cropped
+        return result
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        transformed = {kind: dict(bucket) for kind, bucket in features.items()}
+        bucket = transformed.get(PipelineFeatureType.OBSERVATION, {})
+        for camera_key in self.camera_keys:
+            key = _rgb_key(camera_key)
+            if key in bucket:
+                bucket[key] = PolicyFeature(type=FeatureType.VISUAL, shape=(3, 320, 580))
+        return transformed
 
 
 @ProcessorStepRegistry.register(name="acmt_pi05_prepare_state_tokenizer_processor_step")
@@ -152,6 +323,10 @@ def make_acmt_pi05_pre_post_processors(
     input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
         AddBatchDimensionProcessorStep(),
+        ACMTPi05ObservationProcessorStep(
+            source_camera_keys=config.source_camera_keys,
+            crop_params=config.crop_params,
+        ),
         relative_step,
         # NOTE: NormalizerProcessorStep MUST come before Pi05PrepareStateTokenizerProcessorStep
         # because the tokenizer step expects normalized state in [-1, 1] range for discretization
@@ -176,6 +351,7 @@ def make_acmt_pi05_pre_post_processors(
         ),
         AbsoluteActionsProcessorStep(enabled=config.use_relative_actions, relative_step=relative_step),
         DeviceProcessorStep(device="cpu"),
+        ACMTPi05GripperGPOProcessorStep(),
     ]
 
     return (
@@ -190,3 +366,11 @@ def make_acmt_pi05_pre_post_processors(
             to_output=transition_to_policy_action,
         ),
     )
+
+
+__all__ = [
+    "ACMTPi05GripperGPOProcessorStep",
+    "ACMTPi05ObservationProcessorStep",
+    "make_acmt_pi05_pre_post_processors",
+    "pi05_gripper_to_fr3_pos",
+]

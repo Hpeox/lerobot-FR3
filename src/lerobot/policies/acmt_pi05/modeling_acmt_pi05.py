@@ -641,14 +641,31 @@ class ACMTPi05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             train_expert_only=config.train_expert_only,
         )
 
-        self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
-        self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
+        # The VLM helper above applies the requested mixed precision to the
+        # language/action trunk while deliberately keeping the vision tower
+        # and normalization layers in FP32.  These projections are constructed
+        # after that helper, so cast them explicitly as well; otherwise a
+        # direct deployment call (without an outer autocast context) produces
+        # FP32 suffix embeddings that cannot enter the FP16/BF16 expert.
+        precision_dtype = getattr(torch, config.dtype)
+        self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width).to(
+            dtype=precision_dtype
+        )
+        self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim).to(
+            dtype=precision_dtype
+        )
 
         self.tactile_encoder = ACMTPi05TactileEncoder(tactile_mean, tactile_std)
-        self.tactile_token_proj = nn.Linear(config.tactile_feature_dim, action_expert_config.width)
+        self.tactile_token_proj = nn.Linear(config.tactile_feature_dim, action_expert_config.width).to(
+            dtype=precision_dtype
+        )
 
-        self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
-        self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+        self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width).to(
+            dtype=precision_dtype
+        )
+        self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width).to(
+            dtype=precision_dtype
+        )
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False

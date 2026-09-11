@@ -16,6 +16,16 @@
 
 from .configuration_acmt_pi05 import ACMTPi05Config
 from .modeling_acmt_pi05 import ACMTPi05Policy
-from .processor_acmt_pi05 import make_acmt_pi05_pre_post_processors
+from .processor_acmt_pi05 import (
+    ACMTPi05GripperGPOProcessorStep,
+    ACMTPi05ObservationProcessorStep,
+    make_acmt_pi05_pre_post_processors,
+)
 
-__all__ = ["ACMTPi05Config", "ACMTPi05Policy", "make_acmt_pi05_pre_post_processors"]
+__all__ = [
+    "ACMTPi05Config",
+    "ACMTPi05GripperGPOProcessorStep",
+    "ACMTPi05ObservationProcessorStep",
+    "ACMTPi05Policy",
+    "make_acmt_pi05_pre_post_processors",
+]
