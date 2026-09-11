@@ -21,11 +21,19 @@ from .processor_acmt_pi05 import (
     ACMTPi05ObservationProcessorStep,
     make_acmt_pi05_pre_post_processors,
 )
+from .quantization_acmt_pi05 import (
+    QuantizationReport,
+    quantize_acmt_pi05_int8,
+    should_quantize_linear,
+)
 
 __all__ = [
     "ACMTPi05Config",
     "ACMTPi05GripperGPOProcessorStep",
     "ACMTPi05ObservationProcessorStep",
     "ACMTPi05Policy",
+    "QuantizationReport",
     "make_acmt_pi05_pre_post_processors",
+    "quantize_acmt_pi05_int8",
+    "should_quantize_linear",
 ]

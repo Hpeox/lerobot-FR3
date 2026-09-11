@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 import pytest
+from torch import nn
 
 from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.policies.acmt_pi05.configuration_acmt_pi05 import ACMTPi05Config
@@ -10,6 +11,12 @@ from lerobot.policies.acmt_pi05.processor_acmt_pi05 import (
     ACMTPi05ObservationProcessorStep,
 )
 from lerobot.policies.acmt_pi05.modeling_acmt_pi05 import ACMTPi05Pytorch, ACMTPi05TactileEncoder
+from lerobot.policies.pi_gemma import PiGemmaRMSNorm
+from lerobot.policies.acmt_pi05.quantization_acmt_pi05 import (
+    linear_compute_dtype,
+    quantize_acmt_pi05_int8,
+    should_quantize_linear,
+)
 
 
 def test_acmt_pi05_feature_contract_excludes_raw_force_fields() -> None:
@@ -88,3 +95,74 @@ def test_acmt_pi05_fp16_projection_dtype_keeps_tactile_encoder_fp32(monkeypatch)
     assert model.time_mlp_in.weight.dtype == torch.float16
     assert model.time_mlp_out.weight.dtype == torch.float16
     assert model.tactile_encoder.spatial[0].weight.dtype == torch.float32
+
+
+def test_pi_gemma_adaptive_norm_casts_fp16_condition_to_fp32_projection() -> None:
+    norm = PiGemmaRMSNorm(dim=4, cond_dim=2)
+    x = torch.zeros(1, 3, 4, dtype=torch.float16)
+    cond = torch.zeros(1, 2, dtype=torch.float16)
+
+    output, gate = norm(x, cond=cond)
+
+    assert output.dtype == torch.float16
+    assert gate is not None
+    assert gate.dtype == torch.float16
+
+
+def test_acmt_pi05_int8_allowlist_excludes_sensitive_modules() -> None:
+    large = nn.Linear(2048, 2048)
+    assert should_quantize_linear(
+        "paligemma_with_expert.paligemma.model.language_model.layers.0.mlp.up_proj",
+        large,
+        stage="language",
+    )
+    assert not should_quantize_linear(
+        "paligemma_with_expert.paligemma.model.language_model.embed_tokens",
+        large,
+        stage="language",
+    )
+    assert should_quantize_linear(
+        "paligemma_with_expert.gemma_expert.model.layers.0.mlp.down_proj",
+        large,
+        stage="action",
+    )
+    assert not should_quantize_linear(
+        "action_out_proj",
+        large,
+        stage="action",
+    )
+    assert not should_quantize_linear(
+        "paligemma_with_expert.gemma_expert.model.layers.0.mlp.down_proj",
+        nn.Linear(1024, 1024),
+        stage="action",
+    )
+
+
+def test_acmt_pi05_int8_cpu_replacement_reports_selected_layers() -> None:
+    pytest.importorskip("bitsandbytes")
+    root = nn.Module()
+    paligemma = nn.Module()
+    language_model = nn.Module()
+    layers = nn.ModuleList([nn.Module()])
+    layers[0].add_module("mlp", nn.Module())
+    layers[0].mlp.add_module("up_proj", nn.Linear(2048, 2048))
+    language_model.add_module("layers", layers)
+    paligemma.add_module("model", nn.Module())
+    paligemma.model.add_module("language_model", language_model)
+    root.add_module("paligemma_with_expert", nn.Module())
+    root.paligemma_with_expert.add_module("paligemma", paligemma)
+
+    report = quantize_acmt_pi05_int8(root, stages=("language",))
+
+    assert report.layer_count == 1
+    assert report.parameter_count == 2048 * 2048
+    assert root.paligemma_with_expert.paligemma.model.language_model.layers[0].mlp.up_proj.__class__.__module__.startswith(
+        "bitsandbytes"
+    )
+
+
+def test_acmt_pi05_int8_compute_dtype_does_not_return_int8() -> None:
+    linear = nn.Linear(4, 4)
+    linear.weight.requires_grad_(False)
+    linear.weight.data = linear.weight.data.to(torch.int8)
+    assert linear_compute_dtype(linear, torch.float16) == torch.float16

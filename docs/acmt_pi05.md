@@ -87,3 +87,44 @@ The online path is RTC with a 50-step policy chunk and a 10-step execution
 horizon.  `--inference-type=rtc` is required because relative joint actions
 must be re-anchored by the RTC engine rather than by a synchronous one-action
 loop.
+
+## RTX 2080 Ti deployment profiles
+
+The original `018000` checkpoint is BF16 and remains the source of truth.  The
+FP16 deployment profile is kept separate from the source checkpoint at
+`outputs/acmt_pi05/peg/none/seed42/fp16_deploy/pretrained_model`; its
+`model.safetensors` hash is unchanged.  The model keeps vision and
+normalization layers in FP32 and emits FP32 actions.
+
+The optional Selective INT8 profile is loaded at runtime from
+`outputs/acmt_pi05/peg/none/seed42/int8_deploy/pretrained_model`.  It performs
+a CPU strict load and then replaces only large transformer `Linear` modules
+with `bitsandbytes.nn.Linear8bitLt` (currently tested with bitsandbytes
+`0.50.2`) before moving the model to CUDA:
+
+```text
+v1: language transformer
+v2: language transformer + action expert
+v3: language transformer + action expert + vision transformer
+```
+
+Embeddings, `lm_head`, normalization, state/action projections, action heads
+and gripper-related layers are never quantized.  The first profile that meets
+the memory, latency and action-equivalence gates is the only one eligible for
+RTC.  V1 currently meets the output, memory and warm-latency checks, but its
+fixed-noise action comparison against FP16 is not equivalent enough for
+deployment (`MAE≈0.043`, `relative L2≈0.323`), so it remains an audit
+candidate only.  Use the offline benchmark without ROS or robot motion:
+
+```bash
+PYTHONPATH=src python -m lerobot.policies.acmt_pi05.benchmark_acmt_pi05_int8 \
+  outputs/acmt_pi05/peg/none/seed42/int8_deploy/pretrained_model \
+  --stage v1 --warmup 5 --runs 50 \
+  --report outputs/acmt_pi05/int8_reports/v1.json
+```
+
+The current MainController installation intentionally keeps a 60-second
+startup timeout.  Policy loading occurs before the controlled UDS socket is
+created, so a cold-load measurement above 60 seconds is a startup gate
+failure even when warm inference meets the RTC budget.  Do not extend the
+timeout or start a physical rollout until that gate is resolved and recorded.

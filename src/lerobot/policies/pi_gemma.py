@@ -120,7 +120,12 @@ class PiGemmaRMSNorm(nn.Module):
             return normed.type_as(x), None
         if cond.shape[-1] != self.cond_dim:
             raise ValueError(f"Expected cond dim {self.cond_dim}, got {cond.shape[-1]}")
-        modulation = self.dense(cond)
+        # Adaptive norm projections intentionally remain in FP32 for stable
+        # normalization while the language/action trunk may run in FP16 or
+        # BF16.  Linear requires matching input and weight dtypes; cast only
+        # this conditioning vector, then return the gate in the hidden-state
+        # dtype below.
+        modulation = self.dense(cond.to(dtype=self.dense.weight.dtype))
         if len(x.shape) == 3:
             modulation = modulation.unsqueeze(1)
         scale, shift, gate = modulation.chunk(3, dim=-1)

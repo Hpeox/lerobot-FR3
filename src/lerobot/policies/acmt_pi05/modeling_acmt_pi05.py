@@ -59,6 +59,7 @@ from lerobot.utils.constants import (
 from ..pretrained import PreTrainedPolicy, T
 from ..rtc.modeling_rtc import RTCProcessor
 from .configuration_acmt_pi05 import ACMTPi05Config, ACMT_PI05_SCHEMA, DEFAULT_IMAGE_SIZE
+from .quantization_acmt_pi05 import linear_compute_dtype, quantize_acmt_pi05_int8
 TACTILE0 = "observation.xense.sensor0.force_field"
 TACTILE1 = "observation.xense.sensor1.force_field"
 
@@ -325,15 +326,16 @@ def compute_layer_complete(inputs_embeds, attention_mask, position_ids, adarms_c
     for i, hidden_states in enumerate(inputs_embeds):
         layer = layers[i]
         end_pos = start_pos + hidden_states.shape[1]
-        if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
-            att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
+        target_dtype = linear_compute_dtype(layer.self_attn.o_proj, att_output.dtype)
+        if att_output.dtype != target_dtype:
+            att_output = att_output.to(target_dtype)
         out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
         # first residual
         out_emb = _gated_residual(hidden_states, out_emb, gates[i])
         after_first_residual = out_emb.clone()
         out_emb, gate = layernorm_forward(layer.post_attention_layernorm, out_emb, adarms_cond[i])
         # Match the next layer for both BF16 and FP16 inference/training.
-        target_dtype = layer.mlp.up_proj.weight.dtype
+        target_dtype = linear_compute_dtype(layer.mlp.up_proj, out_emb.dtype)
         if out_emb.dtype != target_dtype:
             out_emb = out_emb.to(dtype=target_dtype)
         out_emb = layer.mlp(out_emb)
@@ -759,7 +761,7 @@ class ACMTPi05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         # action trunks may be BF16/FP16.  Native PI05 normally relies on an
         # outer autocast context; casting here also makes direct/RTC inference
         # deterministic on a 2080 Ti and avoids a mixed-dtype concat.
-        target_dtype = self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
+        target_dtype = getattr(torch, self.config.dtype)
         embs = [embedding.to(dtype=target_dtype) for embedding in embs]
 
         num_lang_embs = lang_emb.shape[1]
@@ -787,7 +789,7 @@ class ACMTPi05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             # pooling in FP32.  Follow the projection weight here so direct
             # deployment (outside an outer autocast context) works for both
             # BF16 and FP16 PI05 checkpoints.
-            tactile_token = tactile_token.to(dtype=self.tactile_token_proj.weight.dtype)
+            tactile_token = tactile_token.to(dtype=linear_compute_dtype(self.tactile_token_proj, tactile_token.dtype))
             tactile_emb = self.tactile_token_proj(tactile_token).unsqueeze(1)
             embs.append(tactile_emb)
             bsize = tactile_emb.shape[0]
@@ -804,11 +806,13 @@ class ACMTPi05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             max_period=self.config.max_period,
             device=timestep.device,
         )
-        time_emb = time_emb.to(dtype=self.time_mlp_in.weight.dtype)
+        time_emb = time_emb.to(dtype=linear_compute_dtype(self.time_mlp_in, time_emb.dtype))
 
         # Fuse timestep + action information using an MLP
         def action_proj_func(noisy_actions):
-            return self.action_in_proj(noisy_actions.to(dtype=self.action_in_proj.weight.dtype))
+            return self.action_in_proj(
+                noisy_actions.to(dtype=linear_compute_dtype(self.action_in_proj, noisy_actions.dtype))
+            )
 
         action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
 
@@ -849,7 +853,7 @@ class ACMTPi05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             x_t, time, tactile_features
         )
 
-        target_dtype = self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
+        target_dtype = getattr(torch, self.config.dtype)
         if suffix_embs.dtype != target_dtype:
             suffix_embs = suffix_embs.to(dtype=target_dtype)
         if prefix_embs.dtype != target_dtype:
@@ -918,7 +922,7 @@ class ACMTPi05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         tactile_features = self.tactile_encoder(tactile)
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        target_dtype = self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
+        target_dtype = getattr(torch, self.config.dtype)
         if prefix_embs.dtype != target_dtype:
             prefix_embs = prefix_embs.to(dtype=target_dtype)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -1114,6 +1118,16 @@ class ACMTPi05Policy(PreTrainedPolicy):
             }
             config = ACMTPi05Config(**values)
 
+        # Quantized deployment is deliberately built on CPU first.  Moving a
+        # full BF16/FP16 checkpoint to the 2080 Ti before replacing large
+        # Linear layers defeats the memory-saving purpose and can OOM.
+        quantization_requested = config.quantization_backend != "none"
+        requested_device = config.device
+        if quantization_requested:
+            if requested_device is None or str(requested_device) == "cpu":
+                raise ValueError("ACMT-PI05 bitsandbytes INT8 deployment requires device='cuda'")
+            config.device = "cpu"
+
         # Initialize model without loading weights
         # Check if dataset_stats were provided in kwargs
         model = cls(config, **kwargs)
@@ -1212,6 +1226,23 @@ class ACMTPi05Policy(PreTrainedPolicy):
             # real robot because inference can still produce plausible-looking
             # joint commands.  Surface the error and stop construction.
             raise RuntimeError(f"Could not load ACMT-PI05 weights from {pretrained_name_or_path!r}: {e}") from e
+
+        if quantization_requested:
+            report = quantize_acmt_pi05_int8(
+                model.model,
+                stages=config.quantization_stages,
+                min_numel=config.quantization_min_numel,
+                threshold=config.quantization_threshold,
+            )
+            model.quantization_report = report.to_dict()
+            config.device = requested_device
+            model.config.device = requested_device
+            model.to(requested_device)
+            print(
+                "Selective INT8 ready: "
+                f"stages={report.stages} layers={report.layer_count} "
+                f"parameters={report.parameter_count} device={requested_device}"
+            )
 
         return model
 

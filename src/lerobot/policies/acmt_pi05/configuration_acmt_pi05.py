@@ -44,6 +44,14 @@ class ACMTPi05Config(PreTrainedConfig):
     action_expert_variant: str = "gemma_300m"
     dtype: str = "float32"  # Options: "bfloat16", "float16", "float32"
 
+    # Optional deployment-time quantization.  The checkpoint remains a
+    # regular safetensors artifact; the loader replaces only the explicitly
+    # selected large Linear modules after a CPU load.
+    quantization_backend: str = "none"
+    quantization_stages: tuple[str, ...] = ()
+    quantization_min_numel: int = 4_000_000
+    quantization_threshold: float = 6.0
+
     checkpoint_schema: str = ACMT_PI05_SCHEMA
     tactile_source: str = "none"
     tactile_feature_dim: int = 160
@@ -146,6 +154,22 @@ class ACMTPi05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+        if self.quantization_backend not in ("none", "bitsandbytes_int8"):
+            raise ValueError(
+                "ACMT-PI05 quantization_backend must be 'none' or 'bitsandbytes_int8'"
+            )
+        self.quantization_stages = tuple(self.quantization_stages)
+        valid_quantization_stages = {"language", "action", "vision"}
+        if any(stage not in valid_quantization_stages for stage in self.quantization_stages):
+            raise ValueError(
+                "ACMT-PI05 quantization_stages must contain only language, action, or vision"
+            )
+        if self.quantization_backend == "bitsandbytes_int8" and not self.quantization_stages:
+            raise ValueError("bitsandbytes_int8 requires at least one quantization stage")
+        if self.quantization_min_numel <= 0:
+            raise ValueError("quantization_min_numel must be positive")
+        if self.quantization_threshold < 0:
+            raise ValueError("quantization_threshold must be non-negative")
         if self.tactile_source not in TACTILE_SOURCE_CHOICES:
             raise ValueError(f"tactile_source must be one of {TACTILE_SOURCE_CHOICES}, got {self.tactile_source!r}")
         if self.checkpoint_schema != ACMT_PI05_SCHEMA:
