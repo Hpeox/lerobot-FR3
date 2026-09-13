@@ -113,6 +113,18 @@ def main() -> None:
             for parameter in policy.model.camera_embedding.parameters()
         ):
             raise RuntimeError("DINOv2 camera embedding produced no finite gradient")
+    elif args.policy_type == "acmt_act":
+        # ACMT-ACT v3 uses four trainable ResNet backbones.  This branch is
+        # intentionally separate from the DFormer-v2 checks below: treating a
+        # ResNet as frozen used to make every valid v3 preflight fail after the
+        # forward/backward pass.
+        for index, backbone in enumerate(policy.model.backbone):
+            if not any(
+                parameter.grad is not None and torch.isfinite(parameter.grad).all()
+                for parameter in backbone.parameters()
+                if parameter.requires_grad
+            ):
+                raise RuntimeError(f"camera ResNet {index} produced no finite gradient")
     else:
         for index, backbone in enumerate(policy.model.backbone):
             trainable = [parameter for parameter in backbone.parameters() if parameter.requires_grad]
@@ -126,11 +138,17 @@ def main() -> None:
             if not any(parameter.grad is not None and torch.isfinite(parameter.grad).all() for parameter in projection.parameters()):
                 raise RuntimeError(f"camera projection {index} produced no finite gradient")
     peak = torch.cuda.max_memory_allocated(device) / (1024**3) if device.type == "cuda" else 0.0
+    if args.policy_type == "acmt_act":
+        vision_label = "resnet50_trainable"
+    elif args.policy_type == "acmt_actv2":
+        vision_label = "dinov2_frozen"
+    else:
+        vision_label = f"dformer_{args.dformer_training_phase}"
     print(
         f"PREFLIGHT PASS task={args.task} tactile_source={args.tactile_source} "
         f"physical_batch_size={args.batch_size} accumulation={args.gradient_accumulation_steps} "
         f"effective_batch_size={args.batch_size * args.gradient_accumulation_steps} "
-        f"vision={'dinov2_frozen' if args.policy_type == 'acmt_actv2' else f'dformer_{args.dformer_training_phase}'} "
+        f"vision={vision_label} "
         f"steps={args.steps} peak_memory_gib={peak:.2f}"
     )
 

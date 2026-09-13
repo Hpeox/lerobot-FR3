@@ -31,6 +31,8 @@ from .acmt_act_depth_memmap import ACMTActDepthMemmapStore
 
 MEMMAP_VERSION = "acmt_act_memmap_v1"
 TARGETS_VERSION = "acmt_act_targets_v1"
+ACTION_HORIZON = 16
+VALIDITY_SOURCES = ("h5_or_all", "build_report")
 GOAL_XYZ = "observation.acmt_act.goal_xyz"
 GOAL_VALID = "observation.acmt_act.goal_valid"
 CAMERA_NAMES = ("top", "side", "wrist_left", "wrist_right")
@@ -82,6 +84,64 @@ def _first_grasp_rise(gpo: np.ndarray) -> int | None:
     return int(indices[0]) if indices.size else None
 
 
+def _valid_anchor_offsets(sample_valid: np.ndarray, *, horizon: int = ACTION_HORIZON) -> np.ndarray:
+    """Return anchors whose observation and complete action window are valid.
+
+    The source arrays are frame indexed.  An invalid frame therefore removes
+    the anchor itself and every preceding anchor whose ``t:t+horizon`` target
+    would include it.  Episode tails remain valid when their recorded targets
+    are present; ``__getitem__`` pads only beyond the episode boundary.
+    """
+
+    values = np.asarray(sample_valid, dtype=bool).reshape(-1)
+    if horizon <= 0:
+        raise ValueError("horizon must be positive")
+    length = len(values)
+    if length == 0:
+        return np.empty((0,), dtype=np.int64)
+    invalid = (~values).astype(np.int64)
+    prefix = np.concatenate(([0], np.cumsum(invalid, dtype=np.int64)))
+    ends = np.minimum(np.arange(length, dtype=np.int64) + horizon, length)
+    covered = prefix[ends] - prefix[np.arange(length, dtype=np.int64)]
+    return np.flatnonzero(covered == 0).astype(np.int64)
+
+
+def _report_invalid_rows(data_dir: Path, name: str, length: int, *, required: bool) -> tuple[list[int], str | None]:
+    """Read strict build-report invalid rows and return rows plus report hash."""
+
+    report_path = data_dir / f"{Path(name).stem}.build_report.json"
+    if not report_path.is_file():
+        if required:
+            raise FileNotFoundError(
+                f"{report_path} is required for validity_source='build_report'"
+            )
+        return [], None
+    try:
+        payload = _read_json(report_path)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid build report JSON: {report_path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"build report must be a JSON object: {report_path}")
+    rows: set[int] = set()
+    for warning in payload.get("warnings", []):
+        if not isinstance(warning, dict):
+            continue
+        if warning.get("stream") != "sample_valid" or warning.get("reason") != "global_sample_invalid":
+            continue
+        row = warning.get("hdf5_row", warning.get("aligned_row"))
+        if row is None:
+            raise ValueError(f"sample_valid warning has no row in {report_path}")
+        try:
+            row_int = int(row)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid sample_valid row {row!r} in {report_path}") from exc
+        if not 0 <= row_int < length:
+            raise ValueError(f"sample_valid row {row_int} outside [0,{length}) in {report_path}")
+        rows.add(row_int)
+    digest = hashlib.sha256(report_path.read_bytes()).hexdigest()
+    return sorted(rows), digest
+
+
 def build_acmt_act_targets(
     data_dir: str | os.PathLike[str],
     memmap_dir: str | os.PathLike[str],
@@ -107,7 +167,11 @@ def build_acmt_act_targets(
     else:
         raw_splits = _read_json(root / "splits.json")
         splits = raw_splits.get("splits", raw_splits) if isinstance(raw_splits, dict) else {}
-    source_inventory = _source_inventory(data_root, names)
+    memmap_manifest = _read_json(root / "manifest.json") or {}
+    validity_source = str(memmap_manifest.get("validity_source", "h5_or_all"))
+    if validity_source not in VALIDITY_SOURCES:
+        raise ValueError(f"unsupported Memmap validity_source={validity_source!r}")
+    source_inventory = _source_inventory(data_root, names, validity_source=validity_source)
     source_hash = _hash_json(source_inventory)
     manifest_path = _targets_manifest_path(root)
     final_npz = _targets_npz_path(root)
@@ -187,6 +251,7 @@ def build_acmt_act_policy_stats(
         raise ValueError(f"no episodes in split {split!r}")
 
     count = 0
+    valid_anchor_count = 0
     total = np.zeros(8, np.float64)
     total_sq = np.zeros(8, np.float64)
     minimum = np.full(8, np.inf, np.float64)
@@ -197,12 +262,13 @@ def build_acmt_act_policy_stats(
         q = np.asarray(store.state[start:end, :7], dtype=np.float32)
         raw_action = np.asarray(store.action[start:end], dtype=np.float32)
         length = end - start
-        anchors = np.arange(length, dtype=np.int64)
-        for horizon in range(16):
+        anchors = _valid_anchor_offsets(store.sample_valid[start:end])
+        valid_anchor_count += int(len(anchors))
+        for horizon in range(ACTION_HORIZON):
             target = np.minimum(anchors + horizon, length - 1)
             mask = anchors + horizon < length
-            values = np.empty((length, 8), dtype=np.float32)
-            values[:, :7] = raw_action[target, :7] - q
+            values = np.empty((len(anchors), 8), dtype=np.float32)
+            values[:, :7] = raw_action[target, :7] - q[anchors]
             values[:, 7] = 1.0 - raw_action[target, 7]
             values = values[mask]
             if values.size:
@@ -211,13 +277,17 @@ def build_acmt_act_policy_stats(
                 total_sq += np.square(values, dtype=np.float64).sum(0)
                 minimum = np.minimum(minimum, values.min(0))
                 maximum = np.maximum(maximum, values.max(0))
-        if store.targets is not None and bool(store.targets["goal_valid"][start]):
-            goals.append(np.asarray(store.targets["goal_xyz"][start], dtype=np.float32))
+        if store.targets is not None and len(anchors):
+            first_anchor = int(anchors[0]) + start
+            if bool(store.targets["goal_valid"][first_anchor]):
+                goals.append(np.asarray(store.targets["goal_xyz"][first_anchor], dtype=np.float32))
     if count == 0:
         raise ValueError("no valid action targets available for policy statistics")
     mean = total / count
     std = np.sqrt(np.maximum(total_sq / count - np.square(mean), 1e-12))
     stats: dict[str, Any] = {
+        "validity_source": store.manifest.get("validity_source", "h5_or_all"),
+        "valid_anchor_count": valid_anchor_count,
         "action": {
             "count": count,
             "mean": mean.tolist(),
@@ -285,13 +355,29 @@ def _normalise_splits(split_file: Path, names: list[str]) -> dict[str, list[str]
     return result
 
 
-def _source_inventory(data_dir: Path, names: Iterable[str]) -> list[dict[str, Any]]:
+def _source_inventory(
+    data_dir: Path,
+    names: Iterable[str],
+    *,
+    validity_source: str = "h5_or_all",
+) -> list[dict[str, Any]]:
+    if validity_source not in VALIDITY_SOURCES:
+        raise ValueError(f"validity_source must be one of {VALIDITY_SOURCES}, got {validity_source!r}")
     inventory: list[dict[str, Any]] = []
     for name in names:
         path = data_dir / name
         if not path.is_file():
             raise FileNotFoundError(path)
-        with h5py.File(path, "r") as handle:
+        try:
+            handle_context = h5py.File(path, "r")
+        except OSError as exc:
+            if "32015" in str(exc) or "filter" in str(exc).lower():
+                raise OSError(
+                    f"cannot decode {path}; this dataset uses HDF5 Zstandard filter 32015. "
+                    "Set HDF5_PLUGIN_PATH to the hdf5plugin/plugins directory before starting Python."
+                ) from exc
+            raise
+        with handle_context as handle:
             missing = [key for key in REQUIRED_KEYS if key not in handle]
             if missing:
                 raise KeyError(f"{path} missing keys: {missing}")
@@ -319,6 +405,9 @@ def _source_inventory(data_dir: Path, names: Iterable[str]) -> list[dict[str, An
             if "sample_valid" in handle and tuple(handle["sample_valid"].shape) != (length,):
                 raise ValueError(f"{path}: sample_valid must be [T]")
         stat = path.stat()
+        invalid_rows, report_sha256 = _report_invalid_rows(
+            data_dir, name, length, required=validity_source == "build_report"
+        )
         inventory.append(
             {
                 "name": name,
@@ -326,12 +415,23 @@ def _source_inventory(data_dir: Path, names: Iterable[str]) -> list[dict[str, An
                 "size": int(stat.st_size),
                 "mtime_ns": int(stat.st_mtime_ns),
                 "shapes": shapes,
+                "validity_source": validity_source,
+                "invalid_rows": invalid_rows,
+                "invalid_count": len(invalid_rows),
+                "build_report_sha256": report_sha256,
             }
         )
     return inventory
 
 
-def _manifest(data_dir: Path, split_file: Path, inventory: list[dict[str, Any]], splits: dict[str, list[str]]) -> dict[str, Any]:
+def _manifest(
+    data_dir: Path,
+    split_file: Path,
+    inventory: list[dict[str, Any]],
+    splits: dict[str, list[str]],
+    *,
+    validity_source: str = "h5_or_all",
+) -> dict[str, Any]:
     return {
         "memmap_version": MEMMAP_VERSION,
         "data_dir": str(data_dir),
@@ -340,6 +440,8 @@ def _manifest(data_dir: Path, split_file: Path, inventory: list[dict[str, Any]],
         "source_inventory_sha256": _hash_json(inventory),
         "splits": splits,
         "split_sha256": _hash_json(splits),
+        "validity_source": validity_source,
+        "invalid_frame_count": int(sum(item.get("invalid_count", 0) for item in inventory)),
         "camera_order": list(CAMERA_NAMES),
         "crop_params": {key: list(value) for key, value in CROP_PARAMS.items()},
         "preprocess": {
@@ -360,6 +462,8 @@ def _manifest_matches(existing: dict[str, Any], expected: dict[str, Any]) -> boo
         "data_dir",
         "source_inventory_sha256",
         "split_sha256",
+        "validity_source",
+        "invalid_frame_count",
         "camera_order",
         "crop_params",
         "preprocess",
@@ -422,9 +526,15 @@ def _flush(arrays: dict[str, np.memmap]) -> None:
 def _write_stats(root: Path, arrays: dict[str, np.memmap], inventory: list[dict[str, Any]], splits: dict[str, list[str]], names: list[str]) -> None:
     train_indices = [names.index(name) for name in splits["train"]]
     starts = np.cumsum([0, *[int(item["frames"]) for item in inventory[:-1]]])
-    frame_indices = np.concatenate(
-        [np.arange(starts[index], starts[index] + int(inventory[index]["frames"])) for index in train_indices]
-    )
+    frame_parts = []
+    for index in train_indices:
+        start = int(starts[index])
+        end = start + int(inventory[index]["frames"])
+        anchors = _valid_anchor_offsets(np.asarray(arrays["sample_valid.npy"][start:end], dtype=bool))
+        frame_parts.append(start + anchors)
+    frame_indices = np.concatenate(frame_parts) if frame_parts else np.empty((0,), dtype=np.int64)
+    if frame_indices.size == 0:
+        raise ValueError("no valid train anchors remain for statistics")
 
     def stats(value: np.ndarray) -> dict[str, list[float] | int]:
         flat = np.asarray(value, dtype=np.float64).reshape(-1, value.shape[-1] if value.ndim > 1 else 1)
@@ -460,12 +570,15 @@ def convert_h5_to_memmap(
     resume: bool = False,
     progress: bool = True,
     device: str | torch.device = "cpu",
+    validity_source: str = "h5_or_all",
 ) -> Path:
     """Convert all H5 episodes to the exact ACMT-ACT cropped memmap format."""
 
     del device  # Cropping is a lossless CPU copy; no GPU work is needed.
     if chunk_frames <= 0:
         raise ValueError("chunk_frames must be positive")
+    if validity_source not in VALIDITY_SOURCES:
+        raise ValueError(f"validity_source must be one of {VALIDITY_SOURCES}, got {validity_source!r}")
     data_root = Path(data_dir).resolve()
     split_path = Path(split_file).resolve()
     output = Path(output_dir).resolve()
@@ -483,8 +596,8 @@ def convert_h5_to_memmap(
     if not names:
         raise FileNotFoundError(f"no H5 files found in {data_root}")
     splits = _normalise_splits(split_path, names)
-    inventory = _source_inventory(data_root, names)
-    expected = _manifest(data_root, split_path, inventory, splits)
+    inventory = _source_inventory(data_root, names, validity_source=validity_source)
+    expected = _manifest(data_root, split_path, inventory, splits, validity_source=validity_source)
     final_manifest = output / "manifest.json"
     existing = _read_json(final_manifest)
     if existing is not None:
@@ -496,6 +609,17 @@ def convert_h5_to_memmap(
         missing = [name for name in ARRAY_SPECS if not (output / name).is_file()]
         if missing:
             raise FileNotFoundError(f"complete ACMT-ACT memmap is missing arrays: {missing}")
+        if "valid_anchor_count" not in existing:
+            valid_array = np.load(output / "sample_valid.npy", mmap_mode="r")
+            ends = np.load(output / "episode_ends.npy", mmap_mode="r")
+            starts = np.concatenate(([0], np.asarray(ends[:-1], dtype=np.int64)))
+            existing["valid_anchor_count"] = int(
+                sum(
+                    len(_valid_anchor_offsets(valid_array[int(start) : int(end)]))
+                    for start, end in zip(starts, ends, strict=True)
+                )
+            )
+            _atomic_json(final_manifest, existing)
         return final_manifest
 
     progress_path = output / "conversion_state.json"
@@ -548,7 +672,16 @@ def convert_h5_to_memmap(
             length = int(inventory[episode_index]["frames"])
             destination_start = int(offsets[episode_index])
             bar.set_postfix(demo=name, episodes=f"{episode_index}/{len(names)}")
-            with h5py.File(data_root / name, "r") as handle:
+            try:
+                handle_context = h5py.File(data_root / name, "r")
+            except OSError as exc:
+                if "32015" in str(exc) or "filter" in str(exc).lower():
+                    raise OSError(
+                        f"cannot decode {data_root / name}; set HDF5_PLUGIN_PATH for Zstandard filter 32015"
+                    ) from exc
+                raise
+            with handle_context as handle:
+                report_invalid = set(int(row) for row in inventory[episode_index].get("invalid_rows", []))
                 for start in range(0, length, chunk_frames):
                     stop = min(length, start + chunk_frames)
                     rgb = _read_rgb_chunk(handle, start, stop)
@@ -558,6 +691,10 @@ def convert_h5_to_memmap(
                     action_q = np.nan_to_num(np.asarray(handle["actions/gello_q"][start:stop], dtype=np.float32))
                     action_g = np.nan_to_num(np.asarray(handle["actions/gello_gripper_cmd"][start:stop], dtype=np.float32)).reshape(-1, 1)
                     valid = np.asarray(handle["sample_valid"][start:stop], dtype=bool) if "sample_valid" in handle else np.ones(stop - start, dtype=bool)
+                    if report_invalid:
+                        for row in report_invalid:
+                            if start <= row < stop:
+                                valid[row - start] = False
                     destination = slice(destination_start + start, destination_start + stop)
                     arrays["rgb.npy"][destination] = rgb
                     arrays["state.npy"][destination] = np.concatenate([q, gpo], axis=-1)
@@ -581,7 +718,19 @@ def convert_h5_to_memmap(
     _atomic_json(output / "splits.json", {"splits": splits})
     _write_stats(output, arrays, inventory, splits, names)
     final = dict(expected)
-    final.update({"complete": True, "total_frames": total_frames, "episode_count": len(names), "created_s": time.time() - started})
+    valid_anchor_count = 0
+    for episode_index in range(len(names)):
+        start, end = int(offsets[episode_index]), int(offsets[episode_index] + inventory[episode_index]["frames"])
+        valid_anchor_count += len(_valid_anchor_offsets(np.asarray(arrays["sample_valid.npy"][start:end], dtype=bool)))
+    final.update(
+        {
+            "complete": True,
+            "total_frames": total_frames,
+            "episode_count": len(names),
+            "valid_anchor_count": int(valid_anchor_count),
+            "created_s": time.time() - started,
+        }
+    )
     _atomic_json(final_manifest, final)
     progress_path.unlink(missing_ok=True)
     return final_manifest
@@ -672,6 +821,7 @@ class ACMTActMemmapMetadata:
         camera_indices: tuple[int, ...] | None = None,
         depth_store: ACMTActDepthMemmapStore | None = None,
         native_absolute_actions: bool = False,
+        episode_lengths: list[int] | None = None,
     ):
         from lerobot.policies.acmt_act.configuration_acmt_act import XENSE0, XENSE1, depth_key, rgb_key
 
@@ -734,14 +884,15 @@ class ACMTActMemmapMetadata:
             for key, values in raw_stats.items()
             if isinstance(values, dict)
         }
-        starts = np.cumsum([0, *[store.bounds(i)[1] - store.bounds(i)[0] for i in range(len(store.episode_ends) - 1)]])
+        if episode_lengths is None:
+            episode_lengths = [store.bounds(i)[1] - store.bounds(i)[0] for i in selected_indices]
+        if len(episode_lengths) != len(selected_indices) or any(int(length) <= 0 for length in episode_lengths):
+            raise ValueError("episode_lengths must contain one positive length per selected episode")
         local_from, local_to, local_tasks = [], [], []
         total = 0
-        for local_index, global_index in enumerate(selected_indices):
-            start, end = store.bounds(global_index)
-            length = end - start
+        for local_index, (global_index, length) in enumerate(zip(selected_indices, episode_lengths, strict=True)):
             local_from.append(total)
-            total += length
+            total += int(length)
             local_to.append(total)
             local_tasks.append([repo_id])
         self.episodes = {
@@ -794,11 +945,26 @@ class ACMTACTMemmapDataset(Dataset):
             selected_indices = [selected_indices[index] for index in episodes]
         if not selected_indices:
             raise ValueError(f"ACMT-ACT memmap split {split!r} is empty")
-        self._selected_indices = selected_indices
         self.camera_indices = tuple(range(4) if camera_indices is None else camera_indices)
         self.chunk_size = int(chunk_size)
         self.native_absolute_actions = bool(native_absolute_actions)
         self.policy_kind = str(policy_kind)
+        # Keep the frame-aligned arrays untouched, but expose only anchors
+        # whose observation and complete action target window are valid.
+        valid_anchor_indices: list[np.ndarray] = []
+        filtered_indices: list[int] = []
+        for global_ep in selected_indices:
+            start, end = self.store.bounds(global_ep)
+            anchors = _valid_anchor_offsets(self.store.sample_valid[start:end], horizon=self.chunk_size)
+            if anchors.size == 0:
+                continue
+            filtered_indices.append(global_ep)
+            valid_anchor_indices.append(start + anchors)
+        if not filtered_indices:
+            raise ValueError(f"ACMT-ACT memmap split {split!r} has no valid action windows")
+        selected_indices = filtered_indices
+        self._selected_indices = selected_indices
+        self._anchor_indices = valid_anchor_indices
         self.depth_store = None
         if depth_root is not None:
             self.depth_store = ACMTActDepthMemmapStore(
@@ -813,6 +979,7 @@ class ACMTACTMemmapDataset(Dataset):
             self.camera_indices,
             depth_store=self.depth_store,
             native_absolute_actions=self.native_absolute_actions,
+            episode_lengths=[len(anchors) for anchors in valid_anchor_indices],
         )
         if self.policy_kind == "acmt_pi05":
             pi05_stats_path = self.store.root / "acmt_pi05_stats.json"
@@ -850,7 +1017,8 @@ class ACMTACTMemmapDataset(Dataset):
         global_ep = self._selected_indices[local_ep]
         global_start, global_end = self.store.bounds(global_ep)
         offset = local_index - local_start
-        return local_ep, global_ep, global_start + offset, global_end
+        global_index = int(self._anchor_indices[local_ep][offset])
+        return local_ep, global_ep, global_index, global_end
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         from lerobot.policies.acmt_act.configuration_acmt_act import XENSE0, XENSE1, depth_key, rgb_key
