@@ -60,6 +60,7 @@ run_preflight() {
 
 run_train() {
   local phase="$1" steps="$2" batch="$3" accumulation="$4" output="$5" log="$6" extra=()
+  local policy_args=("--policy.type=acmt_actv2")
   local cadence=20000
   if [[ "${phase}" == "stage3" ]]; then
     cadence=5000
@@ -70,10 +71,13 @@ run_train() {
   # before the first optimizer step.
   mkdir -p "$(dirname "${output}")"
   if [[ "${phase}" == "stage3" ]]; then
+    # The loader infers policy.type from the pretrained checkpoint.  Passing
+    # both --policy.path and --policy.type is rejected by the LeRobot parser.
+    policy_args=()
     extra+=("--policy.path=${FROZEN_OUTPUT}/checkpoints/best/pretrained_model")
   fi
   "${PYTHON}" -u -m lerobot.scripts.lerobot_train \
-    --policy.type=acmt_actv2 \
+    "${policy_args[@]}" \
     --policy.tactile_source=none \
     --policy.task_variant=peg \
     --policy.checkpoint_schema=acmt_actv2.dformerv2_spatial.v1 \
