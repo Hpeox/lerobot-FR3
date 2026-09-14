@@ -16,6 +16,12 @@ def main() -> None:
     parser.add_argument("--device", default="cpu", help="Compatibility option; conversion is lossless CPU I/O.")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--progress", action="store_true")
+    parser.add_argument(
+        "--validity-source",
+        choices=("h5_or_all", "build_report"),
+        default="h5_or_all",
+        help="Where sample_valid comes from; build_report applies global_sample_invalid rows.",
+    )
     args = parser.parse_args()
     manifest = convert_h5_to_memmap(
         args.data_dir,
@@ -25,6 +31,7 @@ def main() -> None:
         resume=args.resume,
         progress=args.progress,
         device=args.device,
+        validity_source=args.validity_source,
     )
     print(f"ACMT-ACT memmap ready: {manifest}")
 
