@@ -487,8 +487,7 @@ def test_acmt_act_plan_is_postprocessed_once_with_its_observation_anchor(
 
 @pytest.mark.parametrize(
     "engine_type,backbone,reversed_direction",
-    [(ACMTACTInferenceEngine, "resnet50", True),
-     (ACMTACTInferenceEngine, "dformerv2", False),
+    [(ACMTACTInferenceEngine, "dformerv2", False),
      (ACMTDPInferenceEngine, "resnet50", False)],
 )
 def test_gripper_direction_experiment_preserves_plan_anchors(
@@ -530,6 +529,38 @@ def test_gripper_direction_experiment_preserves_plan_anchors(
         assert relative._last_state is previous
         assert result.shape == (1, 16, 8)
         assert postprocessor.calls == 1
+    finally:
+        engine.stop()
+
+
+def test_acmt_act_fixed_gripper_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    from lerobot.policies.acmt_act.configuration_acmt_act import ACMTACTConfig
+    from lerobot.policies.acmt_act.processor_acmt_act import make_acmt_act_pre_post_processors
+    from lerobot.robots.fr3.protocols import policy_gripper_to_gpo
+
+    config = ACMTACTConfig(device="cpu", pretrained_backbone_weights=None)
+    mean = torch.tensor([0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7, 0.4])
+    std = torch.tensor([0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.25])
+    preprocessor, postprocessor = make_acmt_act_pre_post_processors(
+        config, {ACTION: {"mean": mean, "std": std}}
+    )
+    policy = _AnchorPolicy()
+    policy.config = config
+    policy.model = SimpleNamespace(action_mean=mean.view(1, 1, 8), action_std=std.view(1, 1, 8))
+    names = config.action_feature_names
+    engine = ACMTACTInferenceEngine(
+        policy=policy, preprocessor=preprocessor, postprocessor=postprocessor,
+        dataset_features={ACTION: {"names": names}}, ordered_action_keys=names,
+        task="test", device="cpu", robot_type="fr3",
+    )
+    anchor = torch.tensor([[0.2, -0.3, 0.4, -1.5, 0.6, 1.7, -0.8, 0.5]])
+    try:
+        for probe, expected_gpo in [(0.0, 3), (1.0, 255)]:
+            monkeypatch.setattr(ACMTACTInferenceEngine, "_PROBE_GRIPPER_PHYSICAL", probe)
+            result = engine._plan_now({}, plan_id=0, anchor_state=anchor).actions
+            assert result.shape == (16, 8)
+            torch.testing.assert_close(result[:, :7], anchor[:, :7].expand(16, 7))
+            assert [policy_gripper_to_gpo(value)[1] for value in result[:, 7].tolist()] == [expected_gpo] * 16
     finally:
         engine.stop()
 

@@ -13,14 +13,24 @@ from .sync import SyncInferenceEngine
 class ACMTACTInferenceEngine(ACMTDPInferenceEngine):
     """Run legacy ``acmt_act`` with its causal 16-predict/8-execute queue."""
 
+    _PROBE_GRIPPER_PHYSICAL = 0.0  # 0.0 = open, 1.0 = closed.
+
     def _postprocess_plan(self, action, anchor_state):
-        result = super()._postprocess_plan(action, anchor_state)
         config = self._policy.config
-        if (
+        probe_enabled = (
             self._plan_postprocess
             and getattr(config, "checkpoint_schema", None) == "acmt_act.v3"
             and getattr(config, "vision_backbone", None) == "resnet50"
-        ):
+        )
+        if probe_enabled:
+            # Replace the 16-step prediction with zero physical joint residuals
+            # and a fixed gripper target, then run every existing postprocessor.
+            physical = action.new_zeros((1, 16, 8))
+            physical[..., 7] = self._PROBE_GRIPPER_PHYSICAL
+            model = self._policy.model
+            action = (physical - model.action_mean.to(action)) / model.action_std.to(action)
+        result = super()._postprocess_plan(action, anchor_state)
+        if probe_enabled:
             # Experiment: reverse normalized gPO after the existing processors,
             # retaining the deployed 3..255 endpoints and joint anchors.
             result = result.clone()
