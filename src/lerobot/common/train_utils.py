@@ -235,6 +235,14 @@ def load_training_state(
     return step, optimizer, scheduler
 
 
+def override_optimizer_learning_rate(optimizer: Optimizer, learning_rate: float) -> None:
+    """Replace every optimizer parameter-group LR without touching its accumulated state."""
+    if learning_rate <= 0:
+        raise ValueError("learning_rate must be > 0")
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = learning_rate
+
+
 def gather_fsdp_state_dicts(model, optimizer) -> tuple[dict, dict]:
     """Gather the full (unsharded) model and optimizer state dicts under FSDP.
 

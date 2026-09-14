@@ -26,6 +26,7 @@ from lerobot.common.train_utils import (
     load_training_num_processes,
     load_training_state,
     load_training_step,
+    override_optimizer_learning_rate,
     push_checkpoint_to_hub,
     save_checkpoint,
     save_training_state,
@@ -154,6 +155,29 @@ def test_load_training_state_skip_optimizer(tmp_path, optimizer, scheduler):
     assert loaded_step == 10
     assert loaded_optimizer is optimizer
     assert loaded_scheduler is scheduler
+
+
+def test_override_optimizer_learning_rate_preserves_state(optimizer):
+    parameter = next(iter(optimizer.param_groups[0]["params"]))
+    optimizer_state_before = {
+        key: value.clone() if hasattr(value, "clone") else value
+        for key, value in optimizer.state[parameter].items()
+    }
+
+    override_optimizer_learning_rate(optimizer, 3e-6)
+
+    assert all(param_group["lr"] == 3e-6 for param_group in optimizer.param_groups)
+    for key, value_before in optimizer_state_before.items():
+        value_after = optimizer.state[parameter][key]
+        if hasattr(value_before, "equal"):
+            assert value_after.equal(value_before)
+        else:
+            assert value_after == value_before
+
+
+def test_override_optimizer_learning_rate_rejects_non_positive_value(optimizer):
+    with pytest.raises(ValueError, match="learning_rate must be > 0"):
+        override_optimizer_learning_rate(optimizer, 0.0)
 
 
 def test_push_checkpoint_to_hub_creates_repo_and_uploads(tmp_path, monkeypatch):

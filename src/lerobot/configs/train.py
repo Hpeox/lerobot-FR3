@@ -90,6 +90,10 @@ class TrainPipelineConfig(HubMixin):
     # is to use the configuration from the checkpoint, regardless of what's provided with the training
     # command at the time of resumption (CLI `--*` flags still override).
     resume: bool = False
+    # Optionally replace the learning rate stored in the optimizer checkpoint after its state is
+    # restored. This preserves optimizer moments while allowing a lower-rate continuation stage.
+    # Schedulers are intentionally unsupported because they would overwrite this value on the next step.
+    resume_optimizer_lr: float | None = None
     # `seed` is used for training (eg: model initialization, dataset shuffling)
     # AND for the evaluation environments.
     seed: int | None = 1000
@@ -258,6 +262,14 @@ class TrainPipelineConfig(HubMixin):
         elif self.use_policy_training_preset and not self.resume:
             self.optimizer = active_cfg.get_optimizer_preset()
             self.scheduler = active_cfg.get_scheduler_preset()
+
+        if self.resume_optimizer_lr is not None:
+            if not self.resume:
+                raise ValueError("resume_optimizer_lr requires resume=true")
+            if self.resume_optimizer_lr <= 0:
+                raise ValueError("resume_optimizer_lr must be > 0")
+            if self.scheduler is not None:
+                raise ValueError("resume_optimizer_lr requires scheduler=None")
 
         if self.eval_steps > 0 and self.dataset.eval_split == 0.0:
             raise ValueError("eval_steps > 0 requires dataset.eval_split > 0.0 to hold out eval data.")

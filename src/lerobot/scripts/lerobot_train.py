@@ -43,6 +43,7 @@ from lerobot.common.train_utils import (
     load_training_batch_size,
     load_training_num_processes,
     load_training_state,
+    override_optimizer_learning_rate,
     push_checkpoint_to_hub,
     save_checkpoint,
     update_last_checkpoint,
@@ -408,6 +409,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         step, optimizer, lr_scheduler = load_training_state(
             cfg.checkpoint_path, optimizer, lr_scheduler, load_optimizer=not is_fsdp
         )
+        if not is_fsdp and cfg.resume_optimizer_lr is not None:
+            override_optimizer_learning_rate(optimizer, cfg.resume_optimizer_lr)
 
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
@@ -546,6 +549,11 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # model are FSDP-wrapped (i.e. after `prepare`). Collective: every rank must participate.
     if cfg.resume and accelerator.distributed_type == DistributedType.FSDP:
         load_fsdp_optimizer_state(policy, optimizer, cfg.checkpoint_path)
+        if cfg.resume_optimizer_lr is not None:
+            override_optimizer_learning_rate(optimizer, cfg.resume_optimizer_lr)
+
+    if cfg.resume_optimizer_lr is not None and is_main_process:
+        logging.info(f"Overrode resumed optimizer learning rate to {cfg.resume_optimizer_lr:.3e}")
 
     dl_iter = cycle(dataloader)
 

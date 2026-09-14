@@ -10,6 +10,7 @@ MEMMAP="${MEMMAP:-/data2/cym/acmt_act_memmap_v1/16mm-peg-in-hole-zstd100-2026091
 OUTPUT_ROOT="${OUTPUT_ROOT:-/data2/cym/16mm_peg_in_hole/acmt_act/zstd100_20260910}"
 LOG_ROOT="${LOG_ROOT:-/data2/cym/acmt_act_logs/zstd100_20260910_resnet50_200k}"
 STEPS="${STEPS:-200000}"
+RESUME_OPTIMIZER_LR="${RESUME_OPTIMIZER_LR:-}"
 
 export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 export PYTHONUNBUFFERED=1
@@ -59,6 +60,9 @@ run_one() {
       return 1
     }
     resume_args=(--resume=true "--config_path=${last}/pretrained_model/train_config.json")
+    if [[ -n "${RESUME_OPTIMIZER_LR}" ]]; then
+      resume_args+=("--resume_optimizer_lr=${RESUME_OPTIMIZER_LR}")
+    fi
   fi
 
   echo "[START] peg/${source} from ${step}/${STEPS}" | tee -a "${LOG_ROOT}/all_train.log"
