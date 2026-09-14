@@ -189,7 +189,7 @@ def test_v5_processor_validates_and_serializes_source_camera_order() -> None:
 def test_v5_postprocessor_maps_gripper_to_wire_gpo() -> None:
     _, postprocessor = make_acmt_dp_v5_pre_post_processors(_config("none"))
     processed = postprocessor.process_action(torch.tensor([[0.0] * 8]))
-    assert processed[0, 7].item() == 1.0
+    assert processed[0, 7].item() == pytest.approx(3.0 / 255.0)
 
 
 def test_v5_tactigen_depth_uses_the_same_camera_permutation() -> None:

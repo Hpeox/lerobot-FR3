@@ -18,6 +18,7 @@ from lerobot.processor.pipeline import PolicyActionProcessorStep, ProcessorStepR
 
 # Robotiq reports the usable deployed gPO interval as 3..255. Native
 # ACMT-ACT actions use physical semantics: 0.0 is open and 1.0 is closed.
+# The deployed FR3 contract uses gPO=3 for open and gPO=255 for closed;
 # FR3's existing policy converter consumes normalized gPO instead.
 GRIPPER_GPO_MIN = 3.0
 GRIPPER_GPO_MAX = 255.0
@@ -28,13 +29,13 @@ def policy_gripper_to_fr3_pos(value: Tensor) -> Tensor:
 
     The input is clamped to the model's declared ``[0, 1]`` action interval.
     The returned value is normalized so the unchanged FR3 converter emits
-    ``gPO=255`` (open) at input 0 and ``gPO=3`` (closed) at input 1.
+    ``gPO=3`` (open) at input 0 and ``gPO=255`` (closed) at input 1.
     """
 
     if not isinstance(value, torch.Tensor):
         raise TypeError(f"gripper action must be a torch.Tensor, got {type(value).__name__}")
     clipped = value.clamp(0.0, 1.0)
-    gpo = GRIPPER_GPO_MAX - (GRIPPER_GPO_MAX - GRIPPER_GPO_MIN) * clipped
+    gpo = GRIPPER_GPO_MIN + (GRIPPER_GPO_MAX - GRIPPER_GPO_MIN) * clipped
     return gpo / 255.0
 
 
@@ -44,7 +45,7 @@ def fr3_pos_to_policy_gripper(value: Tensor) -> Tensor:
     if not isinstance(value, torch.Tensor):
         raise TypeError(f"gripper action must be a torch.Tensor, got {type(value).__name__}")
     normalized_gpo = value.clamp(GRIPPER_GPO_MIN / 255.0, GRIPPER_GPO_MAX / 255.0)
-    return (GRIPPER_GPO_MAX - normalized_gpo * 255.0) / (GRIPPER_GPO_MAX - GRIPPER_GPO_MIN)
+    return (normalized_gpo * 255.0 - GRIPPER_GPO_MIN) / (GRIPPER_GPO_MAX - GRIPPER_GPO_MIN)
 
 
 @dataclass

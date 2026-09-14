@@ -108,8 +108,8 @@ def test_v3_postprocessor_maps_policy_gripper_to_wire_range() -> None:
     action[0, 7] = 0.0
     action[1, 7] = 1.0
     processed = postprocessor.process_action(action)
-    assert processed[0, 7].item() == pytest.approx(1.0)
-    assert processed[1, 7].item() == pytest.approx(3.0 / 255.0)
+    assert processed[0, 7].item() == pytest.approx(3.0 / 255.0)
+    assert processed[1, 7].item() == pytest.approx(1.0)
 
 
 def test_v3_loader_rejects_v4_artifact_before_model_construction(tmp_path) -> None:

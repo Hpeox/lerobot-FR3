@@ -324,7 +324,7 @@ def convert_one(
             "camera_order": ["top", "side", "wrist_left", "wrist_right"],
             "camera_keys": list(config.camera_keys),
             "source_camera_keys": list(ACMT_DP_DEFAULT_SOURCE_CAMERA_KEYS),
-            "gripper_mapping": "policy_[0,1]_to_gpo_[255,3]",
+            "gripper_mapping": "policy_[0,1]_to_gpo_[3,255]",
             "visual_preprocess": "robomimic_0.2.0_resize240_center216_range",
             "observation_encoder_impl": "robomimic_0.2.0_official",
             "source_provenance": {

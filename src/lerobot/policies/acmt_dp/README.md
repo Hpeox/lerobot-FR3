@@ -84,8 +84,9 @@ actions and keeps eight actions as reserve at a nominal 30 Hz. Planning latency
 must be measured before hardware rollout; 100-step inference can exhaust the
 reserve on slower systems.
 
-The v3 processor maps policy gripper opening `[0,1]` to the existing FR3 wire
-direction `[255,3]`; model weights are unchanged. Convert a v3 checkpoint with:
+The v3 processor maps the physical policy gripper scalar `[0,1]` (`0=open`,
+`1=closed`) to the existing FR3 wire range `[gPO3,gPO255]`; model weights are
+unchanged. Convert a v3 checkpoint with:
 
 ```bash
 python -m lerobot.scripts.convert_acmt_dp_v3_checkpoint \
@@ -113,7 +114,8 @@ processor preserves the deployment camera contract by reading runtime
 `camera.cam4`, `camera.cam3`, `camera.cam1`, `camera.cam2` into policy semantic
 slots `top`, `side`, `wrist_left`, `wrist_right`; serialized
 `source_camera_keys` makes this permutation explicit. The policy postprocessor
-maps opening action `[0,1]` to normalized gPO wire `[255,3]`.
+maps opening action `[0,1]` (`0=open`, `1=closed`) to normalized gPO wire
+`[3,255]`.
 The observation history is four frames with official first-frame padding. The
 internal 19-step prediction is exposed as
 `prediction_raw[:,3:19]` (`[B,16,8]`), and the rolling runtime executes its first
