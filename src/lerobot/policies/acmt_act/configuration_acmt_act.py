@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -111,6 +112,10 @@ class ACMTACTConfig(ACTConfig):
     state_dim: int = 8
     tactile_history: int = 4  # causal ACMT ring; ACT consumes its latest frame
     control_hz: float = 30.0
+    # Deployment-time per-joint command slew limit.  This is applied after
+    # residual-to-absolute action restoration and is not part of the learned
+    # action normalization or model state.
+    max_joint_step_degrees: float = 10.0
     # Train through Accelerate's autocast context.  This is deliberately a
     # config field rather than an environment-only switch so checkpoints keep
     # the precision used for their training run.
@@ -180,6 +185,7 @@ class ACMTACTConfig(ACTConfig):
         self.goal_std = tuple(float(v) for v in self.goal_std)
         self.action_mean = tuple(float(v) for v in self.action_mean)
         self.action_std = tuple(float(v) for v in self.action_std)
+        self.max_joint_step_degrees = float(self.max_joint_step_degrees)
         self.input_features = _coerce_features(self.input_features)
         self.output_features = _coerce_features(self.output_features)
 
@@ -243,6 +249,10 @@ class ACMTACTConfig(ACTConfig):
             raise ValueError("ACMT-ACT fixes the 16-predict/8-execute 8D action protocol")
         if self.tactile_history != 4 or self.control_hz != 30.0:
             raise ValueError("ACMT-ACT fixes a four-frame causal ACMT ring at 30 Hz")
+        if not math.isfinite(self.max_joint_step_degrees) or not (
+            0.0 < self.max_joint_step_degrees <= 10.0
+        ):
+            raise ValueError("max_joint_step_degrees must be finite and in (0, 10]")
         if self.camera_keys != CAMERA_KEYS or self.camera_names != CAMERA_NAMES:
             raise ValueError("ACMT-ACT camera order must be top, side, wrist_left, wrist_right")
         if (

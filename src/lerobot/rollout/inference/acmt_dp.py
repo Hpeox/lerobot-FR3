@@ -108,6 +108,7 @@ class TimedActionQueue:
         with self._lock:
             self._items.clear()
             self._expired = 0
+            self._last_plan_id = -1
             self._last_target_time = None
 
     def install(self, plan: ActionPlan) -> None:
@@ -189,6 +190,61 @@ class TimedActionQueue:
             self._last_plan_id = plan_id
             self._last_target_time = plan.start_time + (PREDICTION_HORIZON - 1) * self.period_s
             return removed, start_time
+
+    def insert_after_popped(
+        self,
+        popped: TimedAction,
+        values: torch.Tensor,
+        action_indices: list[int] | None = None,
+    ) -> None:
+        """Insert extra actions after a just-dispatched item and retime the future.
+
+        This is used by the ACMT-ACT v3 boundary bridge.  ``popped`` has
+        already been removed by :meth:`pop_due`; the inserted values occupy
+        the following 30 Hz deadlines and all existing future items are
+        shifted by the inserted count.  The ordinary fixed [16,8] plan API is
+        unchanged for all callers that do not need a bridge.
+        """
+        values = values.detach().float()
+        if values.ndim != 2 or values.shape[1] != ACTION_DIM:
+            raise ValueError(f"inserted actions must be [N,{ACTION_DIM}], got {tuple(values.shape)}")
+        if not torch.isfinite(values).all():
+            raise ValueError("inserted actions contain non-finite values")
+        if values.shape[0] == 0:
+            return
+        if action_indices is None:
+            action_indices = list(range(values.shape[0]))
+        if len(action_indices) != values.shape[0]:
+            raise ValueError("inserted action_indices must match inserted actions")
+
+        inserted_count = values.shape[0]
+        shift_s = inserted_count * self.period_s
+        with self._lock:
+            future = [
+                TimedAction(
+                    item.plan_id,
+                    item.action_index,
+                    item.target_time + shift_s,
+                    item.value,
+                )
+                for item in self._items
+            ]
+            inserted = [
+                TimedAction(
+                    popped.plan_id,
+                    int(action_index),
+                    popped.target_time + (offset + 1) * self.period_s,
+                    value,
+                )
+                for offset, (action_index, value) in enumerate(zip(action_indices, values, strict=True))
+            ]
+            self._items.clear()
+            self._items.extend(inserted)
+            self._items.extend(future)
+            if self._last_target_time is None:
+                self._last_target_time = inserted[-1].target_time
+            else:
+                self._last_target_time += shift_s
 
     def snapshot(self) -> tuple[torch.Tensor, ...]:
         with self._lock:
@@ -444,6 +500,10 @@ class ACMTDPInferenceEngine(InferenceEngine):
             finally:
                 self._relative_action_step._last_state = previous_state
 
+    def _prepare_timed_action(self, timed: TimedAction) -> torch.Tensor:
+        """Allow policy-specific output handling immediately after queue pop."""
+        return timed.value
+
     def _plan_now(
         self,
         window: dict,
@@ -586,7 +646,16 @@ class ACMTDPInferenceEngine(InferenceEngine):
                     )
                     logger.info("ACMT-DP initial plan ready: id=%d queue=%d", plan_id, len(self._queue))
             timed = self._queue.pop_due()
-            action = None if timed is None else timed.value
+            if timed is not None:
+                # The v3 slew limiter uses the current plan's observation
+                # anchor for its first accepted command.  Publish this
+                # snapshot before the policy-specific timed-action hook runs;
+                # otherwise the first action of an episode would have no
+                # safe reference even though the observation was captured
+                # above.
+                self._current_action_window = current_window
+                self._current_action_anchor_state = anchor_state
+            action = None if timed is None else self._prepare_timed_action(timed)
             if action is None:
                 # A not-yet-due item is preferable to sending it early; an
                 # expired sequence has already been discarded by pop_due().
@@ -597,8 +666,6 @@ class ACMTDPInferenceEngine(InferenceEngine):
                     self._boundary_in_flight = True
                     self._submit_plan(current_window, anchor_state)
                 return None
-            self._current_action_window = current_window
-            self._current_action_anchor_state = anchor_state
             if len(self._queue) <= EXECUTION_HORIZON:
                 self._boundary_in_flight = True
             if self._plan_postprocess:

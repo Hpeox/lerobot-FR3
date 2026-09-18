@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import threading
 import time as wall_time
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from lerobot.rollout.inference.acmt_dp import (
     ACTION_DIM,
     CONTROL_HZ,
     EXECUTION_HORIZON,
+    JOINT_POSITION_KEYS,
     PREDICTION_HORIZON,
     ACMTDPInferenceEngine,
     ActionPlan,
@@ -84,6 +86,14 @@ class _FakePolicy:
         return torch.full((1, PREDICTION_HORIZON, ACTION_DIM), float(sequence))
 
 
+class _FakeACMTACTV3Policy(_FakePolicy):
+    def __init__(self) -> None:
+        super().__init__("none", schema_version=3)
+        self.name = "acmt_act"
+        self.config.checkpoint_schema = "acmt_act.v3"
+        self.config.max_joint_step_degrees = 10.0
+
+
 class _FakeClock:
     def __init__(self, value: float = 100.0) -> None:
         self.value = value
@@ -110,11 +120,180 @@ def _make_engine(policy: _FakePolicy) -> ACMTDPInferenceEngine:
     return engine
 
 
+def _make_acmt_act_v3_engine(
+    ordered_action_keys: list[str] | None = None,
+) -> ACMTACTInferenceEngine:
+    names = ordered_action_keys or [*JOINT_POSITION_KEYS, "gripper.pos"]
+    engine = ACMTACTInferenceEngine(
+        policy=_FakeACMTACTV3Policy(),
+        preprocessor=_IdentityProcessor(),
+        postprocessor=_IdentityProcessor(),
+        dataset_features={ACTION: {"names": names}},
+        ordered_action_keys=names,
+        task="test",
+        device="cpu",
+        robot_type="fr3",
+    )
+    engine.reset()
+    engine.start()
+    return engine
+
+
 def test_v5_policy_uses_the_same_rolling_engine_protocol() -> None:
     engine = _make_engine(_FakePolicy("none", schema_version=5))
     try:
         assert engine.ready
         assert engine.get_action(_observation(0)) is not None
+        assert len(engine._queue) == PREDICTION_HORIZON - 1
+    finally:
+        engine.stop()
+
+
+def test_acmt_act_v3_joint_step_limiter_clips_joints_but_not_gripper() -> None:
+    engine = _make_acmt_act_v3_engine()
+    limit = math.radians(10.0)
+    try:
+        engine._current_action_anchor_state = torch.zeros(1, ACTION_DIM)
+        requested = torch.tensor(
+            [limit + 0.02, -limit - 0.02, limit, -limit, 0.02, -0.02, 0.0, 0.37]
+        )
+        limited = engine._limit_joint_step(requested)
+        torch.testing.assert_close(
+            limited[:7],
+            torch.tensor([limit, -limit, limit, -limit, 0.02, -0.02, 0.0]),
+        )
+        assert limited[7].item() == pytest.approx(0.37)
+
+        # The next command is compared with the command accepted by the
+        # transport, not with the original unclipped policy request.
+        engine.notify_action_executed(limited)
+        next_requested = torch.tensor([2.0] * 7 + [0.61])
+        next_limited = engine._limit_joint_step(next_requested)
+        torch.testing.assert_close(next_limited[:7], limited[:7] + limit)
+        assert next_limited[7].item() == pytest.approx(0.61)
+    finally:
+        engine.stop()
+
+
+def test_acmt_act_v3_joint_step_limiter_reset_uses_new_observation_anchor() -> None:
+    engine = _make_acmt_act_v3_engine()
+    limit = math.radians(10.0)
+    try:
+        engine._current_action_anchor_state = torch.full((1, ACTION_DIM), 0.5)
+        first = engine._limit_joint_step(torch.zeros(ACTION_DIM))
+        torch.testing.assert_close(first[:7], torch.full((7,), 0.5 - limit))
+
+        # A failed send does not call notify_action_executed, so it cannot
+        # advance the limiter reference.
+        engine._current_action_anchor_state = torch.full((1, ACTION_DIM), 1.0)
+        after_failed_send = engine._limit_joint_step(torch.zeros(ACTION_DIM))
+        torch.testing.assert_close(after_failed_send[:7], torch.full((7,), 1.0 - limit))
+
+        engine.notify_action_executed(first)
+        engine.reset()
+        assert engine._active_plan_id is None
+        assert engine._last_accepted_action is None
+        assert engine._queue.last_plan_id == -1
+        engine._current_action_anchor_state = torch.full((1, ACTION_DIM), 1.0)
+        after_reset = engine._limit_joint_step(torch.zeros(ACTION_DIM))
+        torch.testing.assert_close(after_reset[:7], torch.full((7,), 1.0 - limit))
+    finally:
+        engine.stop()
+
+
+def test_acmt_act_v3_get_action_publishes_anchor_before_first_limit() -> None:
+    engine = _make_acmt_act_v3_engine()
+    try:
+        engine._prepare = lambda observation: observation  # type: ignore[method-assign]
+        engine._capture_action_anchor = lambda: torch.zeros(ACTION_DIM)  # type: ignore[method-assign]
+        action = engine.get_action(_observation(0))
+        assert action is not None
+        torch.testing.assert_close(action, torch.zeros(ACTION_DIM))
+    finally:
+        engine.stop()
+
+
+def test_acmt_act_v3_joint_step_limiter_follows_reordered_action_keys() -> None:
+    names = ["gripper.pos", *JOINT_POSITION_KEYS]
+    engine = _make_acmt_act_v3_engine(names)
+    limit = math.radians(10.0)
+    try:
+        engine._current_action_anchor_state = torch.zeros(1, ACTION_DIM)
+        requested = torch.tensor([0.73, *([limit + 0.03] * 7)])
+        limited = engine._limit_joint_step(requested)
+        assert limited[0].item() == pytest.approx(0.73)
+        torch.testing.assert_close(limited[1:], torch.full((7,), limit))
+    finally:
+        engine.stop()
+
+
+def test_acmt_act_v3_boundary_bridge_retimes_future_and_keeps_gripper() -> None:
+    engine = _make_acmt_act_v3_engine()
+    limit = math.radians(10.0)
+    period = 1.0 / CONTROL_HZ
+    old_action = torch.tensor([0.0] * 7 + [0.2])
+    target = torch.tensor([math.radians(25.0)] * 7 + [0.9])
+    future_actions = torch.stack([target, *[torch.full((ACTION_DIM,), float(index)) for index in range(1, 16)]])
+    engine._active_plan_id = 0
+    engine._last_accepted_action = old_action.clone()
+    engine._last_accepted_joint_target = old_action[:7].clone()
+    engine._queue.install(ActionPlan(1, future_actions, start_time=100.0))
+
+    try:
+        first_timed = engine._queue.pop_due(100.0)
+        assert first_timed is not None
+        first = engine._limit_joint_step(engine._prepare_timed_action(first_timed))
+        assert len(engine._queue) == PREDICTION_HORIZON + 1
+        queued = list(engine._queue._items)
+        assert [(item.plan_id, item.action_index) for item in queued[:3]] == [(1, -1), (1, 0), (1, 1)]
+        assert queued[0].target_time == pytest.approx(100.0 + period)
+        assert queued[1].target_time == pytest.approx(100.0 + 2 * period)
+        assert queued[2].target_time == pytest.approx(100.0 + 3 * period)
+        assert queued[-1].target_time == pytest.approx(100.0 + 17 * period)
+        torch.testing.assert_close(first[:7], torch.full((7,), math.radians(25.0) / 3.0))
+        assert first[7].item() == pytest.approx(0.2)
+
+        sequence = [first]
+        engine.notify_action_executed(first)
+        for offset in range(1, 10):
+            timed = engine._queue.pop_due(100.0 + offset * period)
+            assert timed is not None
+            action = engine._limit_joint_step(engine._prepare_timed_action(timed))
+            sequence.append(action)
+            engine.notify_action_executed(action)
+
+        # Two bridge segments are followed by the original new-plan action 0,
+        # then action indices 1..7.  The eight model actions are not consumed
+        # by the bridge itself, and each adjacent joint delta stays <= 10°.
+        torch.testing.assert_close(sequence[1][:7], torch.full((7,), math.radians(50.0) / 3.0))
+        torch.testing.assert_close(sequence[2][:7], target[:7])
+        assert sequence[1][7].item() == pytest.approx(0.2)
+        assert sequence[2][7].item() == pytest.approx(0.9)
+        assert sequence[3][7].item() == pytest.approx(1.0)
+        for previous, current in zip(sequence, sequence[1:]):
+            assert float((current[:7] - previous[:7]).abs().max()) <= limit + 1e-6
+
+        # The action following the new plan's first action was shifted by the
+        # two inserted bridge frames, preserving the 30 Hz deadline spacing.
+        assert sequence[3][0].item() == pytest.approx(target[0].item() + limit)
+        assert engine._queue.pop_due(100.0 + 10 * period) is not None
+    finally:
+        engine.stop()
+
+
+def test_acmt_act_v3_boundary_at_limit_does_not_insert_bridge() -> None:
+    engine = _make_acmt_act_v3_engine()
+    target = torch.tensor([math.radians(10.0)] * 7 + [0.8])
+    actions = torch.stack([target, *[torch.zeros(ACTION_DIM) for _ in range(15)]])
+    engine._active_plan_id = 0
+    engine._last_accepted_action = torch.zeros(ACTION_DIM)
+    engine._last_accepted_joint_target = torch.zeros(7)
+    engine._queue.install(ActionPlan(1, actions, start_time=100.0))
+    try:
+        timed = engine._queue.pop_due(100.0)
+        assert timed is not None
+        output = engine._prepare_timed_action(timed)
+        torch.testing.assert_close(output, target)
         assert len(engine._queue) == PREDICTION_HORIZON - 1
     finally:
         engine.stop()
@@ -156,6 +335,7 @@ def test_factory_routes_acmt_act_v2_to_rolling_engine() -> None:
 
 
 def test_factory_routes_acmt_act_v3_to_rolling_engine() -> None:
+    action_names = [*JOINT_POSITION_KEYS, "gripper.pos"]
     policy = SimpleNamespace(
         name="acmt_act",
         config=SimpleNamespace(
@@ -176,8 +356,8 @@ def test_factory_routes_acmt_act_v3_to_rolling_engine() -> None:
         postprocessor=_IdentityProcessor(),
         robot_wrapper=SimpleNamespace(robot_type="fr3"),
         hw_features={},
-        dataset_features={ACTION: {"names": [f"action_{index}" for index in range(ACTION_DIM)]}},
-        ordered_action_keys=[f"action_{index}" for index in range(ACTION_DIM)],
+        dataset_features={ACTION: {"names": action_names}},
+        ordered_action_keys=action_names,
         task="test",
         fps=CONTROL_HZ,
         device="cpu",

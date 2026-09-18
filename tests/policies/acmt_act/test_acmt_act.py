@@ -50,7 +50,18 @@ def test_factory_and_config_protocol() -> None:
     assert config.n_obs_steps == 1
     assert config.chunk_size == 16
     assert config.n_action_steps == 8
+    assert config.max_joint_step_degrees == pytest.approx(10.0)
     assert get_policy_class("acmt_act") is ACMTACTPolicy
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, 10.0001, float("inf"), float("nan")])
+def test_config_rejects_invalid_joint_step_limit(value: float) -> None:
+    with pytest.raises(ValueError, match="max_joint_step_degrees"):
+        ACMTACTConfig(
+            device="cpu",
+            pretrained_backbone_weights=None,
+            max_joint_step_degrees=value,
+        )
 
 
 def test_crop_boxes_are_exact_and_reject_wrong_resolution() -> None:
