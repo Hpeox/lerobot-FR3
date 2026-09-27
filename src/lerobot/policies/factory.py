@@ -373,6 +373,8 @@ def make_pre_post_processors(
         if isinstance(policy_cfg, ACMTACTConfig):
             acmt_override = dict(preprocessor_overrides.get("acmt_act_observation_processor", {}) or {})
             acmt_override["tactile_source"] = policy_cfg.tactile_source
+            acmt_override["generator_source_camera_keys"] = policy_cfg.generator_source_camera_keys
+            acmt_override["generator_backend"] = policy_cfg.generator_backend
             preprocessor_overrides["acmt_act_observation_processor"] = acmt_override
 
         preprocessor = PolicyProcessorPipeline.from_pretrained(

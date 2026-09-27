@@ -165,6 +165,8 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
     camera_names: tuple[str, ...]
     crop_params: dict[str, tuple[int, int, int, int]]
     source_camera_keys: tuple[str, ...] = DEFAULT_SOURCE_CAMERA_KEYS
+    generator_source_camera_keys: tuple[str, str] | None = None
+    generator_backend: str = "legacy_acmt"
     tactile_source: str = "none"
     use_depth: bool = False
     # Native ACMT-ACTv2 preprocessing: after the fixed 320x580 camera crop,
@@ -179,6 +181,8 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
         self.camera_keys = tuple(self.camera_keys)
         self.camera_names = tuple(self.camera_names)
         self.source_camera_keys = tuple(self.source_camera_keys)
+        if self.generator_source_camera_keys is not None:
+            self.generator_source_camera_keys = tuple(self.generator_source_camera_keys)
         count = len(self.camera_keys)
         if count == 0 or len(set(self.camera_keys)) != count:
             raise ValueError("ACMT-ACT camera_keys must contain distinct cameras")
@@ -186,12 +190,22 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
             raise ValueError("ACMT-ACT camera_names must match camera_keys and be distinct")
         if len(self.source_camera_keys) != count or len(set(self.source_camera_keys)) != count:
             raise ValueError("ACMT-ACT source_camera_keys must contain distinct cameras")
+        if self.generator_source_camera_keys is not None and (
+            len(self.generator_source_camera_keys) != 2
+            or len(set(self.generator_source_camera_keys)) != 2
+            or not set(self.generator_source_camera_keys).issubset(self.source_camera_keys)
+        ):
+            raise ValueError("generator_source_camera_keys must name two distinct runtime cameras")
 
     def get_config(self) -> dict[str, Any]:
         return {
             "camera_keys": list(self.camera_keys),
             "camera_names": list(self.camera_names),
             "source_camera_keys": list(self.source_camera_keys),
+            "generator_source_camera_keys": (
+                list(self.generator_source_camera_keys) if self.generator_source_camera_keys is not None else None
+            ),
+            "generator_backend": self.generator_backend,
             "crop_params": {key: list(value) for key, value in self.crop_params.items()},
             "tactile_source": self.tactile_source,
             "use_depth": self.use_depth,
@@ -203,8 +217,6 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
     def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
         source = dict(observation)
         result = dict(observation)
-        rgb_values: dict[str, torch.Tensor] = {}
-        depth_values: dict[str, torch.Tensor] = {}
         source_by_target = dict(zip(self.camera_keys, self.source_camera_keys, strict=True))
         for camera, source_camera, name in zip(
             self.camera_keys, self.source_camera_keys, self.camera_names, strict=True
@@ -214,8 +226,6 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
             if source_key not in source:
                 raise KeyError(f"ACMT-ACT observation is missing {source_key}")
             raw = _rgb_bchw(source[source_key], source_key, allow_precropped=self.tactile_source != "substitution")
-            if self.tactile_source == "substitution" and name in {"wrist_left", "wrist_right"}:
-                rgb_values[name] = raw
             if tuple(raw.shape[-2:]) == (480, 640):
                 y, x, height, width = self.crop_params[name]
                 cropped = raw[..., y : y + height, x : x + width]
@@ -253,8 +263,6 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
                     source_depth_key,
                     allow_precropped=self.tactile_source != "substitution",
                 )
-                if self.tactile_source == "substitution" and name in {"wrist_left", "wrist_right"}:
-                    depth_values[name] = raw_depth
                 if tuple(raw_depth.shape[-2:]) == (480, 640):
                     y, x, height, width = self.crop_params[name]
                     result[target_depth_key] = raw_depth[..., y : y + height, x : x + width]
@@ -286,7 +294,11 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
             result[XENSE1] = torch.zeros_like(result[XENSE0])
 
         if self.tactile_source == "substitution":
-            required = (DQ, TAU_J, FT300, O_T_EE, GRIPPER_GPO)
+            required = (
+                (DQ, O_T_EE, GRIPPER_GPO)
+                if self.generator_backend == "tactigen_v5"
+                else (DQ, TAU_J, FT300, O_T_EE, GRIPPER_GPO)
+            )
             missing = [key for key in required if key not in result]
             wrist_camera_keys = tuple(
                 camera
@@ -295,36 +307,30 @@ class ACMTACTObservationProcessorStep(ObservationProcessorStep):
             )
             if len(wrist_camera_keys) != 2:
                 raise ValueError("ACMT-ACT substitution requires wrist_left and wrist_right cameras")
-            missing.extend(
-                depth_key(source_by_target[camera])
-                for camera in wrist_camera_keys
-                if depth_key(source_by_target[camera]) not in source
+            generator_cameras = self.generator_source_camera_keys or tuple(
+                source_by_target[camera] for camera in wrist_camera_keys
             )
+            missing.extend(
+                depth_key(camera) for camera in generator_cameras if depth_key(camera) not in source
+            )
+            missing.extend(rgb_key(camera) for camera in generator_cameras if rgb_key(camera) not in source)
             if missing:
                 raise KeyError(f"substitution ACMT-ACT observation is missing {sorted(set(missing))}")
-            left, right = (rgb_values["wrist_left"], rgb_values["wrist_right"])
-            result[GEN_RGB] = torch.stack([left, right], dim=1)
-            if self.use_depth:
-                result[GEN_DEPTH] = torch.stack(
-                    [depth_values[name] for name in ("wrist_left", "wrist_right")], dim=1
-                )
-            else:
-                result[GEN_DEPTH] = torch.stack(
-                    [
-                        _depth_bchw(
-                            source[depth_key(source_by_target[camera])],
-                            depth_key(source_by_target[camera]),
-                        )
-                        for camera in wrist_camera_keys
-                    ],
-                    dim=1,
-                )
+            result[GEN_RGB] = torch.stack(
+                [_rgb_bchw(source[rgb_key(camera)], rgb_key(camera)) for camera in generator_cameras], dim=1
+            )
+            result[GEN_DEPTH] = torch.stack(
+                [_depth_bchw(source[depth_key(camera)], depth_key(camera)) for camera in generator_cameras], dim=1
+            )
             q = state[:, :7]
             dq = _vector(result[DQ], DQ, 7)
-            tau = _vector(result[TAU_J], TAU_J, 7)
-            ft = _vector(result[FT300], FT300, 6)
             gpo = _vector(result[GRIPPER_GPO], GRIPPER_GPO, 1) / 255.0
-            result[GEN_LOWDIM] = torch.cat([q, dq, tau, ft, gpo], dim=-1)
+            if self.generator_backend == "tactigen_v5":
+                result[GEN_LOWDIM] = torch.cat([q, dq, gpo], dim=-1)
+            else:
+                tau = _vector(result[TAU_J], TAU_J, 7)
+                ft = _vector(result[FT300], FT300, 6)
+                result[GEN_LOWDIM] = torch.cat([q, dq, tau, ft, gpo], dim=-1)
             result[GEN_POSE] = _pose(result[O_T_EE], O_T_EE)
         return result
 
@@ -368,6 +374,8 @@ def make_acmt_act_pre_post_processors(
         camera_names=config.camera_names,
         crop_params=config.crop_params,
         source_camera_keys=config.source_camera_keys,
+        generator_source_camera_keys=config.generator_source_camera_keys,
+        generator_backend=config.generator_backend,
         tactile_source=config.tactile_source,
         use_depth=getattr(config, "use_dformer_depth", False),
         dinov2_spatial=bool(getattr(config, "dinov2_spatial_preprocess", False)),

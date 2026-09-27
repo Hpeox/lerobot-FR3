@@ -6,9 +6,15 @@ import torch
 from torch import nn
 
 from lerobot.policies.acmt_act.configuration_acmt_act import (
+    DQ,
+    FT300,
+    GRIPPER_GPO,
+    O_T_EE,
+    TAU_J,
     XENSE0,
     XENSE1,
     ACMTACTConfig,
+    depth_key,
     rgb_key,
 )
 from lerobot.policies.acmt_act.modeling_acmt_act import ACMTACTPolicy
@@ -50,18 +56,7 @@ def test_factory_and_config_protocol() -> None:
     assert config.n_obs_steps == 1
     assert config.chunk_size == 16
     assert config.n_action_steps == 8
-    assert config.max_joint_step_degrees == pytest.approx(10.0)
     assert get_policy_class("acmt_act") is ACMTACTPolicy
-
-
-@pytest.mark.parametrize("value", [0.0, -1.0, 10.0001, float("inf"), float("nan")])
-def test_config_rejects_invalid_joint_step_limit(value: float) -> None:
-    with pytest.raises(ValueError, match="max_joint_step_degrees"):
-        ACMTACTConfig(
-            device="cpu",
-            pretrained_backbone_weights=None,
-            max_joint_step_degrees=value,
-        )
 
 
 def test_crop_boxes_are_exact_and_reject_wrong_resolution() -> None:
@@ -158,10 +153,54 @@ def test_substitution_overrides_serialized_real_observation_step(tmp_path) -> No
         pretrained_backbone_weights=None,
         tactile_source="substitution",
         generator_checkpoint="/tmp/acmt-act-test-generator.pt",
+        generator_source_camera_keys=("camera.cam1", "camera.cam2"),
     )
     loaded, _ = make_pre_post_processors(substitution, pretrained_path=tmp_path)
     step = next(item for item in loaded.steps if isinstance(item, ACMTACTObservationProcessorStep))
     assert step.tactile_source == "substitution"
+    assert step.generator_source_camera_keys == ("camera.cam1", "camera.cam2")
+
+
+def test_substitution_generator_uses_physical_wrists_independently_of_policy_slots(tmp_path) -> None:
+    """The trained policy permutation must not redirect generator RGB-D to top/side."""
+
+    config = ACMTACTConfig(
+        device="cpu",
+        pretrained_backbone_weights=None,
+        tactile_source="substitution",
+        generator_checkpoint="/tmp/acmt-act-test-generator.pt",
+        source_camera_keys=("camera.cam2", "camera.cam1", "camera.cam4", "camera.cam3"),
+        generator_source_camera_keys=("camera.cam1", "camera.cam2"),
+    )
+    preprocessor, _ = make_acmt_act_pre_post_processors(config)
+    step = next(item for item in preprocessor.steps if isinstance(item, ACMTACTObservationProcessorStep))
+    raw = {
+        OBS_STATE: torch.zeros(1, 8),
+        DQ: torch.zeros(1, 7),
+        TAU_J: torch.zeros(1, 7),
+        FT300: torch.zeros(1, 6),
+        O_T_EE: torch.eye(4).unsqueeze(0),
+        GRIPPER_GPO: torch.zeros(1, 1),
+    }
+    for index, camera in enumerate(CAMERAS, start=1):
+        raw[rgb_key(camera)] = torch.full((1, 3, 480, 640), index / 10)
+        raw[depth_key(camera)] = torch.full((1, 1, 480, 640), float(index))
+    result = step.observation(raw)
+    torch.testing.assert_close(result[GEN_RGB][0, :, 0, 0, 0], torch.tensor([0.1, 0.2]))
+    torch.testing.assert_close(result[GEN_DEPTH][0, :, 0, 0, 0], torch.tensor([1.0, 2.0]))
+    mean = torch.tensor(config.image_mean).view(1, 3, 1, 1)
+    std = torch.tensor(config.image_std).view(1, 3, 1, 1)
+    policy_values = [
+        ((result[rgb_key(camera)] * std + mean)[0, 0, 0, 0]).item()
+        for camera in CAMERAS
+    ]
+    assert policy_values == pytest.approx([0.2, 0.1, 0.4, 0.3])
+    preprocessor.save_pretrained(tmp_path)
+    from lerobot.processor import PolicyProcessorPipeline
+
+    restored = PolicyProcessorPipeline.from_pretrained(tmp_path, config_filename="policy_preprocessor.json")
+    restored_step = next(item for item in restored.steps if isinstance(item, ACMTACTObservationProcessorStep))
+    assert restored_step.generator_source_camera_keys == ("camera.cam1", "camera.cam2")
 
 
 def test_loader_rejects_cross_source_checkpoint_before_weight_load(tmp_path) -> None:

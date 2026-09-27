@@ -574,11 +574,21 @@ class ACMTACTPolicy(PreTrainedPolicy):
         self.model = ACMTACT(config)
         # Runtime-only state.  `_ACMTGeneratorRuntime` is not an nn.Module, so
         # no generator weights appear in `named_parameters()` or checkpoints.
-        self._generator_runtime: _ACMTGeneratorRuntime | None = None
+        self._generator_runtime: Any = None
         if config.tactile_source == "substitution":
-            self._generator_runtime = _ACMTGeneratorRuntime(
-                config.generator_checkpoint, config.generator_model_config, config.device
-            )
+            if config.generator_backend == "tactigen_v5":
+                from .tactigen_v5_runtime import TactiGenV5Runtime
+
+                self._generator_runtime = TactiGenV5Runtime(
+                    config.generator_checkpoint,
+                    config.generator_bootstrap_checkpoint,
+                    config.device,
+                    config.generator_checkpoint_sha256,
+                )
+            else:
+                self._generator_runtime = _ACMTGeneratorRuntime(
+                    config.generator_checkpoint, config.generator_model_config, config.device
+                )
             if config.generator_checkpoint_sha256 is None:
                 # Persist the exact generator identity in config.json while
                 # keeping its parameters outside the policy state dict.
@@ -645,6 +655,7 @@ class ACMTACTPolicy(PreTrainedPolicy):
             GEN_LOWDIM: deque(maxlen=self.config.tactile_history),
             GEN_POSE: deque(maxlen=self.config.tactile_history),
         }
+        self._gen_command_history: deque[Tensor] = deque(maxlen=self.config.tactile_history)
         self._latest_window: dict[str, Tensor] | None = None
         self._generated_tactile: Tensor | None = None
         self._observed_batch_size: int | None = None
@@ -716,6 +727,16 @@ class ACMTACTPolicy(PreTrainedPolicy):
                     self._gen_history[key].extend(value.clone() for _ in range(self.config.tactile_history))
                 else:
                     self._gen_history[key].append(value)
+            if self.config.generator_backend == "tactigen_v5" and not self._gen_command_history:
+                from .tactigen_v5_runtime import gello_opening_from_fr3_pos
+
+                lowdim = batch[GEN_LOWDIM].float()
+                initial_command = torch.cat(
+                    (lowdim[:, :7], gello_opening_from_fr3_pos(lowdim[:, 14:15])), dim=-1
+                )
+                self._gen_command_history.extend(
+                    initial_command.clone() for _ in range(self.config.tactile_history)
+                )
 
         window: dict[str, Tensor] = {
             "rgb": rgb,
@@ -859,12 +880,20 @@ class ACMTACTPolicy(PreTrainedPolicy):
             action = action[:, 0]
         if action.ndim != 2 or tuple(action.shape[1:]) != (8,):
             raise ValueError(f"executed ACMT-ACT action must be [B,8], got {tuple(action.shape)}")
-        # ACMTv4 checkpoints retain the historical Gello wire convention
-        # (1=open, 0=closed), whereas ACMT-ACT and the FR3 protocol expose
-        # physical gripper openness (0=open, 1=closed).
         generator_action = action.clone()
-        generator_action[:, 7] = 1.0 - generator_action[:, 7]
-        generated = self._generator_runtime.predict_next(generator_observation, pose, generator_action)
+        if self.config.generator_backend == "tactigen_v5":
+            from .tactigen_v5_runtime import gello_opening_from_fr3_pos
+
+            generator_action[:, 7] = gello_opening_from_fr3_pos(action[:, 7])
+            command_history = torch.stack(list(self._gen_command_history), dim=1)
+            generated = self._generator_runtime.predict_next(
+                generator_observation, pose, generator_action, command_history
+            )
+            self._gen_command_history.append(generator_action.clone())
+        else:
+            # Preserve the legacy generator's historical action convention.
+            generator_action[:, 7] = 1.0 - generator_action[:, 7]
+            generated = self._generator_runtime.predict_next(generator_observation, pose, generator_action)
         self._generated_tactile = generated.permute(0, 1, 4, 2, 3).contiguous().float()
         self._tactile_history.append(self._generated_tactile)
         if self._latest_window is not None:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -101,6 +100,8 @@ class ACMTACTConfig(ACTConfig):
     generator_model_config: dict[str, Any] | None = None
     generator_checkpoint_sha256: str | None = None
     generator_task_variant: str | None = None
+    generator_backend: str = "legacy_acmt"
+    generator_bootstrap_checkpoint: str | None = None
 
     # Observation/action protocol.
     n_obs_steps: int = 1
@@ -112,10 +113,6 @@ class ACMTACTConfig(ACTConfig):
     state_dim: int = 8
     tactile_history: int = 4  # causal ACMT ring; ACT consumes its latest frame
     control_hz: float = 30.0
-    # Deployment-time per-joint command slew limit.  This is applied after
-    # residual-to-absolute action restoration and is not part of the learned
-    # action normalization or model state.
-    max_joint_step_degrees: float = 10.0
     # Train through Accelerate's autocast context.  This is deliberately a
     # config field rather than an environment-only switch so checkpoints keep
     # the precision used for their training run.
@@ -124,6 +121,7 @@ class ACMTACTConfig(ACTConfig):
     camera_keys: tuple[str, str, str, str] = CAMERA_KEYS
     camera_names: tuple[str, str, str, str] = CAMERA_NAMES
     source_camera_keys: tuple[str, str, str, str] = DEFAULT_SOURCE_CAMERA_KEYS
+    generator_source_camera_keys: tuple[str, str] | None = None
     crop_params: dict[str, tuple[int, int, int, int]] = field(
         default_factory=lambda: dict(DEFAULT_CROP_PARAMS)
     )
@@ -174,6 +172,8 @@ class ACMTACTConfig(ACTConfig):
         self.camera_keys = tuple(self.camera_keys)
         self.camera_names = tuple(self.camera_names)
         self.source_camera_keys = tuple(self.source_camera_keys)
+        if self.generator_source_camera_keys is not None:
+            self.generator_source_camera_keys = tuple(self.generator_source_camera_keys)
         self.crop_params = {
             str(name): tuple(int(v) for v in values) for name, values in self.crop_params.items()
         }
@@ -185,7 +185,6 @@ class ACMTACTConfig(ACTConfig):
         self.goal_std = tuple(float(v) for v in self.goal_std)
         self.action_mean = tuple(float(v) for v in self.action_mean)
         self.action_std = tuple(float(v) for v in self.action_std)
-        self.max_joint_step_degrees = float(self.max_joint_step_degrees)
         self.input_features = _coerce_features(self.input_features)
         self.output_features = _coerce_features(self.output_features)
 
@@ -207,6 +206,20 @@ class ACMTACTConfig(ACTConfig):
             raise ValueError("ACMT-ACT checkpoints are task-specific")
         if self.tactile_source == "substitution" and not self.generator_checkpoint:
             raise ValueError("substitution mode requires generator_checkpoint")
+        if self.generator_backend not in {"legacy_acmt", "tactigen_v5"}:
+            raise ValueError("generator_backend must be legacy_acmt or tactigen_v5")
+        if (
+            self.tactile_source == "substitution"
+            and self.generator_backend == "tactigen_v5"
+            and not self.generator_bootstrap_checkpoint
+        ):
+            raise ValueError("TactiGen-V5 substitution requires generator_bootstrap_checkpoint")
+        if self.tactile_source == "substitution" and self.generator_backend == "tactigen_v5":
+            if self.generator_source_camera_keys != ("camera.cam1", "camera.cam2"):
+                raise ValueError("TactiGen-V5 requires physical wrist cameras cam1 and cam2")
+            digest = self.generator_checkpoint_sha256
+            if digest is None or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+                raise ValueError("TactiGen-V5 requires a lowercase SHA-256 checkpoint digest")
         if self.generator_task_variant is None:
             self.generator_task_variant = self.task_variant
         if self.generator_task_variant != self.task_variant:
@@ -249,10 +262,6 @@ class ACMTACTConfig(ACTConfig):
             raise ValueError("ACMT-ACT fixes the 16-predict/8-execute 8D action protocol")
         if self.tactile_history != 4 or self.control_hz != 30.0:
             raise ValueError("ACMT-ACT fixes a four-frame causal ACMT ring at 30 Hz")
-        if not math.isfinite(self.max_joint_step_degrees) or not (
-            0.0 < self.max_joint_step_degrees <= 10.0
-        ):
-            raise ValueError("max_joint_step_degrees must be finite and in (0, 10]")
         if self.camera_keys != CAMERA_KEYS or self.camera_names != CAMERA_NAMES:
             raise ValueError("ACMT-ACT camera order must be top, side, wrist_left, wrist_right")
         if (
@@ -261,6 +270,12 @@ class ACMTACTConfig(ACTConfig):
             or set(self.source_camera_keys) != set(self.camera_keys)
         ):
             raise ValueError("ACMT-ACT source_camera_keys must be a permutation of camera_keys")
+        if self.generator_source_camera_keys is not None and (
+            len(self.generator_source_camera_keys) != 2
+            or len(set(self.generator_source_camera_keys)) != 2
+            or not set(self.generator_source_camera_keys).issubset(self.camera_keys)
+        ):
+            raise ValueError("generator_source_camera_keys must name two distinct runtime cameras")
         expected_crops = set(CAMERA_NAMES)
         if set(self.crop_params) != expected_crops:
             raise ValueError(f"crop_params must contain exactly {sorted(expected_crops)}")
