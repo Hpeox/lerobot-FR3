@@ -1,0 +1,22 @@
+{
+  "torch": "2.7.1+cpu",
+  "transformers": "4.57.1",
+  "step": 100000,
+  "seed": 101,
+  "synthetic_observation": true,
+  "raw_hdf5_read": false,
+  "weights_updated": false,
+  "camera_order": [
+    "side",
+    "top",
+    "wrist1",
+    "wrist2"
+  ],
+  "shape": [
+    16,
+    8
+  ],
+  "source_bundle_id": "c63e3a25e947188852e7af43c55cbec112cf9bf290b51a7ee5f474807950be93",
+  "pixel_values_sha256": "ff9ce823e798829851a3aeaa8385b537afd72dfc6e68774def0db5c823291e5f",
+  "description": "Synthetic RGB arithmetic pattern; no robot images or original HDF5. Reference produced with trained100k Torch2.7.1/Transformers4.57.1."
+}

@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "repository": "zmy513/fr3-siglip-flow",
+  "tag": "v0.1.0-100k",
+  "step": 100000,
+  "bundle_id": "c63e3a25e947188852e7af43c55cbec112cf9bf290b51a7ee5f474807950be93",
+  "assets": [
+    {
+      "name": "step_0100000.pt",
+      "path": "weights/100k/step_0100000.pt",
+      "role": "training",
+      "bytes": 1166855233,
+      "sha256": "e3fc0014a2f41190600f9c049116f76dcaa48caf3a6d83faa6eec7066640d2ed"
+    },
+    {
+      "name": "policy_100k.pt",
+      "path": "weights/100k/policy_100k.pt",
+      "role": "inference",
+      "bytes": 407980313,
+      "sha256": "c4fea24085f8d1f41036e00294d0bceee2a4d5dd396fbacf99fd8aeaaf670db4"
+    },
+    {
+      "name": "vision.pt",
+      "path": "weights/100k/components/vision.pt",
+      "role": "vision",
+      "bytes": 371833414,
+      "sha256": "698b40396d140a343a4998a8fdd72d95c3018541b31d1ec6832c4d94754ebae7"
+    },
+    {
+      "name": "action.pt",
+      "path": "weights/100k/components/action.pt",
+      "role": "action",
+      "bytes": 36340777,
+      "sha256": "ed6672115629b1233f0228d55b3bca93b0aef236242a585840498ae7b51b503d"
+    },
+    {
+      "name": "lerobot044_100k.zip",
+      "path": "weights/100k/lerobot044_100k.zip",
+      "role": "lerobot044",
+      "bytes": 378556354,
+      "sha256": "fb4868563d42ba090e6c1aec7df720f6851cf6e576304cbb43bf981448d54785"
+    }
+  ],
+  "original_training_checkpoint_modified": false,
+  "lerobot_export_version": "0.4.4",
+  "hpeox_lerobot_0_6_native_tested": false
+}

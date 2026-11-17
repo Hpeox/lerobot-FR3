@@ -1,0 +1,99 @@
+{
+  "status": "PASS",
+  "policy_type": "flowmatch",
+  "branch": "flowmatch-100k",
+  "upstream_base": "bdb548f3c91570f7a934f74aedf71d7f646006fc",
+  "change_scope": "Only add src/lerobot/policies/flowmatch/**; no existing upstream file changes",
+  "factory_registration": "Explicit package import / folder-local CLI, using unchanged dynamic factories",
+  "tests_passed_per_profile": 16,
+  "profiles": [
+    {
+      "python": "3.12.13",
+      "torch": "2.7.1+cpu",
+      "transformers": "5.4.0",
+      "pillow": "11.3.0",
+      "numerical": {
+        "status": "PASS",
+        "step": 100000,
+        "whole_weight_source": "original_checkpoint",
+        "source_bundle_id": "c63e3a25e947188852e7af43c55cbec112cf9bf290b51a7ee5f474807950be93",
+        "pixel_values_sha256_matches": true,
+        "legacy_visual_features_max_abs": 0.0,
+        "legacy_raw_action_max_abs": 0.0,
+        "torch": "2.7.1+cpu",
+        "transformers": "5.4.0",
+        "synthetic_reference": true,
+        "device": "cpu",
+        "raw_hdf5_read": false,
+        "weights_updated": false,
+        "robot_connected": false,
+        "native_export_max_abs": 0.0,
+        "independent_workers_max_abs": 0.0
+      }
+    },
+    {
+      "python": "3.12.13",
+      "torch": "2.7.1+cpu",
+      "transformers": "5.5.4",
+      "pillow": "12.3.0",
+      "numerical": {
+        "status": "PASS",
+        "step": 100000,
+        "whole_weight_source": "original_checkpoint",
+        "source_bundle_id": "c63e3a25e947188852e7af43c55cbec112cf9bf290b51a7ee5f474807950be93",
+        "pixel_values_sha256_matches": true,
+        "legacy_visual_features_max_abs": 0.0,
+        "legacy_raw_action_max_abs": 0.0,
+        "torch": "2.7.1+cpu",
+        "transformers": "5.5.4",
+        "synthetic_reference": true,
+        "device": "cpu",
+        "raw_hdf5_read": false,
+        "weights_updated": false,
+        "robot_connected": false,
+        "native_export_max_abs": 0.0,
+        "independent_workers_max_abs": 0.0
+      }
+    }
+  ],
+  "windows_testing": {
+    "test_only_fcntl_import_stub": true,
+    "actual_lock_operations": "always raise",
+    "production_code_uses_stub": false,
+    "note": "Upstream training converters are eagerly imported; Windows interface tests do not exercise them."
+  },
+  "raw_hdf5_read": false,
+  "training_started": false,
+  "robot_connected": false,
+  "remote_push_performed": false,
+  "not_verified": [
+    "Linux control-host end-to-end integration",
+    "CUDA/2080 latency",
+    "physical camera/joint/gripper mapping",
+    "network transport/async scheduling",
+    "real robot success"
+  ],
+  "visible_project_folder_test": {
+    "path": "D:/endtoend/lerobot/lerobot-FR3-fr3/src/lerobot/policies/flowmatch",
+    "tests_passed": 16,
+    "numerical": {
+      "status": "PASS",
+      "step": 100000,
+      "whole_weight_source": "original_checkpoint",
+      "source_bundle_id": "c63e3a25e947188852e7af43c55cbec112cf9bf290b51a7ee5f474807950be93",
+      "pixel_values_sha256_matches": true,
+      "legacy_visual_features_max_abs": 0.0,
+      "legacy_raw_action_max_abs": 0.0,
+      "torch": "2.7.1+cpu",
+      "transformers": "5.5.4",
+      "synthetic_reference": true,
+      "device": "cpu",
+      "raw_hdf5_read": false,
+      "weights_updated": false,
+      "robot_connected": false,
+      "native_export_max_abs": 0.0,
+      "independent_workers_max_abs": 0.0
+    }
+  },
+  "existing_upstream_files_unchanged_in_both_local_copies": 1094
+}

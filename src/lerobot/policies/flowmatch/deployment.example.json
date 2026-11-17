@@ -1,0 +1,19 @@
+{
+  "status": "UNCONFIGURED: fill using verified physical/controller information",
+  "camera_map": {
+    "side": null,
+    "top": null,
+    "wrist1": null,
+    "wrist2": null
+  },
+  "camera_mapping_source": "",
+  "action_mapping": {
+    "joint_order": null,
+    "scale": null,
+    "offset_rad": null,
+    "gpo_at_raw_zero": null,
+    "gpo_at_raw_one": null,
+    "verification_source": ""
+  },
+  "default_task_id": null
+}

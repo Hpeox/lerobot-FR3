@@ -1,0 +1,6 @@
+# Additional model dependencies. Install the parent LeRobot project editable first.
+# Matches this upstream snapshot's Transformers/Pillow versions; no root lockfile edit.
+transformers==5.5.4
+Pillow==12.3.0
+numpy==2.2.6
+h5py>=3.14,<4
